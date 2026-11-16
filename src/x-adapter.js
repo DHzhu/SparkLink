@@ -1211,16 +1211,21 @@
     });
   }
 
-  function extractViewerFromWindow(win) {
+  function extractViewerFromWindow(win, options) {
     if (!win || typeof win !== 'object') {
       return null;
     }
+    const allowInlineScript =
+      !isPlainObject(options) || options.allowInlineScript !== false;
     try {
       if (isPlainObject(win.__INITIAL_STATE__)) {
         const direct = extractViewerFromInitialState(win.__INITIAL_STATE__);
         if (direct) {
           return direct;
         }
+      }
+      if (!allowInlineScript) {
+        return null;
       }
       const doc = win.document;
       if (doc && typeof doc.querySelectorAll === 'function') {

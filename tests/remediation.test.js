@@ -2978,6 +2978,608 @@ test(
   }
 );
 
+test('[P1] Shallow-copying window.__INITIAL_STATE__ without changing account field after Viewer confirmed B keeps Popup at 账号待确认 on resume instead of reviving A', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_shallow_copy_state';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabSender = {
+    id: EXT_ID,
+    tab: { id: 97, active: true },
+    frameId: 0,
+    documentId: 'doc_97',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  const tabListeners = new Set();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: 97, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          for (const fn of tabListeners) fn(msg, { id: EXT_ID });
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  const replyForA = structuredClone(createTweetFixtures.standardReply.response);
+  replyForA.data.create_tweet.tweet_results.result.rest_id = '2122147641553891001';
+  replyForA.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553891001';
+
+  const replyForB = structuredClone(createTweetFixtures.standardReply.response);
+  replyForB.data.create_tweet.tweet_results.result.rest_id = '2122147641553891002';
+  replyForB.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553891002';
+  replyForB.data.create_tweet.tweet_results.result.core.user_results.result.rest_id = '9009009';
+  replyForB.data.create_tweet.tweet_results.result.core.user_results.result.core.screen_name =
+    'second_account';
+  replyForB.data.create_tweet.tweet_results.result.legacy.user_id_str = '9009009';
+
+  let currentReplyPayload = replyForA;
+  const winListeners = new Map();
+
+  const fakeWin = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => []
+    },
+    // Page initially loads as Account A (1001001)
+    __INITIAL_STATE__: structuredClone(viewerFixtures.ownProfileInitialState),
+    fetch(url) {
+      if (String(url).includes('Viewer')) {
+        // Viewer confirms Account B (9009009)
+        return Promise.resolve(
+          new Response(JSON.stringify(viewerFixtures.viewerGraphqlLegacy), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
+      if (String(url).includes('CreateTweet')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(currentReplyPayload), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    },
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (winListeners.has(type)) winListeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = winListeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin });
+        }
+      });
+    }
+  };
+  fakeWin.top = fakeWin;
+
+  const pageChrome = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabSender),
+      onMessage: {
+        addListener(fn) {
+          tabListeners.add(fn);
+        },
+        removeListener(fn) {
+          tabListeners.delete(fn);
+        }
+      }
+    }
+  };
+
+  // 1. Enable collection -> binds A (1001001), A sends 1 reply (totalReplies = 1)
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  installMainInterceptor(fakeWin, adapterApi, { nowFn: () => NOW_MS });
+  const bridge = installIsolatedBridge(fakeWin, pageChrome, { nowFn: () => NOW_MS, retryDelayMs: 5 });
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(bridge.getBindingContext().actorUserId, '1001001');
+
+  await fakeWin.fetch('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 40));
+
+  // 2. Viewer confirms Account B (9009009) while fakeWin.__INITIAL_STATE__ remains Account A (1001001)
+  await fakeWin.fetch('https://x.com/i/api/graphql/ViewerQid/Viewer');
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(bridge.getBindingContext().actorUserId, '9009009');
+
+  const { doc: popupDoc, nodes: popupNodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: popupDoc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const snapBeforePause = await popup.init();
+  assert.equal(snapBeforePause.activeTabActorUserId, '9009009');
+  assert.equal(snapBeforePause.selectedAccount.actorUserId, '9009009');
+  assert.equal(snapBeforePause.selectedAccount.summary.totalReplies, 0);
+  assert.equal(popupNodes.get('viewer-status-badge').textContent, '采集中');
+
+  // 3. Pause collection; page shallow-copies outer __INITIAL_STATE__ object WITHOUT changing account field (still 1001001)!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 25));
+  fakeWin.__INITIAL_STATE__ = { ...fakeWin.__INITIAL_STATE__, uiThemeUpdated: true };
+  assert.equal(fakeWin.__INITIAL_STATE__.session.user_id, '1001001');
+
+  // 4. Resume collection -> MUST stay unconfirmed (账号待确认), NEVER reviving Account A or showing A's 1 reply as actively collecting!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 40));
+
+  const snapAfterResume = await popup.refresh();
+  assert.equal(
+    bridge.getBindingContext(),
+    null,
+    'Shallow-copying outer __INITIAL_STATE__ without changing user_id must NOT rebind superseded Account A'
+  );
+  assert.equal(snapAfterResume.viewerStatus, 'unconfirmed');
+  assert.equal(snapAfterResume.activeTabActorUserId, null);
+  assert.equal(popupNodes.get('viewer-status-badge').textContent, '账号待确认');
+
+  // 5. Fresh Viewer for B confirms B and records B's reply (+1)
+  currentReplyPayload = replyForB;
+  await fakeWin.fetch('https://x.com/i/api/graphql/ViewerQid/Viewer');
+  await new Promise((r) => setTimeout(r, 35));
+  await fakeWin.fetch('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const snapAfterBReply = await popup.refresh();
+  assert.equal(snapAfterBReply.viewerStatus, 'bound');
+  assert.equal(snapAfterBReply.activeTabActorUserId, '9009009');
+  assert.equal(snapAfterBReply.selectedAccount.actorUserId, '9009009');
+  assert.equal(snapAfterBReply.selectedAccount.summary.totalReplies, 1);
+
+  bridge.destroy();
+});
+
+test('[P1] Releasing window.__INITIAL_STATE__ during pause never falls back to initial HTML inline <script> containing Account A', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_inline_script_fallback';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabSender = {
+    id: EXT_ID,
+    tab: { id: 98, active: true },
+    frameId: 0,
+    documentId: 'doc_98',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  const tabListeners = new Set();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: 98, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          for (const fn of tabListeners) fn(msg, { id: EXT_ID });
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  // Initial HTML contains static inline script for Account A (1001001)
+  const initialInlineScriptNode = {
+    textContent:
+      'window.__INITIAL_STATE__ = {"session":{"user_id":"1001001","user":{"screen_name":"sample_me","name":"示例账号"}}};'
+  };
+  const winListeners = new Map();
+
+  const fakeWin = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector: () => null,
+      querySelectorAll(sel) {
+        if (sel === 'script:not([src])') {
+          return [initialInlineScriptNode];
+        }
+        return [];
+      }
+    },
+    // Dynamic window.__INITIAL_STATE__ and Viewer GraphQL both confirm Account B (9009009)!
+    __INITIAL_STATE__: {
+      session: { user_id: '9009009' },
+      entities: {
+        users: {
+          entities: {
+            '9009009': { id_str: '9009009', screen_name: 'second_account', name: '第二账号' }
+          }
+        }
+      }
+    },
+    fetch(url) {
+      if (String(url).includes('Viewer')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(viewerFixtures.viewerGraphqlLegacy), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    },
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (winListeners.has(type)) winListeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = winListeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin });
+        }
+      });
+    }
+  };
+  fakeWin.top = fakeWin;
+
+  const pageChrome = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabSender),
+      onMessage: {
+        addListener(fn) {
+          tabListeners.add(fn);
+        },
+        removeListener(fn) {
+          tabListeners.delete(fn);
+        }
+      }
+    }
+  };
+
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  installMainInterceptor(fakeWin, adapterApi, { nowFn: () => NOW_MS });
+  const bridge = installIsolatedBridge(fakeWin, pageChrome, { nowFn: () => NOW_MS, retryDelayMs: 5 });
+  await new Promise((r) => setTimeout(r, 40));
+
+  await fakeWin.fetch('https://x.com/i/api/graphql/ViewerQid/Viewer');
+  await new Promise((r) => setTimeout(r, 35));
+  assert.equal(bridge.getBindingContext().actorUserId, '9009009');
+
+  const { doc: popupDoc, nodes: popupNodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: popupDoc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup.init();
+  assert.equal(popupNodes.get('viewer-status-badge').textContent, '采集中');
+
+  // Pause collection, then release dynamic window.__INITIAL_STATE__ (leaving static inline <script> for A in DOM!)
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 25));
+  delete fakeWin.__INITIAL_STATE__;
+
+  // Resume collection -> MUST stay unconfirmed (账号待确认), NEVER reading static inline <script> for Account A!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 40));
+
+  const snapAfterResume = await popup.refresh();
+  assert.equal(
+    bridge.getBindingContext(),
+    null,
+    'Releasing window.__INITIAL_STATE__ must NOT fall back to initial HTML inline <script> for Account A'
+  );
+  assert.equal(snapAfterResume.viewerStatus, 'unconfirmed');
+  assert.equal(snapAfterResume.activeTabActorUserId, null);
+  assert.equal(popupNodes.get('viewer-status-badge').textContent, '账号待确认');
+
+  bridge.destroy();
+});
+
+test(
+  '[P1] Real Chromium CDP verification: shallow-copied __INITIAL_STATE__ and initial HTML inline <script> never revive Account A after Viewer confirmed B',
+  { skip: !fs.existsSync('/usr/bin/chromium') || !fs.existsSync('/usr/bin/xvfb-run') },
+  async () => {
+    const adapterSource = fs.readFileSync(path.resolve('src/x-adapter.js'), 'utf8');
+    const interceptorSource = fs.readFileSync(path.resolve('src/interceptor.js'), 'utf8');
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sparklink-chromium-viewer-sm-'));
+    const child = spawn(
+      '/usr/bin/xvfb-run',
+      [
+        '-a',
+        '/usr/bin/chromium',
+        '--remote-debugging-port=0',
+        '--no-first-run',
+        '--no-default-browser-check',
+        `--user-data-dir=${profileDir}`,
+        'about:blank'
+      ],
+      { stdio: ['ignore', 'ignore', 'ignore'], detached: true }
+    );
+
+    try {
+      const portFile = path.join(profileDir, 'DevToolsActivePort');
+      let port = null;
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(portFile)) {
+          const lines = fs.readFileSync(portFile, 'utf8').trim().split('\n');
+          if (lines[0] && /^\d+$/.test(lines[0].trim())) {
+            port = Number(lines[0].trim());
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert.ok(port, 'Chromium DevToolsActivePort must initialize');
+
+      let pageTarget = null;
+      const pageDeadline = Date.now() + 6000;
+      while (Date.now() < pageDeadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/json`);
+          if (res.ok) {
+            const targets = await res.json();
+            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            if (pageTarget) break;
+          }
+        } catch (_ignore) {}
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      assert.ok(pageTarget, 'Chromium page target must be available');
+
+      const evalExpr = `(async () => {
+        const loadCjs = (src) => {
+          const exportsObj = {};
+          const mod = { exports: exportsObj };
+          new Function('module', 'exports', src)(mod, exportsObj);
+          return mod.exports;
+        };
+        const adapter = loadCjs(${JSON.stringify(adapterSource)});
+        const { installMainInterceptor } = loadCjs(${JSON.stringify(interceptorSource)});
+
+        // Mount real <script type="application/json-ssr"> (inline script without src) containing Account A (1001001)
+        document.head.replaceChildren();
+        document.body.replaceChildren();
+        const ssrScript = document.createElement('script');
+        ssrScript.type = 'text/plain';
+        ssrScript.textContent = 'window.__INITIAL_STATE__ = {"session":{"user_id":"1001001","user":{"screen_name":"sample_me","name":"A"}}};';
+        document.head.appendChild(ssrScript);
+
+        const posted = [];
+        const listeners = new Set();
+        const fakeWin = {
+          location: { origin: 'https://x.com', href: 'https://x.com/home' },
+          document,
+          __INITIAL_STATE__: {
+            session: { user_id: '1001001', user: { screen_name: 'sample_me', name: 'A' } }
+          },
+          fetch: async () => new Response(
+            JSON.stringify(${JSON.stringify(viewerFixtures.viewerGraphqlLegacy)}),
+            { status: 200, headers: { 'content-type': 'application/json' } }
+          ),
+          addEventListener: (_t, fn) => listeners.add(fn),
+          removeEventListener: (_t, fn) => listeners.delete(fn),
+          postMessage: (data, origin) => posted.push({ data, origin })
+        };
+        fakeWin.top = fakeWin;
+
+        installMainInterceptor(fakeWin, adapter);
+        const dispatch = (msg) => {
+          for (const fn of listeners) fn({ data: msg, origin: 'https://x.com', source: fakeWin });
+        };
+
+        // 1. Init session 1 -> binds A, then Viewer GraphQL confirms B (9009009) while __INITIAL_STATE__ stays A
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'BRIDGE_INIT',
+          nonce: 'chromium_sm_nonce',
+          collectionEnabled: true,
+          captureSessionId: 1,
+          bindingContext: null
+        });
+        await fakeWin.fetch('https://x.com/i/api/graphql/ViewerQid/Viewer');
+        await new Promise((r) => setTimeout(r, 30));
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'SYNC_STATE',
+          nonce: 'chromium_sm_nonce',
+          collectionEnabled: true,
+          captureSessionId: 1,
+          bindingContext: {
+            bindingId: 'b_9009009_1',
+            actorUserId: '9009009',
+            captureSessionId: 1,
+            collectionGeneration: 1,
+            accountGeneration: 1
+          }
+        });
+
+        // 2. Pause -> shallow copy __INITIAL_STATE__ (still A) -> Resume session 2
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'SYNC_STATE',
+          nonce: 'chromium_sm_nonce',
+          collectionEnabled: false,
+          captureSessionId: null,
+          bindingContext: null
+        });
+        fakeWin.__INITIAL_STATE__ = { ...fakeWin.__INITIAL_STATE__, copied: true };
+        posted.length = 0;
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'SYNC_STATE',
+          nonce: 'chromium_sm_nonce',
+          collectionEnabled: true,
+          captureSessionId: 2,
+          bindingContext: null
+        });
+        dispatch({ protocol: 'SPARKLINK_BRIDGE_V1', type: 'PROBE_VIEWER', nonce: 'chromium_sm_nonce' });
+        const shallowCopyEmitted = posted.filter((m) => m.data.type === 'VIEWER_EVIDENCE').length;
+
+        // 3. Confirm B in both __INITIAL_STATE__ and Viewer, then Pause -> delete __INITIAL_STATE__ (leaving real DOM <script> with A!) -> Resume session 3
+        fakeWin.__INITIAL_STATE__ = {
+          session: { user_id: '9009009', user: { screen_name: 'second_account', name: 'B' } }
+        };
+        await fakeWin.fetch('https://x.com/i/api/graphql/ViewerQid/Viewer');
+        await new Promise((r) => setTimeout(r, 25));
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'SYNC_STATE',
+          nonce: 'chromium_sm_nonce',
+          collectionEnabled: true,
+          captureSessionId: 2,
+          bindingContext: {
+            bindingId: 'b_9009009_2',
+            actorUserId: '9009009',
+            captureSessionId: 2,
+            collectionGeneration: 1,
+            accountGeneration: 2
+          }
+        });
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'SYNC_STATE',
+          nonce: 'chromium_sm_nonce',
+          collectionEnabled: false,
+          captureSessionId: null,
+          bindingContext: null
+        });
+        delete fakeWin.__INITIAL_STATE__;
+        posted.length = 0;
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'SYNC_STATE',
+          nonce: 'chromium_sm_nonce',
+          collectionEnabled: true,
+          captureSessionId: 3,
+          bindingContext: null
+        });
+        dispatch({ protocol: 'SPARKLINK_BRIDGE_V1', type: 'PROBE_VIEWER', nonce: 'chromium_sm_nonce' });
+        const inlineFallbackEmitted = posted.filter((m) => m.data.type === 'VIEWER_EVIDENCE').length;
+
+        // 4. Genuine user_id change in __INITIAL_STATE__ to 3003003 -> Pause & Resume session 4 -> emits 3003003!
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'SYNC_STATE',
+          nonce: 'chromium_sm_nonce',
+          collectionEnabled: false,
+          captureSessionId: null,
+          bindingContext: null
+        });
+        fakeWin.__INITIAL_STATE__ = {
+          session: { user_id: '3003003', user: { screen_name: 'third_acc', name: 'C' } }
+        };
+        posted.length = 0;
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'SYNC_STATE',
+          nonce: 'chromium_sm_nonce',
+          collectionEnabled: true,
+          captureSessionId: 4,
+          bindingContext: null
+        });
+        const genuineChangeActor = posted.find((m) => m.data.type === 'VIEWER_EVIDENCE')?.data?.viewer?.actorUserId || null;
+
+        return {
+          shallowCopyEmitted,
+          inlineFallbackEmitted,
+          genuineChangeActor
+        };
+      })()`;
+
+      const cdpResult = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+        const timer = setTimeout(() => {
+          ws.close();
+          reject(new Error('CDP Runtime.evaluate timed out'));
+        }, 8000);
+        ws.addEventListener('open', () => {
+          ws.send(
+            JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: { expression: evalExpr, awaitPromise: true, returnByValue: true }
+            })
+          );
+        });
+        ws.addEventListener('message', (ev) => {
+          const msg = JSON.parse(String(ev.data));
+          if (msg.id === 1) {
+            clearTimeout(timer);
+            ws.close();
+            resolve(msg);
+          }
+        });
+        ws.addEventListener('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const val = cdpResult.result && cdpResult.result.result && cdpResult.result.result.value;
+      assert.deepEqual(val, {
+        shallowCopyEmitted: 0,
+        inlineFallbackEmitted: 0,
+        genuineChangeActor: '3003003'
+      });
+    } finally {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch (_ignore) {}
+      await new Promise((r) => setTimeout(r, 150));
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch (_ignore) {}
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    }
+  }
+);
+
 
 
 

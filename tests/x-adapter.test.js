@@ -338,8 +338,9 @@ test('Defensive branches: prototype pollution rejection, inline script viewer ex
     handle: 'inline_me',
     displayName: 'Inline User'
   });
+  assert.equal(extractViewerFromWindow(fakeWin, { allowInlineScript: false }), null);
   assert.deepEqual(
-    extractViewerFromWindow({ __INITIAL_STATE__: viewerFixtures.ownProfileInitialState }),
+    extractViewerFromWindow({ __INITIAL_STATE__: viewerFixtures.ownProfileInitialState }, { allowInlineScript: false }),
     { actorUserId: '1001001', handle: 'sample_me', displayName: '示例账号' }
   );
 

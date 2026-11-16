@@ -87,11 +87,14 @@
       captureSessionId: null,
       bindingContext: null,
       latestGraphqlViewer: null,
-      supersededWindowActorId: null,
-      supersededWindowStateRef: undefined,
-      lastSeenWindowActorId: null,
+      hasPausedOnce: false,
+      hasSeenGraphqlViewer: false,
+      hasSeenDynamicStateViewer: false,
+      supersededDynamicActorId: null,
+      lastDynamicStateActorId: null,
       windowSnapshotStale: false,
-      staleSnapshotActorId: null,
+      staleDynamicActorId: null,
+      staleActiveActorId: null,
       activeClones: 0
     };
 
@@ -157,28 +160,62 @@
       return true;
     }
 
+    function readDynamicStateViewer() {
+      const dynViewer = adapter.extractViewerFromWindow(win, { allowInlineScript: false });
+      if (dynViewer && dynViewer.actorUserId) {
+        state.hasSeenDynamicStateViewer = true;
+        state.lastDynamicStateActorId = dynViewer.actorUserId;
+        if (
+          state.supersededDynamicActorId &&
+          dynViewer.actorUserId !== state.supersededDynamicActorId
+        ) {
+          state.supersededDynamicActorId = null;
+        }
+        return dynViewer;
+      }
+      state.lastDynamicStateActorId = null;
+      return null;
+    }
+
+    function readWindowViewerCandidate() {
+      const dynViewer = readDynamicStateViewer();
+      if (dynViewer) {
+        return dynViewer;
+      }
+      const allowInlineBootstrap =
+        !state.hasPausedOnce &&
+        !state.hasSeenGraphqlViewer &&
+        !state.hasSeenDynamicStateViewer;
+      if (!allowInlineBootstrap) {
+        return null;
+      }
+      return adapter.extractViewerFromWindow(win, { allowInlineScript: true });
+    }
+
     function markWindowSnapshotStale(fallbackActorId) {
       const latestGqlId =
         state.latestGraphqlViewer && state.latestGraphqlViewer.actorUserId
           ? state.latestGraphqlViewer.actorUserId
           : null;
+      const activeId = fallbackActorId || latestGqlId || null;
+      state.hasPausedOnce = true;
+      if (!state.windowSnapshotStale || activeId) {
+        state.staleDynamicActorId = state.lastDynamicStateActorId;
+        state.staleActiveActorId =
+          activeId || state.lastDynamicStateActorId || state.staleActiveActorId || null;
+      }
       state.windowSnapshotStale = true;
-      state.staleSnapshotActorId =
-        fallbackActorId || latestGqlId || state.lastSeenWindowActorId || null;
     }
 
     function canTrustWindowSnapshot(winViewer) {
-      if (!winViewer) {
+      if (!winViewer || !winViewer.actorUserId) {
         return false;
       }
-      if (state.supersededWindowActorId && winViewer.actorUserId === state.supersededWindowActorId) {
-        const hasOwnInitialState = Object.prototype.hasOwnProperty.call(win, '__INITIAL_STATE__');
-        const curRef = hasOwnInitialState ? win.__INITIAL_STATE__ : undefined;
-        if (!hasOwnInitialState || curRef === state.supersededWindowStateRef) {
-          return false;
-        }
-        state.supersededWindowActorId = null;
-        state.supersededWindowStateRef = undefined;
+      if (
+        state.supersededDynamicActorId &&
+        winViewer.actorUserId === state.supersededDynamicActorId
+      ) {
+        return false;
       }
       if (winViewer.handle && win.document && typeof win.document.querySelector === 'function') {
         try {
@@ -188,6 +225,7 @@
           if (switcherEl && typeof switcherEl.textContent === 'string') {
             const m = /(?:^|\s)@([A-Za-z0-9_]{1,64})(?:\s|$)/.exec(switcherEl.textContent);
             if (m && m[1].toLowerCase() !== winViewer.handle.toLowerCase()) {
+              state.supersededDynamicActorId = winViewer.actorUserId;
               return false;
             }
           }
@@ -198,11 +236,15 @@
       if (!state.windowSnapshotStale) {
         return true;
       }
-      if (state.staleSnapshotActorId && winViewer.actorUserId === state.staleSnapshotActorId) {
+      if (state.staleDynamicActorId && winViewer.actorUserId === state.staleDynamicActorId) {
+        return false;
+      }
+      if (state.staleActiveActorId && winViewer.actorUserId === state.staleActiveActorId) {
         return false;
       }
       state.windowSnapshotStale = false;
-      state.staleSnapshotActorId = null;
+      state.staleDynamicActorId = null;
+      state.staleActiveActorId = null;
       return true;
     }
 
@@ -212,10 +254,7 @@
       }
       let viewer = state.latestGraphqlViewer;
       if (!viewer) {
-        const winViewer = adapter.extractViewerFromWindow(win);
-        if (winViewer && winViewer.actorUserId) {
-          state.lastSeenWindowActorId = winViewer.actorUserId;
-        }
+        const winViewer = readWindowViewerCandidate();
         if (canTrustWindowSnapshot(winViewer)) {
           viewer = winViewer;
         }
@@ -266,7 +305,23 @@
         engine.revokeBinding(prevBindingId);
       }
 
-      if (state.collectionEnabled && !state.bindingContext) {
+      if (state.collectionEnabled && state.bindingContext) {
+        if (
+          !prevEnabled ||
+          prevSessionId !== state.captureSessionId ||
+          prevActorId !== state.bindingContext.actorUserId
+        ) {
+          state.windowSnapshotStale = false;
+          state.staleDynamicActorId = null;
+          state.staleActiveActorId = null;
+          const dynViewer = readDynamicStateViewer();
+          if (dynViewer && dynViewer.actorUserId !== state.bindingContext.actorUserId) {
+            state.supersededDynamicActorId = dynViewer.actorUserId;
+          } else if (state.bindingContext.actorUserId === state.supersededDynamicActorId) {
+            state.supersededDynamicActorId = null;
+          }
+        }
+      } else if (state.collectionEnabled && !state.bindingContext) {
         maybeProbeInitialViewer();
       }
     }
@@ -328,21 +383,18 @@
       if (match.category === 'viewer') {
         const viewer = adapter.extractViewerFromGraphql(payload);
         if (viewer) {
-          const winViewer = adapter.extractViewerFromWindow(win);
-          if (winViewer && winViewer.actorUserId) {
-            state.lastSeenWindowActorId = winViewer.actorUserId;
-          }
-          if (winViewer && winViewer.actorUserId !== viewer.actorUserId) {
-            state.supersededWindowActorId = winViewer.actorUserId;
-            state.supersededWindowStateRef = Object.prototype.hasOwnProperty.call(
-              win,
-              '__INITIAL_STATE__'
-            )
-              ? win.__INITIAL_STATE__
-              : undefined;
-          } else if (winViewer && winViewer.actorUserId === viewer.actorUserId) {
-            state.supersededWindowActorId = null;
-            state.supersededWindowStateRef = undefined;
+          state.hasSeenGraphqlViewer = true;
+          state.windowSnapshotStale = false;
+          state.staleDynamicActorId = null;
+          state.staleActiveActorId = null;
+          const dynViewer = readDynamicStateViewer();
+          if (dynViewer && dynViewer.actorUserId !== viewer.actorUserId) {
+            state.supersededDynamicActorId = dynViewer.actorUserId;
+          } else if (
+            (dynViewer && dynViewer.actorUserId === viewer.actorUserId) ||
+            state.supersededDynamicActorId === viewer.actorUserId
+          ) {
+            state.supersededDynamicActorId = null;
           }
           state.latestGraphqlViewer = viewer;
           sendToBridge('VIEWER_EVIDENCE', {

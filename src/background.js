@@ -271,6 +271,8 @@ export function createBackgroundService(chromeApi, options = {}) {
 
   function emptyDiagnostics() {
     return {
+      liveCaptureAnomaly: false,
+      historyBackfillAnomaly: false,
       partialUnrecognized: false,
       incompleteObservation: false,
       observationDropped: false
@@ -353,6 +355,10 @@ export function createBackgroundService(chromeApi, options = {}) {
     }
 
     const diagnostics = {
+      liveCaptureAnomaly: Boolean(fgEntry.diagnostics && fgEntry.diagnostics.liveCaptureAnomaly),
+      historyBackfillAnomaly: Boolean(
+        fgEntry.diagnostics && fgEntry.diagnostics.historyBackfillAnomaly
+      ),
       partialUnrecognized: Boolean(fgEntry.diagnostics && fgEntry.diagnostics.partialUnrecognized),
       incompleteObservation: Boolean(
         fgEntry.diagnostics && fgEntry.diagnostics.incompleteObservation
@@ -667,9 +673,22 @@ export function createBackgroundService(chromeApi, options = {}) {
           return mergeRes;
         }
 
-        if (msg.partialUnrecognized || msg.incompleteObservation) {
+        if (
+          msg.liveCaptureAnomaly ||
+          msg.historyBackfillAnomaly ||
+          msg.partialUnrecognized ||
+          msg.incompleteObservation
+        ) {
           sessionEntry.diagnostics = {
             ...(sessionEntry.diagnostics || {}),
+            liveCaptureAnomaly: Boolean(
+              (sessionEntry.diagnostics && sessionEntry.diagnostics.liveCaptureAnomaly) ||
+                msg.liveCaptureAnomaly
+            ),
+            historyBackfillAnomaly: Boolean(
+              (sessionEntry.diagnostics && sessionEntry.diagnostics.historyBackfillAnomaly) ||
+                msg.historyBackfillAnomaly
+            ),
             partialUnrecognized: Boolean(
               (sessionEntry.diagnostics && sessionEntry.diagnostics.partialUnrecognized) ||
                 msg.partialUnrecognized

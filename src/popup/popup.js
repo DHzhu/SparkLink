@@ -212,13 +212,29 @@ export function createPopupController(options = {}) {
     if (snap.viewerStatus === 'unconfirmed') {
       addBanner('当前 X 页面登录账号尚未确认，请在页面正常浏览或刷新后同步。', false);
     }
-    if (
-      snap.diagnostics &&
-      (snap.diagnostics.partialUnrecognized ||
-        snap.diagnostics.incompleteObservation ||
-        snap.diagnostics.observationDropped)
-    ) {
-      addBanner('部分网页响应无法识别或未完整读取，未知结构已安全跳过。', false);
+    if (snap.diagnostics) {
+      if (snap.diagnostics.liveCaptureAnomaly) {
+        addBanner(
+          '实时回复响应结构无法识别或缺少关键字段，新回复采集可能遗漏，待修订适配规则。',
+          true
+        );
+      }
+      if (snap.diagnostics.historyBackfillAnomaly) {
+        addBanner(
+          '历史补录响应结构部分无法识别，历史补录暂不可用，仍可记录新回复和导入备份。',
+          false
+        );
+      }
+      if (snap.diagnostics.observationDropped) {
+        addBanner('部分观测事件因队列超限或重试耗尽未能保存，统计可能存在遗漏。', false);
+      }
+      if (
+        !snap.diagnostics.liveCaptureAnomaly &&
+        !snap.diagnostics.historyBackfillAnomaly &&
+        (snap.diagnostics.partialUnrecognized || snap.diagnostics.incompleteObservation)
+      ) {
+        addBanner('部分网页响应无法识别或未完整读取，未知结构已安全跳过。', false);
+      }
     }
     if (snap.selectedAccount && snap.selectedAccount.summary.clockSkewDetected) {
       addBanner('检测到异常未来时间记录，请检查当前设备系统时钟。', false);
@@ -240,6 +256,14 @@ export function createPopupController(options = {}) {
       return;
     }
     if (snap.viewerStatus === 'bound') {
+      if (snap.diagnostics && snap.diagnostics.liveCaptureAnomaly) {
+        els.viewerStatusBadge.textContent = '实时采集异常';
+        return;
+      }
+      if (snap.diagnostics && snap.diagnostics.historyBackfillAnomaly) {
+        els.viewerStatusBadge.textContent = '历史补录受限';
+        return;
+      }
       els.viewerStatusBadge.textContent = '采集中';
       return;
     }

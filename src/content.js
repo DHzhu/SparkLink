@@ -119,16 +119,46 @@
       profileHandle = candidate;
     }
 
-    // Cross-check visible @handle text if links were mutated out of sync during React recycle
-    const spans = container.querySelectorAll ? container.children : [];
+    // Cross-check visible @handle text across HTMLCollection / NodeList subtrees
     let textHandle = null;
-    const stack = Array.isArray(spans) ? spans.slice() : [];
+    const stack = [];
+    const rootChildren = container.children;
+    if (rootChildren && typeof rootChildren.length === 'number') {
+      for (let i = rootChildren.length - 1; i >= 0; i -= 1) {
+        stack.push(rootChildren[i]);
+      }
+    }
     while (stack.length > 0) {
       const node = stack.pop();
       if (!node || node.nodeType !== 1 || isSparklinkNode(node)) {
         continue;
       }
-      if (node.children && node.children.length === 0) {
+      const childNodes = node.childNodes;
+      if (childNodes && typeof childNodes.length === 'number' && childNodes.length > 0) {
+        for (let j = childNodes.length - 1; j >= 0; j -= 1) {
+          const child = childNodes[j];
+          if (!child) {
+            continue;
+          }
+          if (child.nodeType === 3) {
+            const rawText = (child.nodeValue || child.textContent || '').trim();
+            const atMatch = AT_HANDLE_RE.exec(rawText);
+            if (atMatch) {
+              const h = atMatch[1];
+              if (textHandle && textHandle.toLowerCase() !== h.toLowerCase()) {
+                return null;
+              }
+              textHandle = h;
+            }
+          } else if (child.nodeType === 1) {
+            stack.push(child);
+          }
+        }
+      } else if (node.children && typeof node.children.length === 'number' && node.children.length > 0) {
+        for (let j = node.children.length - 1; j >= 0; j -= 1) {
+          stack.push(node.children[j]);
+        }
+      } else {
         const rawText = (node.textContent || '').trim();
         const atMatch = AT_HANDLE_RE.exec(rawText);
         if (atMatch) {
@@ -137,10 +167,6 @@
             return null;
           }
           textHandle = h;
-        }
-      } else if (node.children) {
-        for (let j = 0; j < node.children.length; j += 1) {
-          stack.push(node.children[j]);
         }
       }
     }

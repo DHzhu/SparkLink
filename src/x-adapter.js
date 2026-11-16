@@ -600,6 +600,11 @@
       if (!isPlainObject(payload) || hasDangerousOwnKeys(payload, 0)) {
         return empty;
       }
+      const hasBusinessErrors = Array.isArray(payload.errors) && payload.errors.length > 0;
+      const isReplyCandidate = Boolean(
+        isPlainObject(requestMeta) && requestMeta.isReplyCandidate
+      );
+
       const createTweetNode =
         isPlainObject(payload.data) &&
         isPlainObject(payload.data.create_tweet) &&
@@ -607,11 +612,25 @@
           ? payload.data.create_tweet.tweet_results
           : null;
       if (!createTweetNode) {
+        if (!hasBusinessErrors && isReplyCandidate) {
+          return {
+            ...empty,
+            anomalies: ['unrecognized_reply_schema'],
+            incompleteObservation: true
+          };
+        }
         return empty;
       }
 
       const parsed = extractTweetCoreFields(createTweetNode);
       if (!parsed) {
+        if (!hasBusinessErrors && isReplyCandidate) {
+          return {
+            ...empty,
+            anomalies: ['unrecognized_reply_schema'],
+            incompleteObservation: true
+          };
+        }
         return empty;
       }
 
@@ -631,13 +650,22 @@
         };
       }
 
-      // Plain post (not a reply)
+      // Plain post (not a reply) vs reply schema missing parent reference
       const expectedParentId =
         isPlainObject(requestMeta) && isValidDecimalId(requestMeta.expectedParentTweetId)
           ? requestMeta.expectedParentTweetId
           : null;
 
       if (!parsed.parentTweetId) {
+        if (!hasBusinessErrors && isReplyCandidate) {
+          return {
+            ...empty,
+            observedUsers,
+            observedTweets,
+            anomalies: ['unrecognized_reply_schema'],
+            incompleteObservation: true
+          };
+        }
         return {
           ...empty,
           observedUsers,
@@ -656,7 +684,16 @@
       }
 
       // Verify author matches frozen viewer binding
-      if (!parsed.authorUserId || parsed.authorUserId !== bindingContext.actorUserId) {
+      if (!parsed.authorUserId) {
+        return {
+          ...empty,
+          observedUsers,
+          observedTweets,
+          anomalies: ['unrecognized_reply_schema'],
+          incompleteObservation: true
+        };
+      }
+      if (parsed.authorUserId !== bindingContext.actorUserId) {
         return {
           ...empty,
           observedUsers,
@@ -758,8 +795,9 @@
     function collectTimelineTweetItems(instructions) {
       const primaryTweets = [];
       const auxiliaryTweets = [];
+      let unrecognizedTweetCount = 0;
       if (!Array.isArray(instructions)) {
-        return { primaryTweets, auxiliaryTweets };
+        return { primaryTweets, auxiliaryTweets, unrecognizedTweetCount };
       }
 
       function inspectItemContent(itemContent) {
@@ -770,8 +808,18 @@
         if (isPlainObject(itemContent.promotedMetadata)) {
           return;
         }
+        const rawRes = isPlainObject(itemContent.tweet_results.result)
+          ? itemContent.tweet_results.result
+          : itemContent.tweet_results;
+        if (
+          isPlainObject(rawRes) &&
+          (rawRes.__typename === 'TweetTombstone' || rawRes.__typename === 'TweetUnavailable')
+        ) {
+          return;
+        }
         const parsed = extractTweetCoreFields(itemContent.tweet_results);
         if (!parsed) {
+          unrecognizedTweetCount += 1;
           return;
         }
         primaryTweets.push(parsed);
@@ -829,7 +877,7 @@
         }
       }
 
-      return { primaryTweets, auxiliaryTweets };
+      return { primaryTweets, auxiliaryTweets, unrecognizedTweetCount };
     }
 
     function extractInstructionsAndOwner(operationName, payload) {
@@ -914,6 +962,13 @@
         return empty;
       }
 
+      const hasBusinessErrors = Array.isArray(payload.errors) && payload.errors.length > 0;
+      const isUnavailableUser =
+        isPlainObject(payload.data) &&
+        isPlainObject(payload.data.user) &&
+        isPlainObject(payload.data.user.result) &&
+        payload.data.user.result.__typename === 'UserUnavailable';
+
       const observedUsers = [];
       const observedTweets = [];
       const { instructions, timelineOwnerId, singleUser } = extractInstructionsAndOwner(
@@ -929,15 +984,24 @@
         const pendingCheck = isValidBindingContext(bindingContext)
           ? resolvePendingReplies(bindingContext.bindingId, observedAt)
           : { resolved: [] };
+        const isDriftedOwnRepliesTimeline =
+          operationName === 'UserTweetsAndReplies' &&
+          isValidBindingContext(bindingContext) &&
+          !hasBusinessErrors &&
+          !isUnavailableUser &&
+          (!timelineOwnerId || timelineOwnerId === bindingContext.actorUserId);
         return {
           ...empty,
           resolvedPendingEvents: pendingCheck.resolved,
           observedUsers,
-          observedTweets
+          observedTweets,
+          partialUnrecognized: isDriftedOwnRepliesTimeline,
+          anomalies: isDriftedOwnRepliesTimeline ? ['unrecognized_timeline_schema'] : []
         };
       }
 
-      const { primaryTweets, auxiliaryTweets } = collectTimelineTweetItems(instructions);
+      const { primaryTweets, auxiliaryTweets, unrecognizedTweetCount } =
+        collectTimelineTweetItems(instructions);
 
       // Pass 1: Register all known tweet authors & user profiles in bounded memory
       for (let i = 0; i < auxiliaryTweets.length; i += 1) {
@@ -983,6 +1047,10 @@
       const seenReplyIds = new Set();
       const anomalies = [];
       let partialUnrecognized = false;
+      if (unrecognizedTweetCount > 0) {
+        partialUnrecognized = true;
+        anomalies.push('unrecognized_timeline_tweet_schema');
+      }
 
       // Pass 2: Extract eligible viewer replies from primary timeline items
       for (let i = 0; i < primaryTweets.length; i += 1) {

@@ -669,6 +669,8 @@
             bindingContext: activeBinding,
             events: batchItems.map((b) => b.event),
             observedUsers: metaSnapshot ? metaSnapshot.observedUsers : [],
+            liveCaptureAnomaly: Boolean(metaSnapshot && metaSnapshot.liveCaptureAnomaly),
+            historyBackfillAnomaly: Boolean(metaSnapshot && metaSnapshot.historyBackfillAnomaly),
             partialUnrecognized: Boolean(metaSnapshot && metaSnapshot.partialUnrecognized),
             incompleteObservation: Boolean(metaSnapshot && metaSnapshot.incompleteObservation),
             anomalies: metaSnapshot ? metaSnapshot.anomalies : []
@@ -793,22 +795,43 @@
       }
 
       const hasDiagFlags = Boolean(
-        data.partialUnrecognized ||
+        data.liveCaptureAnomaly ||
+          data.historyBackfillAnomaly ||
+          data.partialUnrecognized ||
           data.incompleteObservation ||
           (Array.isArray(data.anomalies) && data.anomalies.length > 0)
       );
 
       if (cleanEvents.length > 0 || hasDiagFlags || cleanUsers.length > 0) {
+        const prevMeta =
+          pendingAuxiliaryMeta &&
+          bindingEquals(pendingAuxiliaryMeta.bindingContext, state.bindingContext)
+            ? pendingAuxiliaryMeta
+            : null;
+        const incomingAnomalies = Array.isArray(data.anomalies)
+          ? data.anomalies.filter((a) => typeof a === 'string' && a.length <= 64)
+          : [];
         pendingAuxiliaryMeta = {
           bindingContext: state.bindingContext,
-          observedUsers: cleanUsers,
-          partialUnrecognized: Boolean(data.partialUnrecognized),
-          incompleteObservation: Boolean(data.incompleteObservation),
-          anomalies: Array.isArray(data.anomalies)
-            ? data.anomalies
-                .filter((a) => typeof a === 'string' && a.length <= 64)
-                .slice(0, 10)
-            : []
+          observedUsers: prevMeta
+            ? prevMeta.observedUsers.concat(cleanUsers).slice(0, 500)
+            : cleanUsers,
+          liveCaptureAnomaly: Boolean(
+            (prevMeta && prevMeta.liveCaptureAnomaly) || data.liveCaptureAnomaly
+          ),
+          historyBackfillAnomaly: Boolean(
+            (prevMeta && prevMeta.historyBackfillAnomaly) || data.historyBackfillAnomaly
+          ),
+          partialUnrecognized: Boolean(
+            (prevMeta && prevMeta.partialUnrecognized) || data.partialUnrecognized
+          ),
+          incompleteObservation: Boolean(
+            (prevMeta && prevMeta.incompleteObservation) || data.incompleteObservation
+          ),
+          anomalies: (prevMeta ? prevMeta.anomalies.concat(incomingAnomalies) : incomingAnomalies).slice(
+            0,
+            10
+          )
         };
         flushQueue();
       }

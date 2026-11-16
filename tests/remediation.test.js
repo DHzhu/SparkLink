@@ -15,6 +15,7 @@ const require = createRequire(import.meta.url);
 const adapterApi = require('../src/x-adapter.js');
 const { installMainInterceptor } = require('../src/interceptor.js');
 const { installIsolatedBridge } = require('../src/bridge.js');
+const { installContentBadges } = require('../src/content.js');
 const viewerFixtures = require('./fixtures/viewer-states.json');
 const createTweetFixtures = require('./fixtures/create-tweet.json');
 
@@ -841,6 +842,604 @@ test('[P2] Storage setAccessLevel(TRUSTED_CONTEXTS) failure blocks collection an
   assert.equal(snapRecovered.ok, true);
   assert.equal(snapRecovered.settings.collectionEnabled, true);
 });
+
+function makeHtmlCollection(items) {
+  const col = { length: items.length, item: (i) => items[i] || null };
+  for (let i = 0; i < items.length; i += 1) {
+    col[i] = items[i];
+  }
+  return Object.freeze(col);
+}
+
+class BrowserLikeElement {
+  constructor(tagName) {
+    this.nodeType = 1;
+    this.tagName = String(tagName).toUpperCase();
+    this.attributes = new Map();
+    this._childElements = [];
+    this.parentNode = null;
+    this._text = '';
+    this.dataset = new Proxy(
+      {},
+      {
+        get: (_t, prop) => {
+          const k = 'data-' + String(prop).replace(/[A-Z]/g, (m) => '-' + m.toLowerCase());
+          return this.attributes.get(k);
+        },
+        set: (_t, prop, val) => {
+          const k = 'data-' + String(prop).replace(/[A-Z]/g, (m) => '-' + m.toLowerCase());
+          this.attributes.set(k, String(val));
+          return true;
+        }
+      }
+    );
+    this.classList = {
+      contains: (tok) =>
+        (this.attributes.get('class') || '')
+          .split(/\s+/)
+          .filter(Boolean)
+          .includes(tok)
+    };
+  }
+
+  get children() {
+    // Non-Array HTMLCollection just like real Chromium DOM!
+    return makeHtmlCollection(this._childElements);
+  }
+
+  get className() {
+    return this.attributes.get('class') || '';
+  }
+
+  set className(val) {
+    this.attributes.set('class', String(val));
+  }
+
+  get isConnected() {
+    let cur = this;
+    while (cur.parentNode) cur = cur.parentNode;
+    return cur.isRoot === true;
+  }
+
+  get textContent() {
+    if (this._childElements.length === 0) return this._text;
+    return this._childElements.map((c) => c.textContent).join('');
+  }
+
+  set textContent(val) {
+    this._childElements = [];
+    this._text = String(val);
+  }
+
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+  }
+
+  getAttribute(k) {
+    return this.attributes.has(k) ? this.attributes.get(k) : null;
+  }
+
+  appendChild(child) {
+    child.parentNode = this;
+    this._childElements.push(child);
+    return child;
+  }
+
+  remove() {
+    if (!this.parentNode) return;
+    const idx = this.parentNode._childElements.indexOf(this);
+    if (idx !== -1) this.parentNode._childElements.splice(idx, 1);
+    this.parentNode = null;
+  }
+
+  matches(sel) {
+    if (sel === '[data-testid="User-Name"]' || sel === '[data-testid="User-Name"], [data-testid="UserName"]') {
+      const tid = this.getAttribute('data-testid');
+      return tid === 'User-Name' || tid === 'UserName';
+    }
+    if (sel === '.sparklink-badge') return this.classList.contains('sparklink-badge');
+    if (sel === 'a[href^="/"]') {
+      return this.tagName === 'A' && (this.getAttribute('href') || '').startsWith('/');
+    }
+    if (sel === 'a[href*="/status/"]') {
+      return this.tagName === 'A' && (this.getAttribute('href') || '').includes('/status/');
+    }
+    return false;
+  }
+
+  closest(sel) {
+    let cur = this;
+    while (cur && cur.nodeType === 1) {
+      if (cur.matches(sel)) return cur;
+      cur = cur.parentNode;
+    }
+    return null;
+  }
+
+  querySelectorAll(sel) {
+    const out = [];
+    const walk = (n) => {
+      for (const c of n._childElements) {
+        if (c.matches(sel)) out.push(c);
+        walk(c);
+      }
+    };
+    walk(this);
+    return out;
+  }
+
+  querySelector(sel) {
+    return this.querySelectorAll(sel)[0] || null;
+  }
+}
+
+test('[P2] Non-Array HTMLCollection DOM @handle validation: rejects <a href="/Alice"> + @Bob conflict and renders badge for linkless @Bob', async () => {
+  const root = new BrowserLikeElement('body');
+  root.isRoot = true;
+  assert.equal(Array.isArray(root.children), false, 'children must be non-Array HTMLCollection');
+
+  // Author block 1: Stale recycled link /alice_user with visible @bob_user text -> MUST reject conflict!
+  const conflictHeader = new BrowserLikeElement('div');
+  conflictHeader.setAttribute('data-testid', 'User-Name');
+  const staleLink = new BrowserLikeElement('a');
+  staleLink.setAttribute('href', '/alice_user');
+  staleLink.textContent = 'Alice';
+  const nestedWrap = new BrowserLikeElement('div');
+  const handleSpan = new BrowserLikeElement('span');
+  handleSpan.textContent = '@bob_user';
+  nestedWrap.appendChild(handleSpan);
+  conflictHeader.appendChild(staleLink);
+  conflictHeader.appendChild(nestedWrap);
+  root.appendChild(conflictHeader);
+
+  // Author block 2: Linkless header with visible @bob_user text -> MUST resolve Bob (2002002) and render badge!
+  const linklessHeader = new BrowserLikeElement('div');
+  linklessHeader.setAttribute('data-testid', 'User-Name');
+  const nameSpan = new BrowserLikeElement('span');
+  nameSpan.textContent = 'Bob';
+  const linklessHandleWrap = new BrowserLikeElement('div');
+  const linklessHandleSpan = new BrowserLikeElement('span');
+  linklessHandleSpan.textContent = '@bob_user';
+  linklessHandleWrap.appendChild(linklessHandleSpan);
+  linklessHeader.appendChild(nameSpan);
+  linklessHeader.appendChild(linklessHandleWrap);
+  root.appendChild(linklessHeader);
+
+  const doc = {
+    body: root,
+    documentElement: root,
+    createElement: (t) => new BrowserLikeElement(t),
+    createElementNS: (_ns, t) => new BrowserLikeElement(t),
+    querySelectorAll: (s) => root.querySelectorAll(s)
+  };
+  const win = {
+    location: { origin: 'https://x.com' },
+    document: doc,
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    requestAnimationFrame(cb) {
+      cb();
+      return 1;
+    },
+    cancelAnimationFrame() {}
+  };
+  win.top = win;
+
+  const binding = {
+    bindingId: 'bind_dom_1',
+    actorUserId: '1001001',
+    captureSessionId: 1,
+    collectionGeneration: 1,
+    accountGeneration: 1
+  };
+  const fakeBridge = {
+    subscribe() {
+      return () => {};
+    },
+    getBindingContext: () => binding,
+    getRevision: () => 3,
+    resolveUserIdByHandle(h) {
+      const lower = String(h).toLowerCase();
+      if (lower === 'alice_user') return '1111111';
+      if (lower === 'bob_user') return '2002002';
+      return null;
+    },
+    resolveAuthorByTweetId: () => null,
+    async queryCounts(ids) {
+      const counts = {};
+      for (const id of ids) {
+        if (id === '1111111') counts[id] = 9;
+        if (id === '2002002') counts[id] = 5;
+      }
+      return { ok: true, counts, revision: 3 };
+    }
+  };
+
+  const controller = installContentBadges(win, fakeBridge, {
+    debounceMs: 5,
+    windowRefreshMs: 60000
+  });
+  await new Promise((r) => setTimeout(r, 30));
+
+  assert.equal(
+    conflictHeader.querySelectorAll('.sparklink-badge').length,
+    0,
+    'Mismatched <a href="/alice_user"> + @bob_user must NOT render Alice badge'
+  );
+  const bobBadges = linklessHeader.querySelectorAll('.sparklink-badge');
+  assert.equal(bobBadges.length, 1, 'Linkless @bob_user with verified mapping MUST render Bob badge');
+  assert.equal(bobBadges[0].dataset.sparklinkUserId, '2002002');
+  assert.equal(bobBadges[0].dataset.sparklinkCount, '5');
+
+  controller.destroy();
+});
+
+test(
+  '[P2] Real Chromium DOM HTMLCollection verification: evaluates src/content.js against genuine Chromium HTMLCollection elements via CDP',
+  {
+    skip: !(
+      fs.existsSync('/usr/bin/chromium') &&
+      fs.existsSync('/usr/bin/xvfb-run') &&
+      typeof WebSocket === 'function'
+    )
+  },
+  async () => {
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sparklink-chromium-dom-'));
+    const contentSource = fs.readFileSync(path.resolve('src/content.js'), 'utf8');
+
+    const child = spawn(
+      '/usr/bin/xvfb-run',
+      [
+        '-a',
+        '/usr/bin/chromium',
+        '--remote-debugging-port=0',
+        '--no-first-run',
+        '--no-default-browser-check',
+        `--user-data-dir=${profileDir}`,
+        'about:blank'
+      ],
+      { stdio: ['ignore', 'ignore', 'ignore'], detached: true }
+    );
+
+    try {
+      const portFile = path.join(profileDir, 'DevToolsActivePort');
+      let port = null;
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(portFile)) {
+          const lines = fs.readFileSync(portFile, 'utf8').trim().split('\n');
+          if (lines[0] && /^\d+$/.test(lines[0].trim())) {
+            port = Number(lines[0].trim());
+            break;
+          }
+          }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert.ok(port, 'Chromium DevToolsActivePort must initialize');
+
+      let pageTarget = null;
+      const pageDeadline = Date.now() + 6000;
+      while (Date.now() < pageDeadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/json`);
+          if (res.ok) {
+            const targets = await res.json();
+            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            if (pageTarget) break;
+          }
+        } catch (_ignore) {
+          // Wait
+        }
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      assert.ok(pageTarget, 'Chromium page target must be available');
+
+      const evalExpr = `(async () => {
+        const exportsObj = {};
+        const module = { exports: exportsObj };
+        const fn = new Function('module', 'exports', ${JSON.stringify(contentSource)});
+        fn(module, exportsObj);
+        const { installContentBadges } = module.exports;
+
+        document.body.replaceChildren();
+        const conflictEl = document.createElement('div');
+        conflictEl.setAttribute('data-testid', 'User-Name');
+        const linkA = document.createElement('a');
+        linkA.setAttribute('href', '/alice_real');
+        linkA.textContent = 'Alice Real';
+        const spanWrap = document.createElement('div');
+        const spanB = document.createElement('span');
+        spanB.textContent = '@bob_real';
+        spanWrap.appendChild(spanB);
+        conflictEl.appendChild(linkA);
+        conflictEl.appendChild(spanWrap);
+        document.body.appendChild(conflictEl);
+
+        const linklessEl = document.createElement('div');
+        linklessEl.setAttribute('data-testid', 'User-Name');
+        const spanOnly = document.createElement('span');
+        spanOnly.textContent = '@bob_real';
+        linklessEl.appendChild(spanOnly);
+        document.body.appendChild(linklessEl);
+
+        const fakeWin = {
+          location: { origin: 'https://x.com' },
+          document,
+          MutationObserver: class { observe() {} disconnect() {} },
+          requestAnimationFrame: (cb) => setTimeout(() => cb(performance.now()), 0),
+          cancelAnimationFrame: (id) => clearTimeout(id)
+        };
+        fakeWin.top = fakeWin;
+
+        const ctrl = installContentBadges(fakeWin, {
+          subscribe: () => () => {},
+          getBindingContext: () => ({
+            bindingId: 'b_real',
+            actorUserId: '1001',
+            captureSessionId: 1,
+            collectionGeneration: 1,
+            accountGeneration: 1
+          }),
+          getRevision: () => 1,
+          resolveUserIdByHandle: (h) => {
+            if (h === 'alice_real') return '111';
+            if (h === 'bob_real') return '222';
+            return null;
+          },
+          resolveAuthorByTweetId: () => null,
+          queryCounts: async () => ({
+            ok: true,
+            revision: 1,
+            counts: { '111': 12, '222': 7 }
+          })
+        }, { debounceMs: 5 });
+        await new Promise((r) => setTimeout(r, 40));
+        const out = {
+          isHtmlCollection: conflictEl.children.constructor.name === 'HTMLCollection' && !Array.isArray(conflictEl.children),
+          conflictBadgeCount: conflictEl.querySelectorAll('.sparklink-badge').length,
+          linklessBadgeCount: linklessEl.querySelectorAll('.sparklink-badge').length,
+          linklessUserId: linklessEl.querySelector('.sparklink-badge')?.dataset.sparklinkUserId || null
+        };
+        ctrl.destroy();
+        return out;
+      })()`;
+
+      const cdpResult = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+        const timer = setTimeout(() => {
+          ws.close();
+          reject(new Error('CDP Runtime.evaluate timed out'));
+        }, 8000);
+        ws.addEventListener('open', () => {
+          ws.send(
+            JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: { expression: evalExpr, awaitPromise: true, returnByValue: true }
+            })
+          );
+        });
+        ws.addEventListener('message', (ev) => {
+          const msg = JSON.parse(String(ev.data));
+          if (msg.id === 1) {
+            clearTimeout(timer);
+            ws.close();
+            resolve(msg);
+          }
+        });
+        ws.addEventListener('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const val = cdpResult.result && cdpResult.result.result && cdpResult.result.result.value;
+      assert.deepEqual(val, {
+        isHtmlCollection: true,
+        conflictBadgeCount: 0,
+        linklessBadgeCount: 1,
+        linklessUserId: '222'
+      });
+    } finally {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch (_ignore) {}
+      await new Promise((r) => setTimeout(r, 150));
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch (_ignore) {}
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    }
+  }
+);
+
+test('[P2] Schema drift diagnostics: broken CreateTweet reply schema surfaces live-capture anomaly instead of normal collection, distinct from UserTweetsAndReplies history-backfill anomaly', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_schema_drift';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabSender = {
+    id: EXT_ID,
+    tab: { id: 88, active: true },
+    frameId: 0,
+    documentId: 'doc_88',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  const tabListeners = new Set();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: 88, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          for (const fn of tabListeners) fn(msg, { id: EXT_ID });
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  let nextTimelinePayload = {
+    data: {
+      user: {
+        result: {
+          __typename: 'User',
+          rest_id: '1001001',
+          // Renamed timeline_v2 -> timeline_v3_drifted so instructions cannot be recognized!
+          timeline_v3_drifted: { steps: [] }
+        }
+      }
+    }
+  };
+  let nextCreateTweetPayload = {
+    data: {
+      // Renamed create_tweet -> create_post_v2 so reply entity cannot be recognized!
+      create_post_v2: {
+        post_results: { id: '2122147641553899999' }
+      }
+    }
+  };
+
+  const winListeners = new Map();
+  const fakeWin = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelectorAll: () => []
+    },
+    __INITIAL_STATE__: viewerFixtures.ownProfileInitialState,
+    fetch(url) {
+      if (String(url).includes('UserTweetsAndReplies')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(nextTimelinePayload), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
+      if (String(url).includes('CreateTweet')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(nextCreateTweetPayload), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    },
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (winListeners.has(type)) winListeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = winListeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin });
+        }
+      });
+    }
+  };
+  fakeWin.top = fakeWin;
+
+  const pageChrome = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabSender),
+      onMessage: {
+        addListener(fn) {
+          tabListeners.add(fn);
+        },
+        removeListener(fn) {
+          tabListeners.delete(fn);
+        }
+      }
+    }
+  };
+
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  installMainInterceptor(fakeWin, adapterApi, { nowFn: () => NOW_MS });
+  const bridge = installIsolatedBridge(fakeWin, pageChrome, { nowFn: () => NOW_MS, retryDelayMs: 5 });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const { doc, nodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup.init();
+  assert.equal(nodes.get('viewer-status-badge').textContent, '采集中');
+
+  // 1. UserTweetsAndReplies returns drifted 200 JSON -> surfaces history-backfill anomaly only!
+  await fakeWin.fetch('https://x.com/i/api/graphql/HistQid/UserTweetsAndReplies');
+  await new Promise((r) => setTimeout(r, 40));
+  const snapHistoryDrift = await popup.refresh();
+  assert.equal(snapHistoryDrift.diagnostics.historyBackfillAnomaly, true);
+  assert.equal(snapHistoryDrift.diagnostics.liveCaptureAnomaly, false);
+  assert.equal(nodes.get('viewer-status-badge').textContent, '历史补录受限');
+  assert.ok(
+    nodes.get('status-banners').textContent.includes('历史补录暂不可用，仍可记录新回复和导入备份')
+  );
+
+  // 2. HTTP 200 GraphQL business error on CreateTweet (e.g. duplicate 187) must NOT trigger live schema-drift anomaly
+  nextCreateTweetPayload = createTweetFixtures.graphqlBusinessError.response;
+  await fakeWin.fetch('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 35));
+  const snapAfterBizErr = await popup.refresh();
+  assert.equal(snapAfterBizErr.diagnostics.liveCaptureAnomaly, false);
+
+  // 3. Real schema drift on CreateTweet reply (HTTP 200 without errors, renamed create_tweet / missing reply fields)
+  nextCreateTweetPayload = {
+    data: {
+      create_post_v2: {
+        post_results: { id: '2122147641553899999' }
+      }
+    }
+  };
+  await fakeWin.fetch('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const snapLiveDrift = await popup.refresh();
+  assert.equal(snapLiveDrift.diagnostics.liveCaptureAnomaly, true);
+  assert.equal(snapLiveDrift.diagnostics.historyBackfillAnomaly, true);
+  assert.notEqual(
+    nodes.get('viewer-status-badge').textContent,
+    '采集中',
+    'Popup must NOT display normal 采集中 when live CreateTweet reply schema fails'
+  );
+  assert.equal(nodes.get('viewer-status-badge').textContent, '实时采集异常');
+  assert.ok(nodes.get('status-banners').textContent.includes('实时回复响应结构无法识别'));
+
+  bridge.destroy();
+});
+
 
 
 

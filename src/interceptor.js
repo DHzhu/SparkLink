@@ -304,6 +304,8 @@
             events: res.events,
             observedUsers: res.observedUsers,
             observedTweets: res.observedTweets,
+            liveCaptureAnomaly: Boolean(res.incompleteObservation || res.anomalies.length > 0),
+            historyBackfillAnomaly: false,
             partialUnrecognized: res.anomalies.length > 0,
             incompleteObservation: res.incompleteObservation,
             anomalies: res.anomalies
@@ -336,6 +338,11 @@
             events: combinedEvents,
             observedUsers: res.observedUsers,
             observedTweets: res.observedTweets,
+            liveCaptureAnomaly: false,
+            historyBackfillAnomaly: Boolean(
+              match.category === 'replies_timeline' &&
+                (res.partialUnrecognized || res.anomalies.length > 0)
+            ),
             partialUnrecognized: res.partialUnrecognized,
             incompleteObservation: false,
             anomalies: res.anomalies

@@ -2070,6 +2070,340 @@ test(
   }
 );
 
+test('[P2] Explicit TimelineTweet with renamed tweet_results sets historyBackfillAnomaly in Popup while merging valid sibling replies', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_timeline_field_drift';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabSender = {
+    id: EXT_ID,
+    tab: { id: 93, active: true },
+    frameId: 0,
+    documentId: 'doc_93',
+    origin: 'https://x.com',
+    url: 'https://x.com/sample_me/with_replies'
+  };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  const tabListeners = new Set();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: 93, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          for (const fn of tabListeners) fn(msg, { id: EXT_ID });
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  const timelineFixtures = require('./fixtures/timelines.json');
+  const mixedDriftedTimeline = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  const entries = mixedDriftedTimeline.data.user.result.timeline_v2.timeline.instructions[0].entries;
+  // Keep entry[0] (valid conversation module with reply 2122147641553846272 -> 2002002),
+  // add a non-tweet cursor + promoted TimelineTweet (must be ignored), and rename tweet_results on explicit TimelineTweet!
+  entries.splice(
+    1,
+    entries.length - 1,
+    {
+      entryId: 'cursor-bottom-1',
+      content: {
+        entryType: 'TimelineTimelineItem',
+        itemContent: {
+          itemType: 'TimelineTimelineCursor',
+          value: 'cursor_val_1',
+          cursorType: 'Bottom'
+        }
+      }
+    },
+    {
+      entryId: 'promoted-tweet-1',
+      content: {
+        entryType: 'TimelineTimelineItem',
+        itemContent: {
+          itemType: 'TimelineTweet',
+          promotedMetadata: { impressionId: 'ad_1' },
+          tweet_results_renamed: { result: { rest_id: '888' } }
+        }
+      }
+    },
+    {
+      entryId: 'tweet-2122147641553849999',
+      content: {
+        entryType: 'TimelineTimelineItem',
+        itemContent: {
+          itemType: 'TimelineTweet',
+          // Renamed tweet_results -> tweet_results_v2!
+          tweet_results_v2: {
+            result: {
+              __typename: 'Tweet',
+              rest_id: '2122147641553849999'
+            }
+          }
+        }
+      }
+    }
+  );
+
+  const winListeners = new Map();
+  const fakeWin = {
+    location: { origin: 'https://x.com', href: 'https://x.com/sample_me/with_replies' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => []
+    },
+    __INITIAL_STATE__: structuredClone(viewerFixtures.ownProfileInitialState),
+    async fetch(url) {
+      if (String(url).includes('UserTweetsAndReplies')) {
+        return new Response(JSON.stringify(mixedDriftedTimeline), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      return new Response('{}', { status: 200 });
+    },
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (winListeners.has(type)) winListeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = winListeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin });
+        }
+      });
+    }
+  };
+  fakeWin.top = fakeWin;
+
+  const pageChrome = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabSender),
+      onMessage: {
+        addListener(fn) {
+          tabListeners.add(fn);
+        },
+        removeListener(fn) {
+          tabListeners.delete(fn);
+        }
+      }
+    }
+  };
+
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  installMainInterceptor(fakeWin, adapterApi, { nowFn: () => NOW_MS });
+  const bridge = installIsolatedBridge(fakeWin, pageChrome, { nowFn: () => NOW_MS, retryDelayMs: 5 });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const { doc, nodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup.init();
+  assert.equal(nodes.get('viewer-status-badge').textContent, '采集中');
+
+  await fakeWin.fetch(
+    'https://x.com/i/api/graphql/TimelineQid/UserTweetsAndReplies?variables=%7B%22userId%22%3A%221001001%22%7D'
+  );
+  await new Promise((r) => setTimeout(r, 50));
+
+  const snap = await popup.refresh();
+  assert.equal(snap.selectedAccount.summary.totalReplies, 1, 'Valid sibling reply must still merge');
+  assert.equal(snap.diagnostics.historyBackfillAnomaly, true);
+  assert.equal(snap.diagnostics.liveCaptureAnomaly, false);
+  assert.equal(nodes.get('viewer-status-badge').textContent, '历史补录受限');
+  assert.ok(nodes.get('status-banners').textContent.includes('历史补录暂不可用，仍可记录新回复和导入备份'));
+
+  bridge.destroy();
+});
+
+test(
+  '[P2] Real Chromium DOM direct Text node traversal on root author container via CDP',
+  { skip: !fs.existsSync('/usr/bin/chromium') || !fs.existsSync('/usr/bin/xvfb-run') },
+  async () => {
+    const contentSource = fs.readFileSync(path.resolve('src/content.js'), 'utf8');
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sparklink-chromium-direct-text-'));
+    const child = spawn(
+      '/usr/bin/xvfb-run',
+      [
+        '-a',
+        '/usr/bin/chromium',
+        '--remote-debugging-port=0',
+        '--no-first-run',
+        '--no-default-browser-check',
+        `--user-data-dir=${profileDir}`,
+        'about:blank'
+      ],
+      { stdio: ['ignore', 'ignore', 'ignore'], detached: true }
+    );
+
+    try {
+      const portFile = path.join(profileDir, 'DevToolsActivePort');
+      let port = null;
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(portFile)) {
+          const lines = fs.readFileSync(portFile, 'utf8').trim().split('\n');
+          if (lines[0] && /^\d+$/.test(lines[0].trim())) {
+            port = Number(lines[0].trim());
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert.ok(port, 'Chromium DevToolsActivePort must initialize');
+
+      let pageTarget = null;
+      const pageDeadline = Date.now() + 6000;
+      while (Date.now() < pageDeadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/json`);
+          if (res.ok) {
+            const targets = await res.json();
+            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            if (pageTarget) break;
+          }
+        } catch (_ignore) {}
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      assert.ok(pageTarget, 'Chromium page target must be available');
+
+      const evalExpr = `(async () => {
+        const exportsObj = {};
+        const mod = { exports: exportsObj };
+        new Function('module', 'exports', ${JSON.stringify(contentSource)})(mod, exportsObj);
+        const { installContentBadges } = mod.exports;
+
+        document.body.replaceChildren();
+
+        // Case 1: <div data-testid="User-Name"><a href="/alice_real">Alice Real</a>@bob_real</div> (direct Text child)
+        const directConflictEl = document.createElement('div');
+        directConflictEl.setAttribute('data-testid', 'User-Name');
+        const linkA = document.createElement('a');
+        linkA.setAttribute('href', '/alice_real');
+        linkA.textContent = 'Alice Real';
+        directConflictEl.appendChild(linkA);
+        directConflictEl.appendChild(document.createTextNode('@bob_real'));
+        document.body.appendChild(directConflictEl);
+
+        // Case 2: <div data-testid="User-Name">@bob_real</div> (ONLY direct Text child, zero Element children!)
+        const directOnlyEl = document.createElement('div');
+        directOnlyEl.setAttribute('data-testid', 'User-Name');
+        directOnlyEl.appendChild(document.createTextNode('@bob_real'));
+        document.body.appendChild(directOnlyEl);
+
+        const fakeWin = {
+          location: { origin: 'https://x.com' },
+          document,
+          MutationObserver: class { observe() {} disconnect() {} },
+          requestAnimationFrame: (cb) => setTimeout(() => cb(performance.now()), 0),
+          cancelAnimationFrame: (id) => clearTimeout(id)
+        };
+        fakeWin.top = fakeWin;
+
+        const ctrl = installContentBadges(fakeWin, {
+          subscribe: () => () => {},
+          getBindingContext: () => ({
+            bindingId: 'b_direct_text',
+            actorUserId: '1001',
+            captureSessionId: 1,
+            collectionGeneration: 1,
+            accountGeneration: 1
+          }),
+          getRevision: () => 1,
+          resolveUserIdByHandle: (h) => {
+            if (h === 'alice_real') return '111';
+            if (h === 'bob_real') return '222';
+            return null;
+          },
+          resolveAuthorByTweetId: () => null,
+          queryCounts: async () => ({
+            ok: true,
+            revision: 1,
+            counts: { '111': 12, '222': 7 }
+          })
+        }, { debounceMs: 5 });
+
+        await new Promise((r) => setTimeout(r, 40));
+        const out = {
+          directConflictBadgeCount: directConflictEl.querySelectorAll('.sparklink-badge').length,
+          directOnlyBadgeCount: directOnlyEl.querySelectorAll('.sparklink-badge').length,
+          directOnlyUserId: directOnlyEl.querySelector('.sparklink-badge')?.dataset.sparklinkUserId || null
+        };
+        ctrl.destroy();
+        return out;
+      })()`;
+
+      const cdpResult = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+        const timer = setTimeout(() => {
+          ws.close();
+          reject(new Error('CDP Runtime.evaluate timed out'));
+        }, 8000);
+        ws.addEventListener('open', () => {
+          ws.send(
+            JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: { expression: evalExpr, awaitPromise: true, returnByValue: true }
+            })
+          );
+        });
+        ws.addEventListener('message', (ev) => {
+          const msg = JSON.parse(String(ev.data));
+          if (msg.id === 1) {
+            clearTimeout(timer);
+            ws.close();
+            resolve(msg);
+          }
+        });
+        ws.addEventListener('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const val = cdpResult.result && cdpResult.result.result && cdpResult.result.result.value;
+      assert.deepEqual(val, {
+        directConflictBadgeCount: 0,
+        directOnlyBadgeCount: 1,
+        directOnlyUserId: '222'
+      });
+    } finally {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch (_ignore) {}
+      await new Promise((r) => setTimeout(r, 150));
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch (_ignore) {}
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    }
+  }
+);
+
 
 
 

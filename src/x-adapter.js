@@ -801,11 +801,20 @@
       }
 
       function inspectItemContent(itemContent) {
-        if (!isPlainObject(itemContent) || !isPlainObject(itemContent.tweet_results)) {
+        if (!isPlainObject(itemContent)) {
           return;
         }
         // Skip promoted tweets
         if (isPlainObject(itemContent.promotedMetadata)) {
+          return;
+        }
+        const isExplicitTweetItem =
+          itemContent.itemType === 'TimelineTweet' ||
+          itemContent.__typename === 'TimelineTweet';
+        if (!isPlainObject(itemContent.tweet_results)) {
+          if (isExplicitTweetItem) {
+            unrecognizedTweetCount += 1;
+          }
           return;
         }
         const rawRes = isPlainObject(itemContent.tweet_results.result)
@@ -848,9 +857,21 @@
           for (let i = 0; i < content.items.length; i += 1) {
             const modItem = content.items[i];
             if (isPlainObject(modItem) && isPlainObject(modItem.item)) {
-              inspectItemContent(modItem.item.itemContent);
+              if (isPlainObject(modItem.item.itemContent)) {
+                inspectItemContent(modItem.item.itemContent);
+              } else if (
+                typeof modItem.entryId === 'string' &&
+                /(?:^|-)tweet-\d+$/.test(modItem.entryId)
+              ) {
+                unrecognizedTweetCount += 1;
+              }
             }
           }
+        } else if (
+          typeof entry.entryId === 'string' &&
+          /^tweet-\d+$/.test(entry.entryId)
+        ) {
+          unrecognizedTweetCount += 1;
         }
       }
 

@@ -121,16 +121,10 @@
 
     // Cross-check visible @handle text across HTMLCollection / NodeList subtrees
     let textHandle = null;
-    const stack = [];
-    const rootChildren = container.children;
-    if (rootChildren && typeof rootChildren.length === 'number') {
-      for (let i = rootChildren.length - 1; i >= 0; i -= 1) {
-        stack.push(rootChildren[i]);
-      }
-    }
+    const stack = [container];
     while (stack.length > 0) {
       const node = stack.pop();
-      if (!node || node.nodeType !== 1 || isSparklinkNode(node)) {
+      if (!node || (node !== container && node.nodeType !== 1) || isSparklinkNode(node)) {
         continue;
       }
       const childNodes = node.childNodes;

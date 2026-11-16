@@ -98,10 +98,25 @@ export function createBackgroundService(chromeApi, options = {}) {
     });
   }
 
+  function createAccessLevelInitError() {
+    const err = new Error(
+      '本地存储访问隔离初始化失败（TRUSTED_CONTEXTS 未生效），暂不允许开启采集，请重试。'
+    );
+    err.code = 'ACCESS_LEVEL_INIT_FAILED';
+    return err;
+  }
+
   function enqueueSessionOp(fn) {
     const run = async () => {
-      await ensureBooted();
-      return fn();
+      try {
+        await ensureBooted();
+        return await fn();
+      } catch (err) {
+        if (err && err.code === 'ACCESS_LEVEL_INIT_FAILED') {
+          return { ok: false, code: 'ACCESS_LEVEL_INIT_FAILED', message: err.message };
+        }
+        throw err;
+      }
     };
     const p = sessionWriteTail.then(run, run);
     sessionWriteTail = p.then(
@@ -113,26 +128,23 @@ export function createBackgroundService(chromeApi, options = {}) {
 
   async function doBoot() {
     // Section 6.3: Enforce TRUSTED_CONTEXTS on both storage areas BEFORE handling business messages
-    if (typeof chromeApi.storage.local.setAccessLevel === 'function') {
-      try {
-        await chromeApi.storage.local.setAccessLevel({
-          accessLevel: 'TRUSTED_CONTEXTS'
-        });
-      } catch (_err) {
-        // Ignore if platform version handles local access implicitly
-      }
-    }
     if (
-      chromeApi.storage.session &&
-      typeof chromeApi.storage.session.setAccessLevel === 'function'
+      !chromeApi.storage.local ||
+      typeof chromeApi.storage.local.setAccessLevel !== 'function' ||
+      !chromeApi.storage.session ||
+      typeof chromeApi.storage.session.setAccessLevel !== 'function'
     ) {
-      try {
-        await chromeApi.storage.session.setAccessLevel({
-          accessLevel: 'TRUSTED_CONTEXTS'
-        });
-      } catch (_err) {
-        // Ignore
-      }
+      throw createAccessLevelInitError();
+    }
+    try {
+      await chromeApi.storage.local.setAccessLevel({
+        accessLevel: 'TRUSTED_CONTEXTS'
+      });
+      await chromeApi.storage.session.setAccessLevel({
+        accessLevel: 'TRUSTED_CONTEXTS'
+      });
+    } catch (_err) {
+      throw createAccessLevelInitError();
     }
 
     const storageBoot = await storage.init();
@@ -163,12 +175,27 @@ export function createBackgroundService(chromeApi, options = {}) {
 
   function ensureBooted() {
     if (!bootPromise) {
-      bootPromise = doBoot();
+      bootPromise = doBoot().catch((err) => {
+        bootPromise = null;
+        throw err;
+      });
     }
     return bootPromise;
   }
 
+  function syncExclusiveActiveTab(tabKey, isActive) {
+    if (!isActive || !sessionTabsCache) {
+      return;
+    }
+    for (const [k, entry] of sessionTabsCache.entries()) {
+      if (k !== tabKey && entry.active) {
+        entry.active = false;
+      }
+    }
+  }
+
   function upsertSessionTab(tabKey, record) {
+    syncExclusiveActiveTab(tabKey, Boolean(record.active));
     if (sessionTabsCache.has(tabKey)) {
       sessionTabsCache.delete(tabKey);
     }
@@ -242,17 +269,69 @@ export function createBackgroundService(chromeApi, options = {}) {
     };
   }
 
+  function emptyDiagnostics() {
+    return {
+      partialUnrecognized: false,
+      incompleteObservation: false,
+      observationDropped: false
+    };
+  }
+
+  async function resolveForegroundTabEntry() {
+    if (chromeApi.tabs && typeof chromeApi.tabs.query === 'function') {
+      let queriedTabs = [];
+      try {
+        queriedTabs = await chromeApi.tabs.query({ active: true, lastFocusedWindow: true });
+        if (!Array.isArray(queriedTabs) || queriedTabs.length === 0) {
+          queriedTabs = await chromeApi.tabs.query({ active: true, currentWindow: true });
+        }
+      } catch (_err) {
+        queriedTabs = [];
+      }
+      const fgTab = Array.isArray(queriedTabs) && queriedTabs.length > 0 ? queriedTabs[0] : null;
+      if (!fgTab || !Number.isInteger(fgTab.id)) {
+        return null;
+      }
+      if (typeof fgTab.url === 'string' && fgTab.url.length > 0) {
+        try {
+          if (!ALLOWED_X_ORIGINS.has(new URL(fgTab.url).origin)) {
+            return null;
+          }
+        } catch (_err) {
+          return null;
+        }
+      }
+      const tabKey = String(fgTab.id);
+      const cachedEntry = sessionTabsCache.get(tabKey) || null;
+      if (
+        cachedEntry &&
+        typeof fgTab.url !== 'string' &&
+        typeof chromeApi.tabs.sendMessage === 'function'
+      ) {
+        try {
+          await chromeApi.tabs.sendMessage(fgTab.id, { type: 'PING_X_TAB' }, { frameId: 0 });
+        } catch (_err) {
+          sessionTabsCache.delete(tabKey);
+          await persistSessionTabs();
+          return null;
+        }
+      }
+      return cachedEntry;
+    }
+
+    const activeCandidates = Array.from(sessionTabsCache.values())
+      .filter((entry) => Boolean(entry.active))
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    return activeCandidates.length > 0 ? activeCandidates[0] : null;
+  }
+
   async function resolveActivePopupContext() {
     const ctrl = await storage.getControlState();
     if (!ctrl.ok) {
       return {
         activeActorUserId: null,
         viewerStatus: 'storage_error',
-        diagnostics: {
-          partialUnrecognized: false,
-          incompleteObservation: false,
-          observationDropped: false
-        }
+        diagnostics: emptyDiagnostics()
       };
     }
 
@@ -260,51 +339,30 @@ export function createBackgroundService(chromeApi, options = {}) {
       return {
         activeActorUserId: null,
         viewerStatus: 'paused',
-        diagnostics: {
-          partialUnrecognized: false,
-          incompleteObservation: false,
-          observationDropped: false
-        }
+        diagnostics: emptyDiagnostics()
       };
     }
 
-    const candidates = Array.from(sessionTabsCache.values()).sort((a, b) => {
-      if (a.active !== b.active) {
-        return a.active ? -1 : 1;
-      }
-      return (b.updatedAt || 0) - (a.updatedAt || 0);
-    });
-
-    const diagnostics = {
-      partialUnrecognized: false,
-      incompleteObservation: false,
-      observationDropped: false
-    };
-
-    let boundCandidate = null;
-    let sawUnboundActiveTab = false;
-
-    for (const entry of candidates) {
-      if (entry.diagnostics) {
-        diagnostics.partialUnrecognized =
-          diagnostics.partialUnrecognized || Boolean(entry.diagnostics.partialUnrecognized);
-        diagnostics.incompleteObservation =
-          diagnostics.incompleteObservation || Boolean(entry.diagnostics.incompleteObservation);
-        diagnostics.observationDropped =
-          diagnostics.observationDropped || Boolean(entry.diagnostics.observationDropped);
-      }
-      if (entry.bindingContext && bindingMatchesState(entry.bindingContext, ctrl)) {
-        if (!boundCandidate) {
-          boundCandidate = entry;
-        }
-      } else {
-        sawUnboundActiveTab = true;
-      }
+    const fgEntry = await resolveForegroundTabEntry();
+    if (!fgEntry) {
+      return {
+        activeActorUserId: null,
+        viewerStatus: 'no_x_tab',
+        diagnostics: emptyDiagnostics()
+      };
     }
 
-    if (boundCandidate) {
+    const diagnostics = {
+      partialUnrecognized: Boolean(fgEntry.diagnostics && fgEntry.diagnostics.partialUnrecognized),
+      incompleteObservation: Boolean(
+        fgEntry.diagnostics && fgEntry.diagnostics.incompleteObservation
+      ),
+      observationDropped: Boolean(fgEntry.diagnostics && fgEntry.diagnostics.observationDropped)
+    };
+
+    if (fgEntry.bindingContext && bindingMatchesState(fgEntry.bindingContext, ctrl)) {
       return {
-        activeActorUserId: boundCandidate.bindingContext.actorUserId,
+        activeActorUserId: fgEntry.bindingContext.actorUserId,
         viewerStatus: 'bound',
         diagnostics
       };
@@ -312,7 +370,7 @@ export function createBackgroundService(chromeApi, options = {}) {
 
     return {
       activeActorUserId: null,
-      viewerStatus: sawUnboundActiveTab ? 'unconfirmed' : 'no_x_tab',
+      viewerStatus: 'unconfirmed',
       diagnostics
     };
   }
@@ -525,6 +583,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           existing.bindingContext.actorUserId === msg.viewer.actorUserId &&
           bindingMatchesState(existing.bindingContext, ctrlAfter)
         ) {
+          syncExclusiveActiveTab(xSender.tabKey, xSender.active);
           existing.active = xSender.active;
           existing.updatedAt = nowFn();
           await persistSessionTabs();
@@ -621,6 +680,7 @@ export function createBackgroundService(chromeApi, options = {}) {
             )
           };
         }
+        syncExclusiveActiveTab(xSender.tabKey, xSender.active);
         sessionEntry.active = xSender.active;
         sessionEntry.updatedAt = nowFn();
         await persistSessionTabs();
@@ -687,8 +747,6 @@ export function createBackgroundService(chromeApi, options = {}) {
   }
 
   async function handleMessage(msg, sender) {
-    await ensureBooted();
-
     if (!isPlainObject(msg) || typeof msg.type !== 'string' || hasDangerousKeys(msg)) {
       return { ok: false, code: 'INVALID_MESSAGE' };
     }
@@ -697,6 +755,14 @@ export function createBackgroundService(chromeApi, options = {}) {
       if (!isPopupSender(sender)) {
         return { ok: false, code: 'FORBIDDEN_SENDER' };
       }
+      try {
+        await ensureBooted();
+      } catch (err) {
+        if (err && err.code === 'ACCESS_LEVEL_INIT_FAILED') {
+          return { ok: false, code: 'ACCESS_LEVEL_INIT_FAILED', message: err.message };
+        }
+        throw err;
+      }
       return handlePopupMessage(msg);
     }
 
@@ -704,6 +770,14 @@ export function createBackgroundService(chromeApi, options = {}) {
       const xSender = extractTopXContentSender(sender);
       if (!xSender) {
         return { ok: false, code: 'FORBIDDEN_SENDER' };
+      }
+      try {
+        await ensureBooted();
+      } catch (err) {
+        if (err && err.code === 'ACCESS_LEVEL_INIT_FAILED') {
+          return { ok: false, code: 'ACCESS_LEVEL_INIT_FAILED', message: err.message };
+        }
+        throw err;
       }
       return handleContentScriptMessage(msg, xSender);
     }
@@ -736,7 +810,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           sessionTabsCache.delete(key);
           await persistSessionTabs();
         }
-      });
+      }).catch(() => {});
     });
   }
 

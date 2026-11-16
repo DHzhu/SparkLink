@@ -874,11 +874,18 @@
       }
     }
 
-    function onRuntimeMessage(msg, sender) {
+    function onRuntimeMessage(msg, sender, sendResponse) {
       if (state.destroyed || !isPlainObject(msg)) {
         return;
       }
       if (sender && chromeApi.runtime.id && sender.id && sender.id !== chromeApi.runtime.id) {
+        return;
+      }
+
+      if (msg.type === 'PING_X_TAB') {
+        if (typeof sendResponse === 'function') {
+          sendResponse({ ok: true, alive: true });
+        }
         return;
       }
 

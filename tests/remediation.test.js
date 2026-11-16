@@ -553,4 +553,294 @@ test('[P1] 20,000-reply state (~5.92 MiB) exported via Popup stays under 9 MiB a
   assert.equal(commitRes.added, 20000);
 });
 
+function createPopupDomHarness() {
+  const nodes = new Map();
+  const makeNode = (id) => {
+    const listeners = new Map();
+    const n = {
+      id,
+      className: '',
+      hidden: false,
+      disabled: false,
+      checked: false,
+      value: '',
+      _text: '',
+      children: [],
+      get textContent() {
+        if (this.children.length === 0) return this._text;
+        return this.children.map((c) => c.textContent).join('');
+      },
+      set textContent(val) {
+        this.children = [];
+        this._text = String(val);
+      },
+      setAttribute() {},
+      appendChild(c) {
+        this.children.push(c);
+        return c;
+      },
+      replaceChildren(...cs) {
+        this.children = cs;
+      },
+      click() {},
+      remove() {},
+      addEventListener(t, fn) {
+        if (!listeners.has(t)) listeners.set(t, []);
+        listeners.get(t).push(fn);
+      },
+      async trigger(t) {
+        for (const fn of listeners.get(t) || []) await fn({ target: n });
+      }
+    };
+    nodes.set(id, n);
+    return n;
+  };
+  for (const id of [
+    'collection-toggle',
+    'btn-enable-cta',
+    'initial-activation-banner',
+    'account-select',
+    'viewer-status-badge',
+    'status-banners',
+    'overview-title',
+    'overview-coverage',
+    'latest-reply-time',
+    'stat-total-replies',
+    'stat-active-targets',
+    'stat-deep-targets',
+    'top20-list',
+    'top20-empty',
+    'btn-cleanup',
+    'btn-export',
+    'btn-import',
+    'file-import',
+    'btn-clear-account',
+    'btn-clear-all',
+    'action-feedback',
+    'modal-overlay',
+    'modal-title',
+    'modal-body',
+    'btn-modal-confirm',
+    'btn-modal-cancel'
+  ]) {
+    makeNode(id);
+  }
+  const doc = {
+    body: makeNode('body'),
+    getElementById: (id) => nodes.get(id) || null,
+    createElement: (tag) => makeNode(tag),
+    createElementNS: (_ns, tag) => makeNode(tag)
+  };
+  return { doc, nodes };
+}
+
+test('[P2] Popup foreground tab resolution: background bound Tab A never masks unbound foreground X Tab B or non-X foreground Tab C', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_fg_tab';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  let currentForegroundTab = { id: 10, active: true };
+  const unloadedTabIds = new Set();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return currentForegroundTab ? [currentForegroundTab] : [];
+        },
+        async sendMessage(tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB' && unloadedTabIds.has(tabId)) {
+            throw new Error('Could not establish connection. Receiving end does not exist.');
+          }
+          return { ok: true, alive: true };
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+
+  // 1. Tab 10 was active when bound to Account A (1001001) and recorded a diagnostic anomaly
+  const tab10Sender = {
+    id: EXT_ID,
+    tab: { id: 10, active: true },
+    frameId: 0,
+    documentId: 'doc_10',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+  const hello10 = await bg.handleMessage({ type: 'HELLO' }, tab10Sender);
+  const bind10 = await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: hello10.captureSessionId,
+      viewer: { actorUserId: '1001001', handle: 'bg_alice', displayName: 'Background Alice' }
+    },
+    tab10Sender
+  );
+  await bg.handleMessage(
+    {
+      type: 'SUBMIT_OBSERVED_BATCH',
+      bindingContext: bind10.bindingContext,
+      incompleteObservation: true,
+      events: []
+    },
+    tab10Sender
+  );
+
+  // 2. User opens Tab 20 in foreground on X (HELLO sent, NOT bound yet) while Tab 10 stays in background
+  currentForegroundTab = { id: 20, active: true };
+  const tab20Sender = {
+    id: EXT_ID,
+    tab: { id: 20, active: true },
+    frameId: 0,
+    documentId: 'doc_20',
+    origin: 'https://x.com',
+    url: 'https://x.com/i/flow/login'
+  };
+  await bg.handleMessage({ type: 'HELLO' }, tab20Sender);
+
+  const { doc, nodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const snapUnboundFg = await popup.init();
+
+  assert.equal(snapUnboundFg.viewerStatus, 'unconfirmed');
+  assert.equal(snapUnboundFg.activeTabActorUserId, null);
+  // Background Tab 10 diagnostics must NOT leak into Tab 20
+  assert.equal(snapUnboundFg.diagnostics.incompleteObservation, false);
+  assert.equal(nodes.get('viewer-status-badge').textContent, '账号待确认');
+  assert.equal(
+    nodes.get('account-select').children[0].textContent.includes('(当前页)'),
+    false,
+    'Background Account A must NOT be marked (当前页)'
+  );
+
+  // 3. User switches foreground to Tab 30 (non-X page, never sent HELLO)
+  currentForegroundTab = { id: 30, active: true };
+  const snapNonXFg = await popup.refresh();
+  assert.equal(snapNonXFg.viewerStatus, 'no_x_tab');
+  assert.equal(snapNonXFg.activeTabActorUserId, null);
+  assert.equal(nodes.get('viewer-status-badge').textContent, '无活动 X 页');
+
+  // 4. User switches foreground back to Tab 10 -> Account A is active and bound again
+  currentForegroundTab = { id: 10, active: true };
+  const snapBoundFg = await popup.refresh();
+  assert.equal(snapBoundFg.viewerStatus, 'bound');
+  assert.equal(snapBoundFg.activeTabActorUserId, '1001001');
+  assert.equal(snapBoundFg.diagnostics.incompleteObservation, true);
+  assert.equal(nodes.get('viewer-status-badge').textContent, '采集中');
+  assert.equal(nodes.get('account-select').children[0].textContent, '@bg_alice (当前页)');
+
+  // 5. Same Tab 10 navigates away from X to a non-X site (no "tabs" permission so fgTab.url is omitted, Content Script unreachable)
+  unloadedTabIds.add(10);
+  const snapNavigatedAway = await popup.refresh();
+  assert.equal(snapNavigatedAway.viewerStatus, 'no_x_tab');
+  assert.equal(snapNavigatedAway.activeTabActorUserId, null);
+  assert.equal(nodes.get('viewer-status-badge').textContent, '无活动 X 页');
+});
+
+test('[P2] Storage setAccessLevel(TRUSTED_CONTEXTS) failure blocks collection and Content Script access with retryable ACCESS_LEVEL_INIT_FAILED', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_acl';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const xSender = {
+    id: EXT_ID,
+    tab: { id: 77, active: true },
+    frameId: 0,
+    documentId: 'doc_77',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  let failLocal = true;
+  let failSession = false;
+
+  const localArea = createMockArea();
+  localArea.setAccessLevel = async () => {
+    if (failLocal) {
+      throw new Error('Simulated storage.local.setAccessLevel failure');
+    }
+  };
+
+  const sessionArea = createMockArea();
+  sessionArea.setAccessLevel = async () => {
+    if (failSession) {
+      throw new Error('Simulated storage.session.setAccessLevel failure');
+    }
+  };
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: 77, active: true }];
+        },
+        async sendMessage() {},
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  const { doc, nodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+
+  // Attempt 1: storage.local.setAccessLevel fails -> snapshot & toggle & Content Script HELLO all blocked
+  const snapFail1 = await popup.init();
+  assert.equal(snapFail1.ok, false);
+  assert.equal(snapFail1.code, 'ACCESS_LEVEL_INIT_FAILED');
+  assert.equal(nodes.get('collection-toggle').checked, false);
+
+  const enableFail1 = await bg.handleMessage(
+    { type: 'SET_COLLECTION_ENABLED', enabled: true },
+    POPUP_SENDER
+  );
+  assert.equal(enableFail1.ok, false);
+  assert.equal(enableFail1.code, 'ACCESS_LEVEL_INIT_FAILED');
+  assert.deepEqual(localArea.peek(), {}, 'Must not write collectionEnabled=true before TRUSTED_CONTEXTS succeeds');
+
+  const helloFail1 = await bg.handleMessage({ type: 'HELLO' }, xSender);
+  assert.equal(helloFail1.ok, false);
+  assert.equal(helloFail1.code, 'ACCESS_LEVEL_INIT_FAILED');
+
+  // Attempt 2: storage.local succeeds, storage.session.setAccessLevel fails -> still blocked
+  failLocal = false;
+  failSession = true;
+  await nodes.get('btn-enable-cta').trigger('click');
+  assert.equal(nodes.get('collection-toggle').checked, false);
+  assert.ok(nodes.get('action-feedback').textContent.includes('TRUSTED_CONTEXTS'));
+
+  // Attempt 3: transient failure resolved -> retry succeeds without reloading extension!
+  failSession = false;
+  await nodes.get('btn-enable-cta').trigger('click');
+  assert.equal(nodes.get('collection-toggle').checked, true);
+
+  const snapRecovered = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
+  assert.equal(snapRecovered.ok, true);
+  assert.equal(snapRecovered.settings.collectionEnabled, true);
+});
+
+
 

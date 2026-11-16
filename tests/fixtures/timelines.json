@@ -1,0 +1,397 @@
+{
+  "ownRepliesTimelineMixed": {
+    "requestUrl": "https://x.com/i/api/graphql/tImElInEqUeRyId01/UserTweetsAndReplies?variables=%7B%22userId%22%3A%221001001%22%2C%22count%22%3A20%7D",
+    "response": {
+      "data": {
+        "user": {
+          "result": {
+            "__typename": "User",
+            "rest_id": "1001001",
+            "timeline_v2": {
+              "timeline": {
+                "instructions": [
+                  {
+                    "type": "TimelineAddEntries",
+                    "entries": [
+                      {
+                        "entryId": "profile-conversation-1",
+                        "content": {
+                          "entryType": "TimelineTimelineModule",
+                          "items": [
+                            {
+                              "entryId": "profile-conversation-1-tweet-2121785253688246272",
+                              "item": {
+                                "itemContent": {
+                                  "itemType": "TimelineTweet",
+                                  "tweet_results": {
+                                    "result": {
+                                      "__typename": "Tweet",
+                                      "rest_id": "2121785253688246272",
+                                      "core": {
+                                        "user_results": {
+                                          "result": {
+                                            "__typename": "User",
+                                            "rest_id": "2002002",
+                                            "core": {
+                                              "screen_name": "sample_friend",
+                                              "name": "示例好友"
+                                            }
+                                          }
+                                        }
+                                      },
+                                      "legacy": {
+                                        "user_id_str": "2002002",
+                                        "created_at": "Mon Nov 16 01:00:00 +0000 2026"
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "entryId": "profile-conversation-1-tweet-2122147641553846272",
+                              "item": {
+                                "itemContent": {
+                                  "itemType": "TimelineTweet",
+                                  "tweet_results": {
+                                    "result": {
+                                      "__typename": "Tweet",
+                                      "rest_id": "2122147641553846272",
+                                      "core": {
+                                        "user_results": {
+                                          "result": {
+                                            "__typename": "User",
+                                            "rest_id": "1001001",
+                                            "core": {
+                                              "screen_name": "sample_me",
+                                              "name": "示例账号"
+                                            }
+                                          }
+                                        }
+                                      },
+                                      "legacy": {
+                                        "user_id_str": "1001001",
+                                        "created_at": "Mon Nov 16 02:00:00 +0000 2026",
+                                        "in_reply_to_status_id_str": "2121785253688246272",
+                                        "in_reply_to_user_id_str": "2002002",
+                                        "in_reply_to_screen_name": "sample_friend"
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "entryId": "tweet-2122147641553847003",
+                        "content": {
+                          "entryType": "TimelineTimelineItem",
+                          "itemContent": {
+                            "itemType": "TimelineTweet",
+                            "tweet_results": {
+                              "result": {
+                                "__typename": "Tweet",
+                                "rest_id": "2122147641553847003",
+                                "core": {
+                                  "user_results": {
+                                    "result": {
+                                      "__typename": "User",
+                                      "rest_id": "1001001",
+                                      "core": {
+                                        "screen_name": "sample_me",
+                                        "name": "示例账号"
+                                      }
+                                    }
+                                  }
+                                },
+                                "legacy": {
+                                  "user_id_str": "1001001",
+                                  "created_at": "Mon Nov 16 02:35:00 +0000 2026",
+                                  "in_reply_to_status_id_str": "2121785253688247000",
+                                  "in_reply_to_user_id_str": "2002005",
+                                  "in_reply_to_screen_name": "alice_dev"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "entryId": "tweet-missing-target-2122147641553847004",
+                        "content": {
+                          "entryType": "TimelineTimelineItem",
+                          "itemContent": {
+                            "itemType": "TimelineTweet",
+                            "tweet_results": {
+                              "result": {
+                                "__typename": "Tweet",
+                                "rest_id": "2122147641553847004",
+                                "core": {
+                                  "user_results": {
+                                    "result": {
+                                      "__typename": "User",
+                                      "rest_id": "1001001",
+                                      "core": {
+                                        "screen_name": "sample_me",
+                                        "name": "示例账号"
+                                      }
+                                    }
+                                  }
+                                },
+                                "legacy": {
+                                  "user_id_str": "1001001",
+                                  "created_at": "Mon Nov 16 02:36:00 +0000 2026",
+                                  "in_reply_to_status_id_str": "2121785253688249999"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "entryId": "tweet-retweet-2122147641553847005",
+                        "content": {
+                          "entryType": "TimelineTimelineItem",
+                          "itemContent": {
+                            "itemType": "TimelineTweet",
+                            "tweet_results": {
+                              "result": {
+                                "__typename": "Tweet",
+                                "rest_id": "2122147641553847005",
+                                "core": {
+                                  "user_results": {
+                                    "result": {
+                                      "__typename": "User",
+                                      "rest_id": "1001001",
+                                      "core": { "screen_name": "sample_me", "name": "示例账号" }
+                                    }
+                                  }
+                                },
+                                "legacy": {
+                                  "user_id_str": "1001001",
+                                  "created_at": "Mon Nov 16 02:37:00 +0000 2026",
+                                  "retweeted_status_result": {
+                                    "result": {
+                                      "__typename": "Tweet",
+                                      "rest_id": "2121000000000000001",
+                                      "core": {
+                                        "user_results": {
+                                          "result": {
+                                            "__typename": "User",
+                                            "rest_id": "2002006",
+                                            "core": { "screen_name": "rt_author", "name": "被转推者" }
+                                          }
+                                        }
+                                      },
+                                      "legacy": {
+                                        "user_id_str": "2002006",
+                                        "created_at": "Mon Nov 16 01:10:00 +0000 2026",
+                                        "in_reply_to_status_id_str": "2120999999999999999",
+                                        "in_reply_to_user_id_str": "2002007"
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        "entryId": "tweet-quote-2122147641553847006",
+                        "content": {
+                          "entryType": "TimelineTimelineItem",
+                          "itemContent": {
+                            "itemType": "TimelineTweet",
+                            "tweet_results": {
+                              "result": {
+                                "__typename": "Tweet",
+                                "rest_id": "2122147641553847006",
+                                "core": {
+                                  "user_results": {
+                                    "result": {
+                                      "__typename": "User",
+                                      "rest_id": "1001001",
+                                      "core": { "screen_name": "sample_me", "name": "示例账号" }
+                                    }
+                                  }
+                                },
+                                "quoted_status_result": {
+                                  "result": {
+                                    "__typename": "Tweet",
+                                    "rest_id": "2121000000000000002",
+                                    "core": {
+                                      "user_results": {
+                                        "result": {
+                                          "__typename": "User",
+                                          "rest_id": "2002008",
+                                          "core": { "screen_name": "quoted_author", "name": "被引用者" }
+                                        }
+                                      }
+                                    },
+                                    "legacy": {
+                                      "user_id_str": "2002008",
+                                      "created_at": "Mon Nov 16 01:20:00 +0000 2026",
+                                      "in_reply_to_status_id_str": "2120888888888888888",
+                                      "in_reply_to_user_id_str": "2002009"
+                                    }
+                                  }
+                                },
+                                "legacy": {
+                                  "user_id_str": "1001001",
+                                  "created_at": "Mon Nov 16 02:38:00 +0000 2026",
+                                  "is_quote_status": true
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "otherUserRepliesTimeline": {
+    "requestUrl": "https://x.com/i/api/graphql/tImElInEqUeRyId01/UserTweetsAndReplies?variables=%7B%22userId%22%3A%222002002%22%2C%22count%22%3A20%7D",
+    "response": {
+      "data": {
+        "user": {
+          "result": {
+            "__typename": "User",
+            "rest_id": "2002002",
+            "timeline_v2": {
+              "timeline": {
+                "instructions": [
+                  {
+                    "type": "TimelineAddEntries",
+                    "entries": [
+                      {
+                        "entryId": "tweet-2122999999999999999",
+                        "content": {
+                          "entryType": "TimelineTimelineItem",
+                          "itemContent": {
+                            "itemType": "TimelineTweet",
+                            "tweet_results": {
+                              "result": {
+                                "__typename": "Tweet",
+                                "rest_id": "2122999999999999999",
+                                "core": {
+                                  "user_results": {
+                                    "result": {
+                                      "__typename": "User",
+                                      "rest_id": "2002002",
+                                      "core": {
+                                        "screen_name": "sample_friend",
+                                        "name": "示例好友"
+                                      }
+                                    }
+                                  }
+                                },
+                                "legacy": {
+                                  "user_id_str": "2002002",
+                                  "created_at": "Mon Nov 16 02:40:00 +0000 2026",
+                                  "in_reply_to_status_id_str": "2121700000000000001",
+                                  "in_reply_to_user_id_str": "1001001"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tweetDetailResolutionAndRename": {
+    "requestUrl": "https://x.com/i/api/graphql/dEtAiLqUeRyId02/TweetDetail?variables=%7B%22focalTweetId%22%3A%222121789999999999999%22%7D",
+    "response": {
+      "data": {
+        "threaded_conversation_with_injections_v2": {
+          "instructions": [
+            {
+              "type": "TimelineAddEntries",
+              "entries": [
+                {
+                  "entryId": "tweet-2121789999999999999",
+                  "content": {
+                    "entryType": "TimelineTimelineItem",
+                    "itemContent": {
+                      "itemType": "TimelineTweet",
+                      "tweet_results": {
+                        "result": {
+                          "__typename": "Tweet",
+                          "rest_id": "2121789999999999999",
+                          "core": {
+                            "user_results": {
+                              "result": {
+                                "__typename": "User",
+                                "rest_id": "2002002",
+                                "core": {
+                                  "screen_name": "renamed_friend",
+                                  "name": "改名后的好友"
+                                }
+                              }
+                            }
+                          },
+                          "legacy": {
+                            "user_id_str": "2002002",
+                            "created_at": "Mon Nov 16 02:00:00 +0000 2026"
+                          }
+                        }
+                      }
+                    }
+                  }
+                },
+                {
+                  "entryId": "tweet-2121788888888888888",
+                  "content": {
+                    "entryType": "TimelineTimelineItem",
+                    "itemContent": {
+                      "itemType": "TimelineTweet",
+                      "tweet_results": {
+                        "result": {
+                          "__typename": "Tweet",
+                          "rest_id": "2121788888888888888",
+                          "core": {
+                            "user_results": {
+                              "result": {
+                                "__typename": "User",
+                                "rest_id": "3003003",
+                                "core": {
+                                  "screen_name": "sample_friend",
+                                  "name": "占用旧名的陌生人"
+                                }
+                              }
+                            }
+                          },
+                          "legacy": {
+                            "user_id_str": "3003003",
+                            "created_at": "Mon Nov 16 02:01:00 +0000 2026"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

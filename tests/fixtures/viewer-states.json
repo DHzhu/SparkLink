@@ -1,0 +1,85 @@
+{
+  "ownProfileInitialState": {
+    "session": {
+      "user_id": "1001001"
+    },
+    "entities": {
+      "users": {
+        "entities": {
+          "1001001": {
+            "id_str": "1001001",
+            "screen_name": "sample_me",
+            "name": "示例账号"
+          }
+        }
+      }
+    }
+  },
+  "otherProfileInitialState": {
+    "session": {
+      "user_id": "1001001"
+    },
+    "profile": {
+      "currentProfileUserId": "2002002"
+    },
+    "entities": {
+      "users": {
+        "entities": {
+          "1001001": {
+            "id_str": "1001001",
+            "screen_name": "sample_me",
+            "name": "示例账号"
+          },
+          "2002002": {
+            "id_str": "2002002",
+            "screen_name": "sample_friend",
+            "name": "示例好友"
+          }
+        }
+      }
+    }
+  },
+  "loggedOutInitialState": {
+    "session": {},
+    "entities": {
+      "users": {
+        "entities": {}
+      }
+    }
+  },
+  "viewerGraphqlModern": {
+    "data": {
+      "viewer": {
+        "user_results": {
+          "result": {
+            "__typename": "User",
+            "rest_id": "1001001",
+            "core": {
+              "screen_name": "sample_me",
+              "name": "示例账号"
+            },
+            "legacy": {
+              "followers_count": 42
+            }
+          }
+        }
+      }
+    }
+  },
+  "viewerGraphqlLegacy": {
+    "data": {
+      "viewer": {
+        "user_results": {
+          "result": {
+            "__typename": "User",
+            "rest_id": "9009009",
+            "legacy": {
+              "screen_name": "second_account",
+              "name": "第二账号"
+            }
+          }
+        }
+      }
+    }
+  }
+}

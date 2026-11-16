@@ -1,0 +1,311 @@
+{
+  "standardReply": {
+    "requestUrl": "https://x.com/i/api/graphql/aBcDeFgHiJkLmNoPqRsTuV/CreateTweet",
+    "requestBody": {
+      "variables": {
+        "tweet_text": "赞同这个观点",
+        "reply": {
+          "in_reply_to_tweet_id": "2121785253688246272",
+          "exclude_reply_user_ids": []
+        }
+      },
+      "queryId": "aBcDeFgHiJkLmNoPqRsTuV"
+    },
+    "response": {
+      "data": {
+        "create_tweet": {
+          "tweet_results": {
+            "result": {
+              "__typename": "Tweet",
+              "rest_id": "2122147641553846272",
+              "core": {
+                "user_results": {
+                  "result": {
+                    "__typename": "User",
+                    "rest_id": "1001001",
+                    "core": {
+                      "screen_name": "sample_me",
+                      "name": "示例账号"
+                    }
+                  }
+                }
+              },
+              "edit_control": {
+                "edit_tweet_ids": ["2122147641553846272"],
+                "editable_until_msecs": "0",
+                "is_edit_eligible": false
+              },
+              "legacy": {
+                "id_str": "2122147641553846272",
+                "user_id_str": "1001001",
+                "created_at": "Mon Nov 16 02:00:00 +0000 2026",
+                "in_reply_to_status_id_str": "2121785253688246272",
+                "in_reply_to_user_id_str": "2002002",
+                "in_reply_to_screen_name": "sample_friend"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "visibilityWrappedMediaReply": {
+    "requestUrl": "https://x.com/i/api/graphql/XyZ987_queryId-01/CreateTweet",
+    "requestBody": {
+      "variables": {
+        "tweet_text": "附上截图说明",
+        "reply": {
+          "in_reply_to_tweet_id": "2121785253688246300"
+        },
+        "media": {
+          "media_entities": [{ "media_id": "1800000000000000001" }]
+        }
+      }
+    },
+    "response": {
+      "data": {
+        "create_tweet": {
+          "tweet_results": {
+            "result": {
+              "__typename": "TweetWithVisibilityResults",
+              "tweet": {
+                "__typename": "Tweet",
+                "rest_id": "2122147641553846301",
+                "core": {
+                  "user_results": {
+                    "result": {
+                      "__typename": "User",
+                      "rest_id": "1001001",
+                      "legacy": {
+                        "screen_name": "sample_me",
+                        "name": "示例账号"
+                      }
+                    }
+                  }
+                },
+                "legacy": {
+                  "created_at": "Mon Nov 16 02:05:00 +0000 2026",
+                  "in_reply_to_status_id_str": "2121785253688246300",
+                  "in_reply_to_user_id_str": "2002003",
+                  "in_reply_to_screen_name": "media_friend",
+                  "extended_entities": {
+                    "media": [{ "id_str": "1800000000000000001", "type": "photo" }]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "multiMentionInlineReply": {
+    "requestUrl": "https://x.com/i/api/graphql/aBcDeFgHiJkLmNoPqRsTuV/CreateTweet",
+    "requestBody": {
+      "variables": {
+        "tweet_text": "@sample_friend @other_one @other_two 收到",
+        "reply": {
+          "in_reply_to_tweet_id": "2121785253688246272"
+        }
+      }
+    },
+    "response": {
+      "data": {
+        "create_tweet": {
+          "tweet_results": {
+            "result": {
+              "__typename": "Tweet",
+              "rest_id": "2122147641553846400",
+              "core": {
+                "user_results": {
+                  "result": {
+                    "__typename": "User",
+                    "rest_id": "1001001",
+                    "core": { "screen_name": "sample_me", "name": "示例账号" }
+                  }
+                }
+              },
+              "legacy": {
+                "created_at": "Mon Nov 16 02:10:00 +0000 2026",
+                "in_reply_to_status_id_str": "2121785253688246272",
+                "in_reply_to_user_id_str": "2002002",
+                "entities": {
+                  "user_mentions": [
+                    { "id_str": "2002002", "screen_name": "sample_friend" },
+                    { "id_str": "4004001", "screen_name": "other_one" },
+                    { "id_str": "4004002", "screen_name": "other_two" }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "missingDirectTargetReply": {
+    "requestUrl": "https://x.com/i/api/graphql/aBcDeFgHiJkLmNoPqRsTuV/CreateTweet",
+    "requestBody": {
+      "variables": {
+        "tweet_text": "等待补齐目标作者的回复",
+        "reply": {
+          "in_reply_to_tweet_id": "2121789999999999999"
+        }
+      }
+    },
+    "response": {
+      "data": {
+        "create_tweet": {
+          "tweet_results": {
+            "result": {
+              "__typename": "Tweet",
+              "rest_id": "2122147641553846500",
+              "core": {
+                "user_results": {
+                  "result": {
+                    "__typename": "User",
+                    "rest_id": "1001001",
+                    "core": { "screen_name": "sample_me", "name": "示例账号" }
+                  }
+                }
+              },
+              "legacy": {
+                "created_at": "Mon Nov 16 02:15:00 +0000 2026",
+                "in_reply_to_status_id_str": "2121789999999999999"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "selfReply": {
+    "requestUrl": "https://x.com/i/api/graphql/aBcDeFgHiJkLmNoPqRsTuV/CreateTweet",
+    "requestBody": {
+      "variables": {
+        "tweet_text": "补充一条我自己的线程",
+        "reply": {
+          "in_reply_to_tweet_id": "2121700000000000001"
+        }
+      }
+    },
+    "response": {
+      "data": {
+        "create_tweet": {
+          "tweet_results": {
+            "result": {
+              "__typename": "Tweet",
+              "rest_id": "2122147641553846600",
+              "core": {
+                "user_results": {
+                  "result": {
+                    "__typename": "User",
+                    "rest_id": "1001001",
+                    "core": { "screen_name": "sample_me", "name": "示例账号" }
+                  }
+                }
+              },
+              "legacy": {
+                "created_at": "Mon Nov 16 02:20:00 +0000 2026",
+                "in_reply_to_status_id_str": "2121700000000000001",
+                "in_reply_to_user_id_str": "1001001"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "plainPost": {
+    "requestUrl": "https://x.com/i/api/graphql/aBcDeFgHiJkLmNoPqRsTuV/CreateTweet",
+    "requestBody": {
+      "variables": {
+        "tweet_text": "这是一条普通原创帖"
+      }
+    },
+    "response": {
+      "data": {
+        "create_tweet": {
+          "tweet_results": {
+            "result": {
+              "__typename": "Tweet",
+              "rest_id": "2122147641553846700",
+              "core": {
+                "user_results": {
+                  "result": {
+                    "__typename": "User",
+                    "rest_id": "1001001",
+                    "core": { "screen_name": "sample_me", "name": "示例账号" }
+                  }
+                }
+              },
+              "legacy": {
+                "created_at": "Mon Nov 16 02:25:00 +0000 2026"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "graphqlBusinessError": {
+    "requestUrl": "https://x.com/i/api/graphql/aBcDeFgHiJkLmNoPqRsTuV/CreateTweet",
+    "requestBody": {
+      "variables": {
+        "tweet_text": "重复发送失败",
+        "reply": {
+          "in_reply_to_tweet_id": "2121785253688246272"
+        }
+      }
+    },
+    "response": {
+      "errors": [
+        {
+          "message": "Status is a duplicate. (187)",
+          "code": 187
+        }
+      ],
+      "data": {}
+    }
+  },
+  "multiVersionEditAnomaly": {
+    "requestUrl": "https://x.com/i/api/graphql/aBcDeFgHiJkLmNoPqRsTuV/CreateTweet",
+    "requestBody": {
+      "variables": {
+        "tweet_text": "未知的多版本回复结构",
+        "reply": {
+          "in_reply_to_tweet_id": "2121785253688246272"
+        }
+      }
+    },
+    "response": {
+      "data": {
+        "create_tweet": {
+          "tweet_results": {
+            "result": {
+              "__typename": "Tweet",
+              "rest_id": "2122147641553846802",
+              "core": {
+                "user_results": {
+                  "result": {
+                    "__typename": "User",
+                    "rest_id": "1001001",
+                    "core": { "screen_name": "sample_me", "name": "示例账号" }
+                  }
+                }
+              },
+              "edit_control": {
+                "edit_tweet_ids": ["2122147641553846801", "2122147641553846802"]
+              },
+              "legacy": {
+                "created_at": "Mon Nov 16 02:30:00 +0000 2026",
+                "in_reply_to_status_id_str": "2121785253688246272",
+                "in_reply_to_user_id_str": "2002002"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

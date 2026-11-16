@@ -2630,6 +2630,354 @@ test('[P1] & [P2] Same-tab A -> B -> A updated snapshot rebinds A and records fi
   bridge.destroy();
 });
 
+test('[P2] fetch(request, { body: null }) preserves Request parent-tweet validation (0 misattributed replies + anomaly) and default 256 KiB parses ~80 KiB Request body', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_null_body';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabSender = {
+    id: EXT_ID,
+    tab: { id: 96, active: true },
+    frameId: 0,
+    documentId: 'doc_96',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  const tabListeners = new Set();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: 96, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          for (const fn of tabListeners) fn(msg, { id: EXT_ID });
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  // Response claims parentTweetId = 9999999999999999999 (user 8888888), conflicting with Request's 2121785253688246272!
+  const parentConflictResp = structuredClone(createTweetFixtures.standardReply.response);
+  parentConflictResp.data.create_tweet.tweet_results.result.rest_id = '2122147641553890999';
+  parentConflictResp.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553890999';
+  parentConflictResp.data.create_tweet.tweet_results.result.legacy.in_reply_to_status_id_str =
+    '9999999999999999999';
+  parentConflictResp.data.create_tweet.tweet_results.result.legacy.in_reply_to_user_id_str =
+    '8888888';
+  parentConflictResp.data.create_tweet.tweet_results.result.legacy.in_reply_to_screen_name =
+    'wrong_target';
+
+  let nextCreateResp = parentConflictResp;
+  const transmittedBodies = [];
+  const winListeners = new Map();
+
+  const fakeWin = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => []
+    },
+    __INITIAL_STATE__: structuredClone(viewerFixtures.ownProfileInitialState),
+    async fetch(input, init) {
+      // Follow WHATWG Fetch spec via native new Request(input, init)
+      const effectiveReq = new Request(input, init);
+      if (effectiveReq.method === 'POST') {
+        transmittedBodies.push(await effectiveReq.text());
+      }
+      return new Response(JSON.stringify(nextCreateResp), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    },
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (winListeners.has(type)) winListeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = winListeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin });
+        }
+      });
+    }
+  };
+  fakeWin.top = fakeWin;
+
+  const pageChrome = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabSender),
+      onMessage: {
+        addListener(fn) {
+          tabListeners.add(fn);
+        },
+        removeListener(fn) {
+          tabListeners.delete(fn);
+        }
+      }
+    }
+  };
+
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  // Use default maxRequestBytes (256 KiB)!
+  installMainInterceptor(fakeWin, adapterApi, { nowFn: () => NOW_MS });
+  const bridge = installIsolatedBridge(fakeWin, pageChrome, { nowFn: () => NOW_MS, retryDelayMs: 5 });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const { doc, nodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup.init();
+
+  // 1. Call fetch(request, { body: null }) with conflicting parent-tweet response ->
+  // native Fetch transmits original body, and SparkLink MUST reject parent conflict (0 replies added + liveCaptureAnomaly)!
+  const reqBodyStr = JSON.stringify(createTweetFixtures.standardReply.requestBody);
+  const req1 = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: reqBodyStr
+  });
+  await (await fakeWin.fetch(req1, { body: null })).json();
+  await new Promise((r) => setTimeout(r, 50));
+
+  assert.equal(transmittedBodies[0], reqBodyStr, 'WHATWG Fetch transmits original Request body when init.body is null');
+  const snapConflict = await popup.refresh();
+  assert.equal(
+    snapConflict.selectedAccount.summary.totalReplies,
+    0,
+    'Conflicting parent tweet must add 0 replies even when init.body is explicitly null'
+  );
+  assert.equal(snapConflict.diagnostics.liveCaptureAnomaly, true);
+  assert.equal(nodes.get('viewer-status-badge').textContent, '实时采集异常');
+
+  // 2. Verify ~80 KiB (> 64 KiB, <= 256 KiB default) Request body is parsed cleanly under default 256 KiB limit!
+  const eightyKibReqBody = JSON.stringify({
+    ...createTweetFixtures.standardReply.requestBody,
+    client_context_padding: 'p'.repeat(80 * 1024)
+  });
+  const req80k = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: eightyKibReqBody
+  });
+  nextCreateResp = { data: { drifted_80k: true } };
+  await (await fakeWin.fetch(req80k)).json();
+  nextCreateResp = createTweetFixtures.standardReply.response;
+  const req80kValid = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: eightyKibReqBody
+  });
+  await (await fakeWin.fetch(req80kValid, { body: null })).json();
+  await new Promise((r) => setTimeout(r, 50));
+
+  const snapAfter80k = await popup.refresh();
+  assert.equal(snapAfter80k.selectedAccount.summary.totalReplies, 1);
+
+  bridge.destroy();
+});
+
+test(
+  '[P2] Real Chromium fetch(request, { body: null }) parent-conflict verification via CDP',
+  { skip: !fs.existsSync('/usr/bin/chromium') || !fs.existsSync('/usr/bin/xvfb-run') },
+  async () => {
+    const adapterSource = fs.readFileSync(path.resolve('src/x-adapter.js'), 'utf8');
+    const interceptorSource = fs.readFileSync(path.resolve('src/interceptor.js'), 'utf8');
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sparklink-chromium-null-body-'));
+    const child = spawn(
+      '/usr/bin/xvfb-run',
+      [
+        '-a',
+        '/usr/bin/chromium',
+        '--remote-debugging-port=0',
+        '--no-first-run',
+        '--no-default-browser-check',
+        `--user-data-dir=${profileDir}`,
+        'about:blank'
+      ],
+      { stdio: ['ignore', 'ignore', 'ignore'], detached: true }
+    );
+
+    try {
+      const portFile = path.join(profileDir, 'DevToolsActivePort');
+      let port = null;
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(portFile)) {
+          const lines = fs.readFileSync(portFile, 'utf8').trim().split('\n');
+          if (lines[0] && /^\d+$/.test(lines[0].trim())) {
+            port = Number(lines[0].trim());
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert.ok(port, 'Chromium DevToolsActivePort must initialize');
+
+      let pageTarget = null;
+      const pageDeadline = Date.now() + 6000;
+      while (Date.now() < pageDeadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/json`);
+          if (res.ok) {
+            const targets = await res.json();
+            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            if (pageTarget) break;
+          }
+        } catch (_ignore) {}
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      assert.ok(pageTarget, 'Chromium page target must be available');
+
+      const conflictResp = structuredClone(createTweetFixtures.standardReply.response);
+      conflictResp.data.create_tweet.tweet_results.result.rest_id = '2122147641553890998';
+      conflictResp.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553890998';
+      conflictResp.data.create_tweet.tweet_results.result.legacy.in_reply_to_status_id_str =
+        '9999999999999999999';
+      conflictResp.data.create_tweet.tweet_results.result.legacy.in_reply_to_user_id_str =
+        '8888888';
+
+      const evalExpr = `(async () => {
+        const loadCjs = (src) => {
+          const exportsObj = {};
+          const mod = { exports: exportsObj };
+          new Function('module', 'exports', src)(mod, exportsObj);
+          return mod.exports;
+        };
+        const adapter = loadCjs(${JSON.stringify(adapterSource)});
+        const { installMainInterceptor } = loadCjs(${JSON.stringify(interceptorSource)});
+
+        const posted = [];
+        const listeners = new Set();
+        let chromiumForwardedBody = null;
+
+        const fakeWin = {
+          location: { origin: 'https://x.com', href: 'https://x.com/home' },
+          document: { visibilityState: 'visible', querySelector: () => null, querySelectorAll: () => [] },
+          fetch: async (input, init) => {
+            const effective = new Request(input, init);
+            chromiumForwardedBody = await effective.text();
+            return new Response(
+              JSON.stringify(${JSON.stringify(conflictResp)}),
+              { status: 200, headers: { 'content-type': 'application/json' } }
+            );
+          },
+          addEventListener: (_t, fn) => listeners.add(fn),
+          removeEventListener: (_t, fn) => listeners.delete(fn),
+          postMessage: (data, origin) => posted.push({ data, origin })
+        };
+        fakeWin.top = fakeWin;
+
+        installMainInterceptor(fakeWin, adapter);
+        for (const fn of listeners) {
+          fn({
+            data: {
+              protocol: 'SPARKLINK_BRIDGE_V1',
+              type: 'BRIDGE_INIT',
+              nonce: 'chromium_null_body',
+              collectionEnabled: true,
+              captureSessionId: 1,
+              bindingContext: {
+                bindingId: 'b_null_body_1',
+                actorUserId: '1001001',
+                captureSessionId: 1,
+                collectionGeneration: 1,
+                accountGeneration: 1
+              }
+            },
+            origin: 'https://x.com',
+            source: fakeWin
+          });
+        }
+
+        const reqBody = ${JSON.stringify(JSON.stringify(createTweetFixtures.standardReply.requestBody))};
+        const req = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: reqBody
+        });
+        await (await fakeWin.fetch(req, { body: null })).json();
+        await new Promise((r) => setTimeout(r, 40));
+
+        const obs = posted.find((m) => m.data && m.data.type === 'OBSERVED_EVENTS');
+        return {
+          chromiumPreservedBody: chromiumForwardedBody === reqBody,
+          recordedEventsCount: obs ? obs.data.events.length : 0,
+          liveCaptureAnomaly: Boolean(obs && obs.data.liveCaptureAnomaly),
+          anomalies: obs ? obs.data.anomalies : []
+        };
+      })()`;
+
+      const cdpResult = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+        const timer = setTimeout(() => {
+          ws.close();
+          reject(new Error('CDP Runtime.evaluate timed out'));
+        }, 8000);
+        ws.addEventListener('open', () => {
+          ws.send(
+            JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: { expression: evalExpr, awaitPromise: true, returnByValue: true }
+            })
+          );
+        });
+        ws.addEventListener('message', (ev) => {
+          const msg = JSON.parse(String(ev.data));
+          if (msg.id === 1) {
+            clearTimeout(timer);
+            ws.close();
+            resolve(msg);
+          }
+        });
+        ws.addEventListener('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const val = cdpResult.result && cdpResult.result.result && cdpResult.result.result.value;
+      assert.deepEqual(val, {
+        chromiumPreservedBody: true,
+        recordedEventsCount: 0,
+        liveCaptureAnomaly: true,
+        anomalies: ['parent_mismatch']
+      });
+    } finally {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch (_ignore) {}
+      await new Promise((r) => setTimeout(r, 150));
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch (_ignore) {}
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    }
+  }
+);
+
 
 
 

@@ -567,11 +567,11 @@
               let requestMetaPromise = null;
               let skipObservation = false;
               if (match.category === 'create_tweet') {
-                const hasInitBody = Boolean(init && typeof init === 'object' && init.body !== undefined);
-                if (hasInitBody) {
-                  if (init.body === null) {
-                    requestMeta = null;
-                  } else if (typeof init.body === 'string') {
+                const hasNonNullInitBody = Boolean(
+                  init && typeof init === 'object' && init.body !== undefined && init.body !== null
+                );
+                if (hasNonNullInitBody) {
+                  if (typeof init.body === 'string') {
                     if (utf8ByteLength(init.body) <= maxRequestBytes) {
                       requestMeta = adapter.parseCreateTweetRequest(init.body);
                     } else {

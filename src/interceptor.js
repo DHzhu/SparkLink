@@ -88,6 +88,8 @@
       bindingContext: null,
       latestGraphqlViewer: null,
       supersededWindowActorId: null,
+      windowSnapshotStale: false,
+      staleWindowActorIds: new Set(),
       activeClones: 0
     };
 
@@ -153,6 +155,42 @@
       return true;
     }
 
+    function markWindowSnapshotStale(fallbackActorId) {
+      const snapViewer = adapter.extractViewerFromWindow(win);
+      state.windowSnapshotStale = true;
+      if (snapViewer && snapViewer.actorUserId) {
+        state.staleWindowActorIds.add(snapViewer.actorUserId);
+      }
+      if (fallbackActorId) {
+        state.staleWindowActorIds.add(fallbackActorId);
+      }
+    }
+
+    function canTrustWindowSnapshot(winViewer) {
+      if (!winViewer || winViewer.actorUserId === state.supersededWindowActorId) {
+        return false;
+      }
+      if (winViewer.handle && win.document && typeof win.document.querySelector === 'function') {
+        try {
+          const switcherEl = win.document.querySelector(
+            '[data-testid="SideNav_AccountSwitcher_Button"]'
+          );
+          if (switcherEl && typeof switcherEl.textContent === 'string') {
+            const m = /(?:^|\s)@([A-Za-z0-9_]{1,64})(?:\s|$)/.exec(switcherEl.textContent);
+            if (m && m[1].toLowerCase() !== winViewer.handle.toLowerCase()) {
+              return false;
+            }
+          }
+        } catch (_err) {
+          // Ignore DOM query errors
+        }
+      }
+      if (!state.windowSnapshotStale) {
+        return true;
+      }
+      return !state.staleWindowActorIds.has(winViewer.actorUserId);
+    }
+
     function maybeProbeInitialViewer() {
       if (!state.collectionEnabled || state.captureSessionId === null || !state.nonce) {
         return;
@@ -160,7 +198,7 @@
       let viewer = state.latestGraphqlViewer;
       if (!viewer) {
         const winViewer = adapter.extractViewerFromWindow(win);
-        if (winViewer && winViewer.actorUserId !== state.supersededWindowActorId) {
+        if (canTrustWindowSnapshot(winViewer)) {
           viewer = winViewer;
         }
       }
@@ -189,7 +227,9 @@
             })
           : null;
 
+      const prevEnabled = state.collectionEnabled;
       const prevBindingId = state.bindingContext ? state.bindingContext.bindingId : null;
+      const prevActorId = state.bindingContext ? state.bindingContext.actorUserId : null;
       const prevSessionId = state.captureSessionId;
 
       state.collectionEnabled = nextEnabled && nextSessionId !== null;
@@ -197,6 +237,9 @@
       state.bindingContext = state.collectionEnabled ? nextBinding : null;
 
       if (!state.collectionEnabled || prevSessionId !== state.captureSessionId) {
+        if (prevEnabled || prevSessionId !== null) {
+          markWindowSnapshotStale(prevActorId);
+        }
         state.latestGraphqlViewer = null;
         cancelActiveReaders(() => true);
         engine.revokeBinding(null);

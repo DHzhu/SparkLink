@@ -156,6 +156,14 @@ test('Section 13 — Full E2E Pause/Resume In-Flight Isolation + Replies Timelin
           })
         );
       }
+      if (String(url).includes('ViewerConfirmA')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(viewerFixtures.viewerGraphqlModern), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
       if (String(url).includes('Viewer')) {
         viewerCallSeq += 1;
         const viewerPayload =
@@ -242,7 +250,12 @@ test('Section 13 — Full E2E Pause/Resume In-Flight Isolation + Replies Timelin
   const snapAfterOldArrived = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
   assert.equal(snapAfterOldArrived.selectedAccount.summary.totalReplies, 0);
 
-  // 3. User actively browses own replies timeline in the new session -> backfills valid replies!
+  // 3. On resume with un-updated page snapshot, tab stays unconfirmed until fresh Viewer evidence arrives,
+  // then user actively browses own replies timeline in the new session -> backfills valid replies!
+  assert.equal(bridge.getBindingContext(), null);
+  await fakeWin.fetch('https://x.com/i/api/graphql/ViewerConfirmA/Viewer');
+  await new Promise((r) => setTimeout(r, 35));
+  assert.equal(bridge.getBindingContext().actorUserId, '1001001');
   await fakeWin.fetch(
     'https://x.com/i/api/graphql/TimelineQid/UserTweetsAndReplies?variables=%7B%22userId%22%3A%221001001%22%7D'
   );

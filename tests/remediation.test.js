@@ -2404,6 +2404,232 @@ test(
   }
 );
 
+test('[P1] & [P2] Same-tab A -> B -> A updated snapshot rebinds A and records first reply (+1) while clicking Pause performs 0 window.__INITIAL_STATE__ reads', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_aba_snapshot';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabSender = {
+    id: EXT_ID,
+    tab: { id: 95, active: true },
+    frameId: 0,
+    documentId: 'doc_95',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  const tabListeners = new Set();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: 95, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          for (const fn of tabListeners) fn(msg, { id: EXT_ID });
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  const initialStateA = () => structuredClone(viewerFixtures.ownProfileInitialState);
+  const initialStateB = () => ({
+    session: { user_id: '9009009' },
+    entities: {
+      users: {
+        entities: {
+          '9009009': { id_str: '9009009', screen_name: 'second_account', name: '第二账号' }
+        }
+      }
+    }
+  });
+
+  const replyForA = structuredClone(createTweetFixtures.standardReply.response);
+  replyForA.data.create_tweet.tweet_results.result.rest_id = '2122147641553890101';
+  replyForA.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553890101';
+
+  const replyForB = structuredClone(createTweetFixtures.standardReply.response);
+  replyForB.data.create_tweet.tweet_results.result.rest_id = '2122147641553890202';
+  replyForB.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553890202';
+  replyForB.data.create_tweet.tweet_results.result.core.user_results.result.rest_id = '9009009';
+  replyForB.data.create_tweet.tweet_results.result.core.user_results.result.core.screen_name =
+    'second_account';
+  replyForB.data.create_tweet.tweet_results.result.legacy.user_id_str = '9009009';
+
+  let currentReplyPayload = replyForA;
+  let currentInitialState = initialStateA();
+  let initialStateReads = 0;
+  let domQueryReads = 0;
+  const winListeners = new Map();
+
+  const fakeWin = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        domQueryReads += 1;
+        return null;
+      },
+      querySelectorAll() {
+        domQueryReads += 1;
+        return [];
+      }
+    },
+    fetch(url) {
+      if (String(url).includes('CreateTweet')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(currentReplyPayload), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    },
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (winListeners.has(type)) winListeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = winListeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin });
+        }
+      });
+    }
+  };
+  Object.defineProperty(fakeWin, '__INITIAL_STATE__', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      initialStateReads += 1;
+      return currentInitialState;
+    }
+  });
+  fakeWin.top = fakeWin;
+
+  const pageChrome = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabSender),
+      onMessage: {
+        addListener(fn) {
+          tabListeners.add(fn);
+        },
+        removeListener(fn) {
+          tabListeners.delete(fn);
+        }
+      }
+    }
+  };
+
+  // 1. Enable collection -> binds Account A (1001001)
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  installMainInterceptor(fakeWin, adapterApi, { nowFn: () => NOW_MS });
+  const bridge = installIsolatedBridge(fakeWin, pageChrome, { nowFn: () => NOW_MS, retryDelayMs: 5 });
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(bridge.getBindingContext().actorUserId, '1001001');
+
+  const { doc: popupDoc, nodes: popupNodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: popupDoc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup.init();
+  assert.equal(popupNodes.get('viewer-status-badge').textContent, '采集中');
+
+  // 2. Reset read counters, then click Pause #1 -> MUST perform 0 reads of window.__INITIAL_STATE__ & DOM!
+  initialStateReads = 0;
+  domQueryReads = 0;
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(initialStateReads, 0, 'Clicking Pause must perform 0 reads on window.__INITIAL_STATE__');
+  assert.equal(domQueryReads, 0, 'Clicking Pause must perform 0 DOM viewer queries');
+
+  // 3. During Pause #1, update page snapshot to Account B (9009009) and Resume #1 -> binds B and records B reply (+1)
+  currentInitialState = initialStateB();
+  currentReplyPayload = replyForB;
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(bridge.getBindingContext().actorUserId, '9009009');
+
+  await fakeWin.fetch('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 40));
+  const snapB = await popup.refresh();
+  assert.equal(snapB.selectedAccount.actorUserId, '9009009');
+  assert.equal(snapB.selectedAccount.summary.totalReplies, 1);
+
+  // 4. Reset read counters, click Pause #2 -> MUST perform 0 reads of window.__INITIAL_STATE__!
+  initialStateReads = 0;
+  domQueryReads = 0;
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(initialStateReads, 0, 'Second Pause must also perform 0 reads on window.__INITIAL_STATE__');
+  assert.equal(domQueryReads, 0);
+
+  // 5. During Pause #2, update page snapshot BACK to Account A (1001001) and Resume #2 -> MUST bind A immediately and record A's first reply (+1)!
+  currentInitialState = initialStateA();
+  currentReplyPayload = replyForA;
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 40));
+
+  const snapResumeA = await popup.refresh();
+  assert.equal(
+    popupNodes.get('viewer-status-badge').textContent,
+    '采集中',
+    'Popup must bind updated Account A snapshot rather than staying at 账号待确认'
+  );
+  assert.equal(snapResumeA.viewerStatus, 'bound');
+  assert.equal(snapResumeA.activeTabActorUserId, '1001001');
+  assert.ok(bridge.getBindingContext());
+  assert.equal(bridge.getBindingContext().actorUserId, '1001001');
+
+  await fakeWin.fetch('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const snapAfterAReply = await popup.refresh();
+  assert.equal(snapAfterAReply.selectedAccount.actorUserId, '1001001');
+  assert.equal(snapAfterAReply.selectedAccount.summary.totalReplies, 1);
+
+  // 6. Pause #3 WITHOUT updating snapshot (snapshot stays at Account A) -> Resume #3 still stays unconfirmed!
+  initialStateReads = 0;
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(initialStateReads, 0);
+
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 40));
+  const snapUnchanged = await popup.refresh();
+  assert.equal(snapUnchanged.viewerStatus, 'unconfirmed');
+  assert.equal(popupNodes.get('viewer-status-badge').textContent, '账号待确认');
+
+  bridge.destroy();
+});
+
 
 
 

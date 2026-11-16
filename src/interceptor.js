@@ -88,8 +88,10 @@
       bindingContext: null,
       latestGraphqlViewer: null,
       supersededWindowActorId: null,
+      supersededWindowStateRef: undefined,
+      lastSeenWindowActorId: null,
       windowSnapshotStale: false,
-      staleWindowActorIds: new Set(),
+      staleSnapshotActorId: null,
       activeClones: 0
     };
 
@@ -156,19 +158,27 @@
     }
 
     function markWindowSnapshotStale(fallbackActorId) {
-      const snapViewer = adapter.extractViewerFromWindow(win);
+      const latestGqlId =
+        state.latestGraphqlViewer && state.latestGraphqlViewer.actorUserId
+          ? state.latestGraphqlViewer.actorUserId
+          : null;
       state.windowSnapshotStale = true;
-      if (snapViewer && snapViewer.actorUserId) {
-        state.staleWindowActorIds.add(snapViewer.actorUserId);
-      }
-      if (fallbackActorId) {
-        state.staleWindowActorIds.add(fallbackActorId);
-      }
+      state.staleSnapshotActorId =
+        fallbackActorId || latestGqlId || state.lastSeenWindowActorId || null;
     }
 
     function canTrustWindowSnapshot(winViewer) {
-      if (!winViewer || winViewer.actorUserId === state.supersededWindowActorId) {
+      if (!winViewer) {
         return false;
+      }
+      if (state.supersededWindowActorId && winViewer.actorUserId === state.supersededWindowActorId) {
+        const hasOwnInitialState = Object.prototype.hasOwnProperty.call(win, '__INITIAL_STATE__');
+        const curRef = hasOwnInitialState ? win.__INITIAL_STATE__ : undefined;
+        if (!hasOwnInitialState || curRef === state.supersededWindowStateRef) {
+          return false;
+        }
+        state.supersededWindowActorId = null;
+        state.supersededWindowStateRef = undefined;
       }
       if (winViewer.handle && win.document && typeof win.document.querySelector === 'function') {
         try {
@@ -188,7 +198,12 @@
       if (!state.windowSnapshotStale) {
         return true;
       }
-      return !state.staleWindowActorIds.has(winViewer.actorUserId);
+      if (state.staleSnapshotActorId && winViewer.actorUserId === state.staleSnapshotActorId) {
+        return false;
+      }
+      state.windowSnapshotStale = false;
+      state.staleSnapshotActorId = null;
+      return true;
     }
 
     function maybeProbeInitialViewer() {
@@ -198,6 +213,9 @@
       let viewer = state.latestGraphqlViewer;
       if (!viewer) {
         const winViewer = adapter.extractViewerFromWindow(win);
+        if (winViewer && winViewer.actorUserId) {
+          state.lastSeenWindowActorId = winViewer.actorUserId;
+        }
         if (canTrustWindowSnapshot(winViewer)) {
           viewer = winViewer;
         }
@@ -311,10 +329,20 @@
         const viewer = adapter.extractViewerFromGraphql(payload);
         if (viewer) {
           const winViewer = adapter.extractViewerFromWindow(win);
+          if (winViewer && winViewer.actorUserId) {
+            state.lastSeenWindowActorId = winViewer.actorUserId;
+          }
           if (winViewer && winViewer.actorUserId !== viewer.actorUserId) {
             state.supersededWindowActorId = winViewer.actorUserId;
+            state.supersededWindowStateRef = Object.prototype.hasOwnProperty.call(
+              win,
+              '__INITIAL_STATE__'
+            )
+              ? win.__INITIAL_STATE__
+              : undefined;
           } else if (winViewer && winViewer.actorUserId === viewer.actorUserId) {
             state.supersededWindowActorId = null;
+            state.supersededWindowStateRef = undefined;
           }
           state.latestGraphqlViewer = viewer;
           sendToBridge('VIEWER_EVIDENCE', {

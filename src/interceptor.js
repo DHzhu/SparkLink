@@ -400,6 +400,86 @@
       }
     }
 
+    async function readBoundedBodyStream(bodyStream, maxBytes, frozenSessionId, frozenBinding) {
+      state.activeClones += 1;
+      let reader = null;
+      let aborted = false;
+      let timeoutId = null;
+
+      const taskRecord = {
+        captureSessionId: frozenSessionId,
+        bindingId: frozenBinding ? frozenBinding.bindingId : null,
+        cancel() {
+          aborted = true;
+          if (reader) {
+            reader.cancel('sparklink_aborted').catch(() => {});
+          }
+        }
+      };
+      activeReaders.add(taskRecord);
+
+      try {
+        reader = bodyStream.getReader();
+        timeoutId = setTimeout(() => {
+          aborted = true;
+          if (reader) {
+            reader.cancel('sparklink_timeout').catch(() => {});
+          }
+        }, cloneTimeoutMs);
+        if (timeoutId && typeof timeoutId.unref === 'function') {
+          timeoutId.unref();
+        }
+
+        const chunks = [];
+        let totalBytes = 0;
+
+        while (!aborted) {
+          const step = await reader.read();
+          if (aborted || !isContextStillActive(frozenSessionId, frozenBinding)) {
+            await reader.cancel('sparklink_stale').catch(() => {});
+            return { ok: false, text: '' };
+          }
+          if (step.done) {
+            break;
+          }
+          const chunk = step.value;
+          if (!(chunk instanceof Uint8Array)) {
+            await reader.cancel('sparklink_unsupported_chunk').catch(() => {});
+            return { ok: false, text: '' };
+          }
+          totalBytes += chunk.byteLength;
+          if (totalBytes > maxBytes) {
+            await reader.cancel('sparklink_size_exceeded').catch(() => {});
+            return { ok: false, text: '' };
+          }
+          chunks.push(chunk);
+        }
+
+        if (aborted || !isContextStillActive(frozenSessionId, frozenBinding)) {
+          return { ok: false, text: '' };
+        }
+
+        const merged = new Uint8Array(totalBytes);
+        let offset = 0;
+        for (let i = 0; i < chunks.length; i += 1) {
+          merged.set(chunks[i], offset);
+          offset += chunks[i].byteLength;
+        }
+        const text = textDecoder
+          ? textDecoder.decode(merged)
+          : String.fromCharCode.apply(null, merged);
+        return { ok: true, text };
+      } catch (_err) {
+        return { ok: false, text: '' };
+      } finally {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+        activeReaders.delete(taskRecord);
+        state.activeClones = Math.max(0, state.activeClones - 1);
+      }
+    }
+
     async function readBoundedResponseClone(response, frozenSessionId, frozenBinding) {
       if (
         !response ||
@@ -427,85 +507,19 @@
         return null;
       }
 
-      state.activeClones += 1;
-      let reader = null;
-      let aborted = false;
-      let timeoutId = null;
-
-      const taskRecord = {
-        captureSessionId: frozenSessionId,
-        bindingId: frozenBinding ? frozenBinding.bindingId : null,
-        cancel() {
-          aborted = true;
-          if (reader) {
-            reader.cancel('sparklink_aborted').catch(() => {});
-          }
-        }
-      };
-      activeReaders.add(taskRecord);
-
+      const bodyResult = await readBoundedBodyStream(
+        cloned.body,
+        maxResponseBytes,
+        frozenSessionId,
+        frozenBinding
+      );
+      if (!bodyResult.ok || !bodyResult.text.trim()) {
+        return null;
+      }
       try {
-        reader = cloned.body.getReader();
-        timeoutId = setTimeout(() => {
-          aborted = true;
-          if (reader) {
-            reader.cancel('sparklink_timeout').catch(() => {});
-          }
-        }, cloneTimeoutMs);
-        if (timeoutId && typeof timeoutId.unref === 'function') {
-          timeoutId.unref();
-        }
-
-        const chunks = [];
-        let totalBytes = 0;
-
-        while (!aborted) {
-          const step = await reader.read();
-          if (aborted || !isContextStillActive(frozenSessionId, frozenBinding)) {
-            await reader.cancel('sparklink_stale').catch(() => {});
-            return null;
-          }
-          if (step.done) {
-            break;
-          }
-          const chunk = step.value;
-          if (!(chunk instanceof Uint8Array)) {
-            await reader.cancel('sparklink_unsupported_chunk').catch(() => {});
-            return null;
-          }
-          totalBytes += chunk.byteLength;
-          if (totalBytes > maxResponseBytes) {
-            await reader.cancel('sparklink_size_exceeded').catch(() => {});
-            return null;
-          }
-          chunks.push(chunk);
-        }
-
-        if (aborted || !isContextStillActive(frozenSessionId, frozenBinding)) {
-          return null;
-        }
-
-        const merged = new Uint8Array(totalBytes);
-        let offset = 0;
-        for (let i = 0; i < chunks.length; i += 1) {
-          merged.set(chunks[i], offset);
-          offset += chunks[i].byteLength;
-        }
-        const jsonText = textDecoder
-          ? textDecoder.decode(merged)
-          : String.fromCharCode.apply(null, merged);
-        if (!jsonText.trim()) {
-          return null;
-        }
-        return JSON.parse(jsonText);
+        return JSON.parse(bodyResult.text);
       } catch (_err) {
         return null;
-      } finally {
-        if (timeoutId !== null) {
-          clearTimeout(timeoutId);
-        }
-        activeReaders.delete(taskRecord);
-        state.activeClones = Math.max(0, state.activeClones - 1);
       }
     }
 
@@ -519,11 +533,17 @@
             const { url, method } = extractFetchUrlAndMethod(input, init);
             const match = url ? adapter.matchWhitelistedRequest(url, method) : null;
             if (match && (state.bindingContext || match.category === 'viewer')) {
+              const frozenSessionId = state.captureSessionId;
+              const frozenBinding = state.bindingContext;
               let requestMeta = null;
+              let requestMetaPromise = null;
               let skipObservation = false;
               if (match.category === 'create_tweet') {
-                if (init && typeof init === 'object' && init.body !== undefined && init.body !== null) {
-                  if (typeof init.body === 'string') {
+                const hasInitBody = Boolean(init && typeof init === 'object' && init.body !== undefined);
+                if (hasInitBody) {
+                  if (init.body === null) {
+                    requestMeta = null;
+                  } else if (typeof init.body === 'string') {
                     if (utf8ByteLength(init.body) <= maxRequestBytes) {
                       requestMeta = adapter.parseCreateTweetRequest(init.body);
                     } else {
@@ -533,14 +553,56 @@
                     // Non-string streaming/binary body: do not consume original Request/stream
                     skipObservation = true;
                   }
+                } else if (input && typeof input === 'object' && typeof input.clone === 'function') {
+                  if (input.bodyUsed) {
+                    skipObservation = true;
+                  } else if (input.body !== null && input.body !== undefined) {
+                    if (state.activeClones >= maxConcurrentClones) {
+                      sendToBridge('DIAGNOSTIC', {
+                        category: 'concurrency_limit_skipped',
+                        captureSessionId: frozenSessionId
+                      });
+                      skipObservation = true;
+                    } else {
+                      let clonedReq = null;
+                      try {
+                        clonedReq = input.clone();
+                      } catch (_cloneErr) {
+                        clonedReq = null;
+                      }
+                      if (!clonedReq || !clonedReq.body || typeof clonedReq.body.getReader !== 'function') {
+                        skipObservation = true;
+                      } else {
+                        requestMetaPromise = readBoundedBodyStream(
+                          clonedReq.body,
+                          maxRequestBytes,
+                          frozenSessionId,
+                          frozenBinding
+                        ).then((res) => {
+                          if (!res.ok) {
+                            if (captured) {
+                              captured.skipObservation = true;
+                            }
+                            return { skipObservation: true, requestMeta: null };
+                          }
+                          const parsedMeta = res.text.trim()
+                            ? adapter.parseCreateTweetRequest(res.text)
+                            : null;
+                          return { skipObservation: false, requestMeta: parsedMeta };
+                        });
+                      }
+                    }
+                  }
                 }
               }
               if (!skipObservation) {
                 captured = {
                   match,
                   requestMeta,
-                  frozenSessionId: state.captureSessionId,
-                  frozenBinding: state.bindingContext
+                  requestMetaPromise,
+                  skipObservation: false,
+                  frozenSessionId,
+                  frozenBinding
                 };
               }
             }
@@ -555,24 +617,45 @@
         if (captured && responsePromise && typeof responsePromise.then === 'function') {
           responsePromise.then(
             (response) => {
-              if (!isContextStillActive(captured.frozenSessionId, captured.frozenBinding)) {
+              if (
+                captured.skipObservation ||
+                !isContextStillActive(captured.frozenSessionId, captured.frozenBinding)
+              ) {
                 return;
               }
-              readBoundedResponseClone(
+              const responseJsonPromise = readBoundedResponseClone(
                 response,
                 captured.frozenSessionId,
                 captured.frozenBinding
-              ).then((parsedJson) => {
-                if (parsedJson) {
-                  handleParsedPayload(
-                    captured.match,
-                    parsedJson,
-                    captured.requestMeta,
-                    captured.frozenSessionId,
-                    captured.frozenBinding
-                  );
-                }
-              });
+              );
+              if (captured.requestMetaPromise) {
+                Promise.all([captured.requestMetaPromise, responseJsonPromise]).then(
+                  ([reqInfo, parsedJson]) => {
+                    if (!reqInfo || reqInfo.skipObservation || !parsedJson) {
+                      return;
+                    }
+                    handleParsedPayload(
+                      captured.match,
+                      parsedJson,
+                      reqInfo.requestMeta,
+                      captured.frozenSessionId,
+                      captured.frozenBinding
+                    );
+                  }
+                );
+              } else {
+                responseJsonPromise.then((parsedJson) => {
+                  if (parsedJson) {
+                    handleParsedPayload(
+                      captured.match,
+                      parsedJson,
+                      captured.requestMeta,
+                      captured.frozenSessionId,
+                      captured.frozenBinding
+                    );
+                  }
+                });
+              }
             },
             () => {
               // Swallow rejection on side-effect chain only; caller still receives original rejection

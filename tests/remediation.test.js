@@ -1699,6 +1699,377 @@ test('[P1] Pause -> SPA switch A to B while initial A window.__INITIAL_STATE__ s
   bridge.destroy();
 });
 
+test('[P2] Native fetch(new Request(...)) reply schema drift surfaces liveCaptureAnomaly in Popup while enforcing 64 KiB / timeout / bodyUsed limits', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_request_clone';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabSender = {
+    id: EXT_ID,
+    tab: { id: 92, active: true },
+    frameId: 0,
+    documentId: 'doc_92',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  const tabListeners = new Set();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: 92, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          for (const fn of tabListeners) fn(msg, { id: EXT_ID });
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  let nextCreateTweetPayload = {
+    data: {
+      create_post_v2: {
+        post_results: { id: '2122147641553899888' }
+      }
+    }
+  };
+  const callerConsumedBodies = [];
+  const winListeners = new Map();
+
+  const fakeWin = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => []
+    },
+    __INITIAL_STATE__: structuredClone(viewerFixtures.ownProfileInitialState),
+    async fetch(input, init) {
+      const urlStr = typeof input === 'string' ? input : input.url;
+      if (input && typeof input === 'object' && typeof input.text === 'function' && !input.bodyUsed) {
+        callerConsumedBodies.push(await input.text());
+      } else if (init && typeof init.body === 'string') {
+        callerConsumedBodies.push(init.body);
+      }
+      if (String(urlStr).includes('CreateTweet')) {
+        return new Response(JSON.stringify(nextCreateTweetPayload), {
+          status: 200,
+          headers: { 'content-type': 'application/json' }
+        });
+      }
+      return new Response('{}', { status: 200 });
+    },
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (winListeners.has(type)) winListeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = winListeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin });
+        }
+      });
+    }
+  };
+  fakeWin.top = fakeWin;
+
+  const pageChrome = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabSender),
+      onMessage: {
+        addListener(fn) {
+          tabListeners.add(fn);
+        },
+        removeListener(fn) {
+          tabListeners.delete(fn);
+        }
+      }
+    }
+  };
+
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  installMainInterceptor(fakeWin, adapterApi, {
+    nowFn: () => NOW_MS,
+    maxRequestBytes: 64 * 1024,
+    cloneTimeoutMs: 60
+  });
+  const bridge = installIsolatedBridge(fakeWin, pageChrome, { nowFn: () => NOW_MS, retryDelayMs: 5 });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const { doc, nodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup.init();
+  assert.equal(nodes.get('viewer-status-badge').textContent, '采集中');
+
+  const replyJson = JSON.stringify(createTweetFixtures.standardReply.requestBody);
+
+  // 1. Oversized Request (> 64 KiB), pre-consumed Request (bodyUsed === true), and timed-out streaming Request must NOT trigger false anomaly
+  const oversizedReq = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify({
+      variables: {
+        reply: { in_reply_to_tweet_id: '2121785253688246272' },
+        padding: 'x'.repeat(70 * 1024)
+      }
+    })
+  });
+  await (await fakeWin.fetch(oversizedReq)).json();
+
+  const usedReq = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: replyJson
+  });
+  await usedReq.text();
+  assert.equal(usedReq.bodyUsed, true);
+  await fakeWin.fetch(usedReq);
+
+  const slowBody = new ReadableStream({
+    start(ctrl) {
+      const timer = setTimeout(() => {
+        try {
+          ctrl.enqueue(new TextEncoder().encode(replyJson));
+          ctrl.close();
+        } catch (_ignore) {}
+      }, 160);
+      if (timer && typeof timer.unref === 'function') timer.unref();
+    }
+  });
+  const slowReq = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: slowBody,
+    duplex: 'half'
+  });
+  await fakeWin.fetch(slowReq);
+  await new Promise((r) => setTimeout(r, 100));
+
+  const snapBeforeValidReq = await popup.refresh();
+  assert.equal(snapBeforeValidReq.diagnostics.liveCaptureAnomaly, false);
+  assert.equal(nodes.get('viewer-status-badge').textContent, '采集中');
+
+  // 2. Valid native Request reply with drifted 200 response -> caller receives intact body AND Popup surfaces 实时采集异常!
+  const nativeReplyReq = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: replyJson
+  });
+  const callerRes = await fakeWin.fetch(nativeReplyReq);
+  const callerParsed = await callerRes.json();
+  assert.equal(callerParsed.data.create_post_v2.post_results.id, '2122147641553899888');
+  assert.ok(callerConsumedBodies.includes(replyJson), 'Original Request body must remain intact for caller');
+
+  await new Promise((r) => setTimeout(r, 50));
+  const snapAfterNativeReq = await popup.refresh();
+  assert.equal(snapAfterNativeReq.diagnostics.liveCaptureAnomaly, true);
+  assert.equal(nodes.get('viewer-status-badge').textContent, '实时采集异常');
+  assert.ok(nodes.get('status-banners').textContent.includes('实时回复响应结构无法识别'));
+
+  // 3. Valid native Request reply with valid CreateTweet 200 response -> records +1 reply!
+  nextCreateTweetPayload = createTweetFixtures.standardReply.response;
+  const validReplyReq = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: replyJson
+  });
+  await (await fakeWin.fetch(validReplyReq)).json();
+  await new Promise((r) => setTimeout(r, 50));
+  const snapAfterValidReply = await popup.refresh();
+  assert.equal(snapAfterValidReply.selectedAccount.summary.totalReplies, 1);
+
+  bridge.destroy();
+});
+
+test(
+  '[P2] Real Chromium native fetch(new Request(...)) verification via CDP',
+  { skip: !fs.existsSync('/usr/bin/chromium') || !fs.existsSync('/usr/bin/xvfb-run') },
+  async () => {
+    const adapterSource = fs.readFileSync(path.resolve('src/x-adapter.js'), 'utf8');
+    const interceptorSource = fs.readFileSync(path.resolve('src/interceptor.js'), 'utf8');
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sparklink-chromium-req-'));
+    const child = spawn(
+      '/usr/bin/xvfb-run',
+      [
+        '-a',
+        '/usr/bin/chromium',
+        '--remote-debugging-port=0',
+        '--no-first-run',
+        '--no-default-browser-check',
+        `--user-data-dir=${profileDir}`,
+        'about:blank'
+      ],
+      { stdio: ['ignore', 'ignore', 'ignore'], detached: true }
+    );
+
+    try {
+      const portFile = path.join(profileDir, 'DevToolsActivePort');
+      let port = null;
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(portFile)) {
+          const lines = fs.readFileSync(portFile, 'utf8').trim().split('\n');
+          if (lines[0] && /^\d+$/.test(lines[0].trim())) {
+            port = Number(lines[0].trim());
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert.ok(port, 'Chromium DevToolsActivePort must initialize');
+
+      let pageTarget = null;
+      const pageDeadline = Date.now() + 6000;
+      while (Date.now() < pageDeadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/json`);
+          if (res.ok) {
+            const targets = await res.json();
+            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            if (pageTarget) break;
+          }
+        } catch (_ignore) {}
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      assert.ok(pageTarget, 'Chromium page target must be available');
+
+      const evalExpr = `(async () => {
+        const loadCjs = (src) => {
+          const exportsObj = {};
+          const mod = { exports: exportsObj };
+          new Function('module', 'exports', src)(mod, exportsObj);
+          return mod.exports;
+        };
+        const adapter = loadCjs(${JSON.stringify(adapterSource)});
+        const { installMainInterceptor } = loadCjs(${JSON.stringify(interceptorSource)});
+
+        const posted = [];
+        const listeners = new Set();
+        let consumedReqText = null;
+
+        const fakeWin = {
+          location: { origin: 'https://x.com', href: 'https://x.com/home' },
+          document: { visibilityState: 'visible', querySelector: () => null, querySelectorAll: () => [] },
+          fetch: async (input) => {
+            consumedReqText = await input.text();
+            return new Response(
+              JSON.stringify({ data: { create_post_v2: { id: '999' } } }),
+              { status: 200, headers: { 'content-type': 'application/json' } }
+            );
+          },
+          addEventListener: (_t, fn) => listeners.add(fn),
+          removeEventListener: (_t, fn) => listeners.delete(fn),
+          postMessage: (data, origin) => posted.push({ data, origin })
+        };
+        fakeWin.top = fakeWin;
+
+        installMainInterceptor(fakeWin, adapter);
+        const dispatch = (msg) => {
+          for (const fn of listeners) fn({ data: msg, origin: 'https://x.com', source: fakeWin });
+        };
+
+        dispatch({
+          protocol: 'SPARKLINK_BRIDGE_V1',
+          type: 'BRIDGE_INIT',
+          nonce: 'chromium_nonce_req',
+          collectionEnabled: true,
+          captureSessionId: 1,
+          bindingContext: {
+            bindingId: 'b_req_1',
+            actorUserId: '1001001',
+            captureSessionId: 1,
+            collectionGeneration: 1,
+            accountGeneration: 1
+          }
+        });
+
+        const reqBody = ${JSON.stringify(JSON.stringify(createTweetFixtures.standardReply.requestBody))};
+        const nativeReq = new Request('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: reqBody
+        });
+        const res = await fakeWin.fetch(nativeReq);
+        const resJson = await res.json();
+        await new Promise((r) => setTimeout(r, 40));
+
+        const obs = posted.find((m) => m.data && m.data.type === 'OBSERVED_EVENTS');
+        return {
+          consumedMatches: consumedReqText === reqBody,
+          callerGotResponse: Boolean(resJson && resJson.data && resJson.data.create_post_v2),
+          liveCaptureAnomaly: Boolean(obs && obs.data.liveCaptureAnomaly),
+          anomalies: obs ? obs.data.anomalies : []
+        };
+      })()`;
+
+      const cdpResult = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+        const timer = setTimeout(() => {
+          ws.close();
+          reject(new Error('CDP Runtime.evaluate timed out'));
+        }, 8000);
+        ws.addEventListener('open', () => {
+          ws.send(
+            JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: { expression: evalExpr, awaitPromise: true, returnByValue: true }
+            })
+          );
+        });
+        ws.addEventListener('message', (ev) => {
+          const msg = JSON.parse(String(ev.data));
+          if (msg.id === 1) {
+            clearTimeout(timer);
+            ws.close();
+            resolve(msg);
+          }
+        });
+        ws.addEventListener('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const val = cdpResult.result && cdpResult.result.result && cdpResult.result.result.value;
+      assert.deepEqual(val, {
+        consumedMatches: true,
+        callerGotResponse: true,
+        liveCaptureAnomaly: true,
+        anomalies: ['unrecognized_reply_schema']
+      });
+    } finally {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch (_ignore) {}
+      await new Promise((r) => setTimeout(r, 150));
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch (_ignore) {}
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    }
+  }
+);
+
 
 
 

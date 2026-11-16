@@ -1,0 +1,594 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { createBackgroundService } from '../src/background.js';
+import { createPopupController } from '../src/popup/popup.js';
+
+const NOW_MS = 1794794402000;
+const EXT_ID = 'sparklink_ext_id';
+const POPUP_URL = `chrome-extension://${EXT_ID}/src/popup/popup.html`;
+const POPUP_SENDER = Object.freeze({ id: EXT_ID, url: POPUP_URL });
+
+class FakePopupNode {
+  constructor(tagName, namespaceURI = null) {
+    this.nodeType = 1;
+    this.tagName = String(tagName).toUpperCase();
+    this.namespaceURI = namespaceURI;
+    this.id = '';
+    this.className = '';
+    this.disabled = false;
+    this.checked = false;
+    this.hidden = false;
+    this.value = '';
+    this.files = [];
+    this.attributes = new Map();
+    this.dataset = {};
+    this.children = [];
+    this.parentNode = null;
+    this._textContent = '';
+    this._listeners = new Map();
+    this.clickedCount = 0;
+  }
+
+  set innerHTML(_v) {
+    throw new Error('innerHTML is strictly forbidden in Popup');
+  }
+
+  get textContent() {
+    if (this.children.length === 0) {
+      return this._textContent;
+    }
+    return this.children.map((c) => c.textContent).join('');
+  }
+
+  set textContent(val) {
+    this.children = [];
+    this._textContent = String(val);
+  }
+
+  setAttribute(k, v) {
+    const str = String(v);
+    this.attributes.set(k, str);
+    if (k === 'id') this.id = str;
+    if (k === 'class') this.className = str;
+  }
+
+  getAttribute(k) {
+    return this.attributes.has(k) ? this.attributes.get(k) : null;
+  }
+
+  appendChild(child) {
+    if (child.parentNode) {
+      const idx = child.parentNode.children.indexOf(child);
+      if (idx !== -1) child.parentNode.children.splice(idx, 1);
+    }
+    child.parentNode = this;
+    this.children.push(child);
+    return child;
+  }
+
+  replaceChildren(...nodes) {
+    this.children = [];
+    this._textContent = '';
+    for (const n of nodes) {
+      this.appendChild(n);
+    }
+  }
+
+  remove() {
+    if (this.parentNode) {
+      const idx = this.parentNode.children.indexOf(this);
+      if (idx !== -1) this.parentNode.children.splice(idx, 1);
+      this.parentNode = null;
+    }
+  }
+
+  addEventListener(type, fn) {
+    if (!this._listeners.has(type)) this._listeners.set(type, []);
+    this._listeners.get(type).push(fn);
+  }
+
+  async trigger(type, eventInit = {}) {
+    const list = this._listeners.get(type) || [];
+    for (const fn of list) {
+      await fn({ target: this, preventDefault() {}, ...eventInit });
+    }
+  }
+
+  click() {
+    this.clickedCount += 1;
+  }
+
+  findAllByTag(tag) {
+    const upper = tag.toUpperCase();
+    const out = [];
+    const walk = (n) => {
+      for (const c of n.children) {
+        if (c.tagName === upper) out.push(c);
+        walk(c);
+      }
+    };
+    walk(this);
+    return out;
+  }
+}
+
+function createFakePopupDom() {
+  const byId = new Map();
+  const root = new FakePopupNode('body');
+
+  const ids = [
+    'collection-toggle',
+    'btn-enable-cta',
+    'initial-activation-banner',
+    'account-select',
+    'viewer-status-badge',
+    'status-banners',
+    'overview-title',
+    'overview-coverage',
+    'latest-reply-time',
+    'stat-total-replies',
+    'stat-active-targets',
+    'stat-deep-targets',
+    'top20-list',
+    'top20-empty',
+    'btn-cleanup',
+    'btn-export',
+    'btn-import',
+    'file-import',
+    'btn-clear-account',
+    'btn-clear-all',
+    'action-feedback',
+    'modal-overlay',
+    'modal-title',
+    'modal-body',
+    'btn-modal-confirm',
+    'btn-modal-cancel'
+  ];
+
+  for (const id of ids) {
+    const tag =
+      id === 'account-select'
+        ? 'select'
+        : id === 'collection-toggle' || id === 'file-import'
+        ? 'input'
+        : 'div';
+    const el = new FakePopupNode(tag);
+    el.setAttribute('id', id);
+    if (id === 'modal-overlay') el.hidden = true;
+    byId.set(id, el);
+    root.appendChild(el);
+  }
+
+  const createdDownloads = [];
+  const revokedUrls = [];
+
+  const doc = {
+    body: root,
+    getElementById(id) {
+      return byId.get(id) || null;
+    },
+    createElement(tag) {
+      const n = new FakePopupNode(tag);
+      if (String(tag).toLowerCase() === 'a') {
+        createdDownloads.push(n);
+      }
+      return n;
+    },
+    createElementNS(ns, tag) {
+      return new FakePopupNode(tag, ns);
+    }
+  };
+
+  const urlApi = {
+    createObjectURL(_blob) {
+      return 'blob:chrome-extension://sparklink/backup-1';
+    },
+    revokeObjectURL(u) {
+      revokedUrls.push(u);
+    }
+  };
+
+  return { doc, byId, createdDownloads, revokedUrls, urlApi };
+}
+
+function createArea() {
+  let store = {};
+  return {
+    async setAccessLevel() {},
+    async get(k) {
+      if (typeof k === 'string') {
+        return Object.prototype.hasOwnProperty.call(store, k)
+          ? { [k]: structuredClone(store[k]) }
+          : {};
+      }
+      return structuredClone(store);
+    },
+    async set(items) {
+      store = { ...store, ...structuredClone(items) };
+    },
+    async clear() {
+      store = {};
+    },
+    async getBytesInUse() {
+      return Buffer.byteLength(JSON.stringify(store), 'utf8');
+    }
+  };
+}
+
+test('Popup HTML/CSS assets have zero remote resources and Popup UI covers activation, viewing Account B without altering Tab A binding, safe links, export notice, stale import re-confirm, and clears', async () => {
+  const htmlSource = fs.readFileSync(
+    path.resolve('src/popup/popup.html'),
+    'utf8'
+  );
+  const cssSource = fs.readFileSync(
+    path.resolve('src/popup/popup.css'),
+    'utf8'
+  );
+  assert.ok(htmlSource.includes('SparkLink'));
+  assert.ok(htmlSource.includes('我不会错过你的每一次发声'));
+  assert.equal(/https?:\/\//i.test(htmlSource), false);
+  assert.equal(/https?:\/\//i.test(cssSource), false);
+  assert.ok(cssSource.includes('prefers-color-scheme: dark'));
+
+  const localArea = createArea();
+  const sessionArea = createArea();
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: { sendMessage: async () => {}, onRemoved: { addListener() {} } }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  const runtimeBridge = {
+    sendMessage: (msg) => bg.handleMessage(msg, POPUP_SENDER)
+  };
+
+  const { doc, byId, createdDownloads, revokedUrls, urlApi } = createFakePopupDom();
+  const popup = createPopupController({
+    document: doc,
+    runtime: runtimeBridge,
+    urlApi
+  });
+  await popup.init();
+
+  // 1. Initial paused state shows activation banner & exact Section 2.3 copy
+  assert.equal(byId.get('initial-activation-banner').hidden, false);
+  assert.equal(
+    byId.get('overview-title').textContent,
+    '近 30 天已记录的主动回复（含导入）'
+  );
+  assert.equal(
+    byId.get('overview-coverage').textContent,
+    '来源包括本机网页活动和导入的备份，历史记录可能不完整。'
+  );
+  assert.equal(byId.get('latest-reply-time').textContent, '尚无已记录回复');
+
+  // 2. Click CTA to enable collection -> binds Tab A (1001001) and also imports Account B (9009009)
+  await byId.get('btn-enable-cta').trigger('click');
+  assert.equal(byId.get('collection-toggle').checked, true);
+
+  const tabASender = {
+    id: EXT_ID,
+    tab: { id: 11, active: true },
+    frameId: 0,
+    documentId: 'doc_tab_a',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+  const helloA = await bg.handleMessage({ type: 'HELLO' }, tabASender);
+  const bindA = await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: helloA.captureSessionId,
+      viewer: { actorUserId: '1001001', handle: 'alice_x', displayName: 'Alice' }
+    },
+    tabASender
+  );
+
+  // Submit 1 reply with valid handle & 1 reply with missing handle (ID-only fallback)
+  await bg.handleMessage(
+    {
+      type: 'SUBMIT_OBSERVED_BATCH',
+      bindingContext: bindA.bindingContext,
+      events: [
+        {
+          actorUserId: '1001001',
+          replyTweetId: '2122147641553846272',
+          parentTweetId: '2121785253688246272',
+          targetUserId: '2002002',
+          targetHandle: 'valid_friend',
+          targetDisplayName: 'Valid Friend',
+          createdAt: NOW_MS - 2000,
+          observedAt: NOW_MS - 1000,
+          source: 'live'
+        },
+        {
+          actorUserId: '1001001',
+          replyTweetId: '2122147641553846273',
+          parentTweetId: '2121785253688246273',
+          targetUserId: '3003003',
+          targetHandle: null,
+          targetDisplayName: null,
+          createdAt: NOW_MS - 1000,
+          observedAt: NOW_MS - 500,
+          source: 'history'
+        }
+      ]
+    },
+    tabASender
+  );
+
+  // Import a backup containing Account B (9009009) + mixed validity (1 valid ID-only, 1 invalid missing targetUserId)
+  const mixedBackup = JSON.stringify({
+    format: 'sparklink-backup',
+    formatVersion: 1,
+    exportedAt: '2026-11-16T02:00:01.000Z',
+    data: {
+      schemaVersion: 1,
+      accounts: {
+        '9009009': {
+          handle: 'bob_x',
+          displayName: 'Bob',
+          users: {},
+          replies: {
+            '2122147641553849001': {
+              replyTweetId: '2122147641553849001',
+              parentTweetId: '2121785253688249001',
+              targetUserId: '7777777',
+              createdAt: NOW_MS - 5000,
+              observedAt: NOW_MS - 4000,
+              source: 'live'
+            },
+            '2122147641553849002': {
+              replyTweetId: '2122147641553849002',
+              parentTweetId: '2121785253688249002',
+              targetUserId: '', // invalid!
+              createdAt: NOW_MS - 5000,
+              observedAt: NOW_MS - 4000,
+              source: 'live'
+            }
+          }
+        }
+      }
+    }
+  });
+
+  byId.get('file-import').files = [
+    {
+      name: 'backup.json',
+      size: mixedBackup.length,
+      text: async () => mixedBackup
+    }
+  ];
+  await byId.get('file-import').trigger('change');
+
+  // Preview modal opens showing 新增 1, 无效 1
+  assert.equal(byId.get('modal-overlay').hidden, false);
+  assert.ok(byId.get('modal-body').textContent.includes('1'));
+
+  // Simulate background change BEFORE user confirms import -> triggers PREVIEW_STALE!
+  await bg.handleMessage(
+    {
+      type: 'SUBMIT_OBSERVED_BATCH',
+      bindingContext: bindA.bindingContext,
+      events: [
+        {
+          actorUserId: '1001001',
+          replyTweetId: '2122147641553846299',
+          parentTweetId: '2121785253688246299',
+          targetUserId: '2002002',
+          targetHandle: 'valid_friend',
+          createdAt: NOW_MS - 500,
+          observedAt: NOW_MS - 100,
+          source: 'live'
+        }
+      ]
+    },
+    tabASender
+  );
+  // Also advance global generation by Clear All? Wait: let's test PREVIEW_STALE by clearing Account B or mutating Account B!
+  // Let's confirm first import (Account B was null before and still null, so this succeeds!)
+  await byId.get('btn-modal-confirm').trigger('click');
+  assert.equal(byId.get('modal-overlay').hidden, true);
+
+  // Refresh Popup: active tab is Account A (1001001, 3 replies)
+  await popup.refresh();
+  assert.equal(byId.get('stat-total-replies').textContent, '3');
+
+  // Verify Top 20 safe links: valid_friend has https://x.com/valid_friend, 3003003 has NO link and displays ID
+  const linksInTop20 = byId.get('top20-list').findAllByTag('a');
+  assert.equal(linksInTop20.length, 1);
+  assert.equal(linksInTop20[0].getAttribute('href'), 'https://x.com/valid_friend');
+  assert.equal(linksInTop20[0].getAttribute('rel'), 'noopener noreferrer');
+  assert.ok(byId.get('top20-list').textContent.includes('3003003'));
+
+  // 3. Switch viewed account in Popup to Account B (9009009) -> does NOT change Tab A's capture binding!
+  byId.get('account-select').value = '9009009';
+  await byId.get('account-select').trigger('change');
+  assert.equal(byId.get('stat-total-replies').textContent, '1');
+  assert.ok(byId.get('top20-list').textContent.includes('7777777'));
+
+  // Tab A submits another reply while Popup is viewing Account B -> still attributed to Account A!
+  const tabAWriteWhileViewingB = await bg.handleMessage(
+    {
+      type: 'SUBMIT_OBSERVED_BATCH',
+      bindingContext: bindA.bindingContext,
+      events: [
+        {
+          actorUserId: '1001001',
+          replyTweetId: '2122147641553846300',
+          parentTweetId: '2121785253688246300',
+          targetUserId: '2002002',
+          createdAt: NOW_MS - 200,
+          observedAt: NOW_MS - 50,
+          source: 'live'
+        }
+      ]
+    },
+    tabASender
+  );
+  assert.equal(tabAWriteWhileViewingB.ok, true);
+  assert.equal(tabAWriteWhileViewingB.added, 1);
+
+  // 4. Export backup shows plaintext notice modal first, then downloads and revokes Blob URL
+  await byId.get('btn-export').trigger('click');
+  assert.equal(byId.get('modal-overlay').hidden, false);
+  assert.ok(byId.get('modal-body').textContent.includes('明文'));
+  await byId.get('btn-modal-confirm').trigger('click');
+  assert.equal(byId.get('modal-overlay').hidden, true);
+  assert.ok(createdDownloads.some((a) => (a.getAttribute('download') || '').startsWith('sparklink-backup-')));
+  assert.equal(revokedUrls.length, 1);
+
+  // 5. Open import preview, then Clear All before confirming -> PREVIEW_STALE requires second confirm!
+  byId.get('file-import').files = [
+    {
+      name: 'backup.json',
+      size: mixedBackup.length,
+      text: async () => mixedBackup
+    }
+  ];
+  await byId.get('file-import').trigger('change');
+  assert.equal(byId.get('modal-overlay').hidden, false);
+
+  // Mutate underlying state via CLEAR_ALL directly in background while preview modal is open
+  await bg.handleMessage({ type: 'CLEAR_ALL' }, POPUP_SENDER);
+
+  // First click on confirm gets PREVIEW_STALE and keeps modal open with fresh preview!
+  await byId.get('btn-modal-confirm').trigger('click');
+  assert.equal(byId.get('modal-overlay').hidden, false);
+  assert.ok(byId.get('action-feedback').textContent.includes('变化'));
+
+  // Second click confirms fresh preview and succeeds!
+  await byId.get('btn-modal-confirm').trigger('click');
+  assert.equal(byId.get('modal-overlay').hidden, true);
+  assert.equal(byId.get('stat-total-replies').textContent, '1');
+  assert.equal(byId.get('collection-toggle').checked, false);
+
+  // 6. Cleanup expired, Clear single account, and Clear all via confirmation modals
+  await byId.get('btn-cleanup').trigger('click');
+
+  await byId.get('btn-clear-account').trigger('click');
+  assert.equal(byId.get('modal-overlay').hidden, false);
+  await byId.get('btn-modal-confirm').trigger('click');
+  assert.equal(byId.get('stat-total-replies').textContent, '0');
+
+  await byId.get('btn-clear-all').trigger('click');
+  assert.equal(byId.get('modal-overlay').hidden, false);
+  await byId.get('btn-modal-confirm').trigger('click');
+  assert.equal(byId.get('collection-toggle').checked, false);
+});
+
+test('Popup handles >9 MiB file rejection, modal cancel, toggle switch, and anomaly/corrupted banners cleanly', async () => {
+  assert.equal(createPopupController({ document: null, runtime: null }), null);
+
+  const { doc, byId, urlApi } = createFakePopupDom();
+  let nextSnapshot = {
+    ok: true,
+    revision: 5,
+    collectionGeneration: 1,
+    settings: { collectionEnabled: true, captureSessionId: 5 },
+    savedAccounts: [{ actorUserId: '1001001', accountGeneration: 2, handle: null, displayName: 'NoHandleUser' }],
+    selectedAccount: {
+      actorUserId: '1001001',
+      accountGeneration: 2,
+      handle: null,
+      displayName: 'NoHandleUser',
+      summary: {
+        totalReplies: 55,
+        activeTargetsCount: 1,
+        deepTargetsCount: 1,
+        latestReplyAt: NOW_MS - 1000,
+        clockSkewDetected: true,
+        top20: [
+          {
+            targetUserId: '8888888',
+            handle: null,
+            displayName: null,
+            count: 55,
+            lastReplyAt: NOW_MS - 1000,
+            tierInfo: { tier: 'deep', label: '深度互动', tooltip: '近30天已记录你回复TA 55 次（含导入）' }
+          }
+        ]
+      }
+    },
+    activeTabActorUserId: null,
+    viewerStatus: 'unconfirmed',
+    nearQuotaWarning: true,
+    lastStorageError: '存储空间不足，部分新记录未保存',
+    diagnostics: { partialUnrecognized: true, incompleteObservation: false, observationDropped: false }
+  };
+
+  const mockRuntime = {
+    async sendMessage(msg) {
+      if (msg.type === 'GET_POPUP_SNAPSHOT') return nextSnapshot;
+      if (msg.type === 'SET_COLLECTION_ENABLED') {
+        nextSnapshot.settings.collectionEnabled = msg.enabled;
+        return { ok: true, settings: nextSnapshot.settings };
+      }
+      if (msg.type === 'PREVIEW_IMPORT') {
+        return { ok: false, message: '不支持的备份格式' };
+      }
+      return { ok: true };
+    }
+  };
+
+  const popup = createPopupController({ document: doc, runtime: mockRuntime, urlApi });
+  await popup.init();
+
+  // Verify all 5 warning/error banners rendered simultaneously
+  const bannerText = byId.get('status-banners').textContent;
+  assert.ok(bannerText.includes('存储空间不足'));
+  assert.ok(bannerText.includes('7 MiB'));
+  assert.ok(bannerText.includes('尚未确认'));
+  assert.ok(bannerText.includes('无法识别'));
+  assert.ok(bannerText.includes('系统时钟'));
+  assert.equal(byId.get('viewer-status-badge').textContent, '账号待确认');
+
+  // Oversized > 9 MiB file rejected immediately before reading
+  await byId.get('btn-import').trigger('click');
+  byId.get('file-import').files = [
+    {
+      name: 'huge.json',
+      size: 10 * 1024 * 1024,
+      text: async () => {
+        throw new Error('Should not read oversized file');
+      }
+    }
+  ];
+  await byId.get('file-import').trigger('change');
+  assert.ok(byId.get('action-feedback').textContent.includes('9 MiB'));
+
+  // Invalid format preview displays error message
+  byId.get('file-import').files = [
+    { name: 'bad.json', size: 10, text: async () => '{}' }
+  ];
+  await byId.get('file-import').trigger('change');
+  assert.ok(byId.get('action-feedback').textContent.includes('不支持'));
+
+  // Modal cancel closes modal cleanly
+  await byId.get('btn-clear-all').trigger('click');
+  assert.equal(byId.get('modal-overlay').hidden, false);
+  await byId.get('btn-modal-cancel').trigger('click');
+  assert.equal(byId.get('modal-overlay').hidden, true);
+
+  // Toggle collection checkbox directly
+  byId.get('collection-toggle').checked = false;
+  await byId.get('collection-toggle').trigger('change');
+  assert.equal(byId.get('viewer-status-badge').textContent, '已暂停');
+
+  // Corrupted snapshot state
+  nextSnapshot = { ok: false, code: 'STATE_CORRUPTED', message: '本地状态版本不受支持，已保留旧快照' };
+  await popup.refresh();
+  assert.equal(byId.get('viewer-status-badge').textContent, '存储异常');
+  assert.ok(byId.get('status-banners').textContent.includes('保留旧快照'));
+});
+

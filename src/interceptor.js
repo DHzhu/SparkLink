@@ -155,7 +155,7 @@
       if (!state.collectionEnabled || state.captureSessionId === null || !state.nonce) {
         return;
       }
-      const viewer = adapter.extractViewerFromWindow(win);
+      const viewer = state.latestGraphqlViewer || adapter.extractViewerFromWindow(win);
       if (viewer) {
         sendToBridge('VIEWER_EVIDENCE', {
           captureSessionId: state.captureSessionId,
@@ -239,9 +239,6 @@
           state.bindingContext = null;
           cancelActiveReaders((t) => !targetId || t.bindingId === targetId);
           engine.revokeBinding(targetId);
-          if (state.collectionEnabled) {
-            maybeProbeInitialViewer();
-          }
         } else {
           cancelActiveReaders((t) => t.bindingId === targetId);
           engine.revokeBinding(targetId);
@@ -260,6 +257,7 @@
       if (match.category === 'viewer') {
         const viewer = adapter.extractViewerFromGraphql(payload);
         if (viewer) {
+          state.latestGraphqlViewer = viewer;
           sendToBridge('VIEWER_EVIDENCE', {
             captureSessionId: frozenSessionId,
             viewer

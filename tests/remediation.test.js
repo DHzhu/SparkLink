@@ -3162,6 +3162,28 @@ test('[P1] Shallow-copying window.__INITIAL_STATE__ without changing account fie
   assert.equal(snapAfterBReply.selectedAccount.actorUserId, '9009009');
   assert.equal(snapAfterBReply.selectedAccount.summary.totalReplies, 1);
 
+  // 6. Pause -> __INITIAL_STATE__ catches up to B (clears supersededDynamicActorId, still equals staleActiveActorId B -> stays unconfirmed),
+  //    then Viewer confirms B, Pause -> __INITIAL_STATE__ genuinely switches B -> A -> Resume rebinds A!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 25));
+  fakeWin.__INITIAL_STATE__ = {
+    session: { user_id: '9009009', user: { screen_name: 'second_account', name: '第二账号' } }
+  };
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 35));
+  assert.equal(bridge.getBindingContext(), null);
+
+  await fakeWin.fetch('https://x.com/i/api/graphql/ViewerQid/Viewer');
+  await new Promise((r) => setTimeout(r, 35));
+  assert.equal(bridge.getBindingContext().actorUserId, '9009009');
+
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 25));
+  fakeWin.__INITIAL_STATE__ = structuredClone(viewerFixtures.ownProfileInitialState);
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(bridge.getBindingContext().actorUserId, '1001001');
+
   bridge.destroy();
 });
 

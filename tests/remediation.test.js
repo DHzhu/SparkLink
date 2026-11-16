@@ -857,6 +857,7 @@ class BrowserLikeElement {
     this.tagName = String(tagName).toUpperCase();
     this.attributes = new Map();
     this._childElements = [];
+    this._childNodes = null;
     this.parentNode = null;
     this._text = '';
     this.dataset = new Proxy(
@@ -885,6 +886,10 @@ class BrowserLikeElement {
   get children() {
     // Non-Array HTMLCollection just like real Chromium DOM!
     return makeHtmlCollection(this._childElements);
+  }
+
+  get childNodes() {
+    return this._childNodes ? makeHtmlCollection(this._childNodes) : undefined;
   }
 
   get className() {
@@ -999,7 +1004,10 @@ test('[P2] Non-Array HTMLCollection DOM @handle validation: rejects <a href="/Al
   nameSpan.textContent = 'Bob';
   const linklessHandleWrap = new BrowserLikeElement('div');
   const linklessHandleSpan = new BrowserLikeElement('span');
-  linklessHandleSpan.textContent = '@bob_user';
+  const iconChild = new BrowserLikeElement('svg');
+  // Exercise mixed element + text childNodes just like X inline icon + @handle spans
+  linklessHandleSpan._childElements = [iconChild];
+  linklessHandleSpan._childNodes = [iconChild, { nodeType: 3, nodeValue: '@bob_user' }];
   linklessHandleWrap.appendChild(linklessHandleSpan);
   linklessHeader.appendChild(nameSpan);
   linklessHeader.appendChild(linklessHandleWrap);
@@ -1436,6 +1444,90 @@ test('[P2] Schema drift diagnostics: broken CreateTweet reply schema surfaces li
   );
   assert.equal(nodes.get('viewer-status-badge').textContent, '实时采集异常');
   assert.ok(nodes.get('status-banners').textContent.includes('实时回复响应结构无法识别'));
+
+  // 4. Direct unit checks on additional CreateTweet & UserTweetsAndReplies field-level drift branches
+  const directEngine = adapterApi.createAdapterEngine();
+  const sampleBind = bridge.getBindingContext();
+  const replyMeta = { expectedParentTweetId: '2121785253688246272', isReplyCandidate: true };
+
+  // Missing rest_id inside tweet_results
+  const driftNoId = directEngine.processCreateTweetResponse({
+    payload: { data: { create_tweet: { tweet_results: { result: { __typename: 'Tweet' } } } } },
+    requestMeta: replyMeta,
+    bindingContext: sampleBind,
+    observedAt: NOW_MS
+  });
+  assert.deepEqual(driftNoId.anomalies, ['unrecognized_reply_schema']);
+  assert.equal(driftNoId.incompleteObservation, true);
+
+  // Reply candidate missing parentTweetId in response
+  const driftNoParent = directEngine.processCreateTweetResponse({
+    payload: createTweetFixtures.plainPost.response,
+    requestMeta: replyMeta,
+    bindingContext: sampleBind,
+    observedAt: NOW_MS
+  });
+  assert.deepEqual(driftNoParent.anomalies, ['unrecognized_reply_schema']);
+  assert.equal(driftNoParent.incompleteObservation, true);
+
+  // Reply candidate missing authorUserId in response
+  const noAuthorPayload = structuredClone(createTweetFixtures.standardReply.response);
+  delete noAuthorPayload.data.create_tweet.tweet_results.result.core;
+  delete noAuthorPayload.data.create_tweet.tweet_results.result.legacy.user_id_str;
+  const driftNoAuthor = directEngine.processCreateTweetResponse({
+    payload: noAuthorPayload,
+    requestMeta: replyMeta,
+    bindingContext: sampleBind,
+    observedAt: NOW_MS
+  });
+  assert.deepEqual(driftNoAuthor.anomalies, ['unrecognized_reply_schema']);
+  assert.equal(driftNoAuthor.incompleteObservation, true);
+
+  // Timeline entry with unrecognized tweet item structure vs normal TweetTombstone
+  const timelineItemDrift = directEngine.processTimelineResponse({
+    operationName: 'UserTweetsAndReplies',
+    payload: {
+      data: {
+        user: {
+          result: {
+            __typename: 'User',
+            rest_id: sampleBind.actorUserId,
+            timeline_v2: {
+              timeline: {
+                instructions: [
+                  {
+                    type: 'TimelineAddEntries',
+                    entries: [
+                      {
+                        entryId: 'tomb-1',
+                        content: {
+                          itemContent: {
+                            tweet_results: { result: { __typename: 'TweetTombstone' } }
+                          }
+                        }
+                      },
+                      {
+                        entryId: 'drifted-tweet-1',
+                        content: {
+                          itemContent: {
+                            tweet_results: { result: { __typename: 'Tweet', id_renamed: '999' } }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    bindingContext: sampleBind,
+    observedAt: NOW_MS
+  });
+  assert.equal(timelineItemDrift.partialUnrecognized, true);
+  assert.ok(timelineItemDrift.anomalies.includes('unrecognized_timeline_tweet_schema'));
 
   bridge.destroy();
 });

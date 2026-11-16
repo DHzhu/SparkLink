@@ -1,0 +1,69 @@
+# --- OS & System Files ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+*~
+
+# --- IDE & Editor ---
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.run/
+*.swp
+*.swo
+*.swn
+
+# --- AI & Local Tooling State ---
+.claude/
+.gemini/
+.cursor/
+conductor/setup_state.json
+
+# --- Node.js & Test Artifacts ---
+node_modules/
+coverage/
+.nyc_output/
+*.lcov
+test-results/
+playwright-report/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Extension Build, Packages & Signing Keys ---
+dist/
+build/
+out/
+release/
+artifacts/
+.web-ext-artifacts/
+*.zip
+*.crx
+*.pem
+*.key
+
+# --- Browser Debug Profiles ---
+.chrome-profile/
+.edge-profile/
+user-data-dir/
+
+# --- Logs, Temp & Intermediate Files ---
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.pid
+*.seed
+
+# --- Environment & Sensitive Captures / Backups ---
+.env
+.env.*
+!.env.example
+*.har
+raw-samples/
+captures/
+sparklink-backup-*.json

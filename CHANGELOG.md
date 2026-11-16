@@ -15,7 +15,7 @@
   - 实现 Service Worker 信任上下文配置、Popup 与顶层 X 页面权限分离及 `storage.session` 跨重启会话绑定恢复（`src/background.js`）。
   - 实现 DOM 星火徽章分级渲染（SVG 火苗、认证图标后置布局、`MutationObserver` 合并与 `requestAnimationFrame` 分片、虚拟列表节点复用清理及 60 秒过期窗口自动刷新，`src/content.js`、`src/styles.css`）。
   - 实现浅色/深色自适应 Popup 管理界面（`src/popup/`）并通过全部 34 项单元与端到端验收测试（整体行覆盖率 88.13%）。
-- 补齐 4 个尺寸确定性品牌 PNG 图标（`icons/icon16.png`、`icons/icon32.png`、`icons/icon48.png`、`icons/icon128.png`），并接入真实 Chromium 155 未打包扩展加载与 CDP 真实 DOM / 原生 `Request` 回归验收（`tests/remediation.test.js`，全量 51 项测试通过，整体行覆盖率 88.96%）。
+- 补齐 4 个尺寸确定性品牌 PNG 图标（`icons/icon16.png`、`icons/icon32.png`、`icons/icon48.png`、`icons/icon128.png`），并接入真实 Chromium 155 未打包扩展加载与 CDP 真实 DOM / 原生 `Request` 回归验收（`tests/remediation.test.js`，全量 54 项测试通过，整体行覆盖率 89.25%）。
 
 ### 变更
 - 备份导出切换为紧凑 JSON 序列化并引入 `O(1)` 用户 Handle 索引（`src/popup/popup.js`、`src/storage.js`），确保满载 20,000 条回复（约 5.92 MiB）导出的备份体积低于 9 MiB 导入上限且可快速往返恢复。
@@ -35,6 +35,8 @@
 - **[P1]** 修复同一标签页在暂停期间依次从 A 切到 B、再切回 A 且页面快照均已更新为目标账号时，因历史暂停账号集合未重置而停留在“账号待确认”、漏记 A 首条回复的问题；改为仅对比最近一次暂停前的账号快照，使明确更新的快照可立即重新绑定（`src/interceptor.js`）。
 - **[P2]** 修复 `fetch(request, { body: null })` 误将 `requestMeta` 置空导致跳过父帖一致性校验、将冲突响应错计给另一作者的问题；遵循 WHATWG Fetch 规范沿用原 `Request` 的 256 KiB / 2s 有界副本读取与父帖比对（`src/interceptor.js`）。
 - **[P2]** 修复点击暂停关闭采集开关后 `markWindowSnapshotStale` 仍读取 `window.__INITIAL_STATE__` 的问题；改为仅在开启采集期间缓存已见快照并在暂停时基于内存状态失效（暂停期间页面读取次数为 0，`src/interceptor.js`）。
+- **[P1]** 修复 `Viewer` 已确认账号 B 而 `window.__INITIAL_STATE__` 仍保留旧账号 A 时，暂停期间页面对 `window.__INITIAL_STATE__` 做外层对象浅拷贝（账号字段未变）后恢复采集会重新绑定旧账号 A 的回归问题；移除对象引用判等，改为同时记录暂停前的动态状态账号与当前已激活账号，仅当账号字段真实变化或收到新的 `Viewer` 证据时才允许绑定（`src/interceptor.js`）。
+- **[P1]** 修复页面在确认账号 B 后释放或清空全局 `window.__INITIAL_STATE__` 时，暂停再恢复采集会穿透回退读取首次加载 HTML 内联 `<script>` 中的旧账号 A 并将其误当新账号证据的回归问题；分离动态全局状态与静态初始内联脚本来源（`allowInlineScript`），一旦发生过暂停或观测到动态状态 / `Viewer` 身份证据即永久禁用内联脚本兜底，保持“账号待确认”（`src/x-adapter.js`、`src/interceptor.js`）。
 
 ### 移除
 - (在此记录已移除的功能)

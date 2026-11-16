@@ -86,6 +86,8 @@
       collectionEnabled: false,
       captureSessionId: null,
       bindingContext: null,
+      latestGraphqlViewer: null,
+      supersededWindowActorId: null,
       activeClones: 0
     };
 
@@ -155,7 +157,13 @@
       if (!state.collectionEnabled || state.captureSessionId === null || !state.nonce) {
         return;
       }
-      const viewer = state.latestGraphqlViewer || adapter.extractViewerFromWindow(win);
+      let viewer = state.latestGraphqlViewer;
+      if (!viewer) {
+        const winViewer = adapter.extractViewerFromWindow(win);
+        if (winViewer && winViewer.actorUserId !== state.supersededWindowActorId) {
+          viewer = winViewer;
+        }
+      }
       if (viewer) {
         sendToBridge('VIEWER_EVIDENCE', {
           captureSessionId: state.captureSessionId,
@@ -189,6 +197,7 @@
       state.bindingContext = state.collectionEnabled ? nextBinding : null;
 
       if (!state.collectionEnabled || prevSessionId !== state.captureSessionId) {
+        state.latestGraphqlViewer = null;
         cancelActiveReaders(() => true);
         engine.revokeBinding(null);
       } else if (prevBindingId && (!nextBinding || nextBinding.bindingId !== prevBindingId)) {
@@ -237,6 +246,7 @@
         const targetId = typeof data.bindingId === 'string' ? data.bindingId : null;
         if (!targetId || (state.bindingContext && state.bindingContext.bindingId === targetId)) {
           state.bindingContext = null;
+          state.latestGraphqlViewer = null;
           cancelActiveReaders((t) => !targetId || t.bindingId === targetId);
           engine.revokeBinding(targetId);
         } else {
@@ -257,6 +267,12 @@
       if (match.category === 'viewer') {
         const viewer = adapter.extractViewerFromGraphql(payload);
         if (viewer) {
+          const winViewer = adapter.extractViewerFromWindow(win);
+          if (winViewer && winViewer.actorUserId !== viewer.actorUserId) {
+            state.supersededWindowActorId = winViewer.actorUserId;
+          } else if (winViewer && winViewer.actorUserId === viewer.actorUserId) {
+            state.supersededWindowActorId = null;
+          }
           state.latestGraphqlViewer = viewer;
           sendToBridge('VIEWER_EVIDENCE', {
             captureSessionId: frozenSessionId,

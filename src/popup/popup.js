@@ -446,8 +446,9 @@ export function createPopupController(options = {}) {
     await refresh();
   }
 
-  function triggerJsonDownload(filename, backupObj) {
-    const jsonText = JSON.stringify(backupObj, null, 2);
+  function triggerJsonDownload(filename, backupObj, rawJson) {
+    // Use compact JSON serialization so states near the 8 MiB app budget stay well under the 9 MiB import limit
+    const jsonText = typeof rawJson === 'string' ? rawJson : JSON.stringify(backupObj);
     const blob = new Blob([jsonText], { type: 'application/json' });
     const objectUrl = urlApi.createObjectURL(blob);
     try {
@@ -601,7 +602,7 @@ export function createPopupController(options = {}) {
           const res = await sendToBackground({ type: 'EXPORT_BACKUP' });
           closeModal();
           if (res && res.ok && res.backup) {
-            triggerJsonDownload(res.filename, res.backup);
+            triggerJsonDownload(res.filename, res.backup, res.rawJson);
             showFeedback(`已导出备份：${res.filename}`);
           } else {
             showFeedback((res && res.message) || '导出失败');

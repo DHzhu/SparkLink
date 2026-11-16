@@ -26,11 +26,29 @@ import {
   computeTargetCounts
 } from './metrics.js';
 
-function detachDuplicateHandleInUsersDict(usersDict, ownerUserId, handle) {
+function buildHandleIndex(usersDict) {
+  const index = new Map();
+  for (const [uid, profile] of Object.entries(usersDict)) {
+    if (isPlainObject(profile) && typeof profile.handle === 'string' && profile.handle) {
+      index.set(profile.handle.toLowerCase(), uid);
+    }
+  }
+  return index;
+}
+
+function detachDuplicateHandleInUsersDict(usersDict, ownerUserId, handle, handleIndex) {
   if (!handle) {
     return;
   }
   const lower = handle.toLowerCase();
+  if (handleIndex) {
+    const prevUid = handleIndex.get(lower);
+    if (prevUid && prevUid !== ownerUserId && isPlainObject(usersDict[prevUid])) {
+      usersDict[prevUid].handle = null;
+    }
+    handleIndex.set(lower, ownerUserId);
+    return;
+  }
   for (const [uid, profile] of Object.entries(usersDict)) {
     if (uid !== ownerUserId && isPlainObject(profile) && typeof profile.handle === 'string') {
       if (profile.handle.toLowerCase() === lower) {
@@ -40,14 +58,14 @@ function detachDuplicateHandleInUsersDict(usersDict, ownerUserId, handle) {
   }
 }
 
-function upsertReferencedUserProfile(usersDict, targetUserId, incoming, timestampMs) {
+function upsertReferencedUserProfile(usersDict, targetUserId, incoming, timestampMs, handleIndex) {
   const cleanHandle = sanitizeHandle(incoming && incoming.handle);
   const cleanName = sanitizeDisplayName(incoming && incoming.displayName);
   const existing = isPlainObject(usersDict[targetUserId]) ? usersDict[targetUserId] : null;
 
   if (!existing) {
     if (cleanHandle) {
-      detachDuplicateHandleInUsersDict(usersDict, targetUserId, cleanHandle);
+      detachDuplicateHandleInUsersDict(usersDict, targetUserId, cleanHandle, handleIndex);
     }
     usersDict[targetUserId] = {
       handle: cleanHandle,
@@ -60,7 +78,13 @@ function upsertReferencedUserProfile(usersDict, targetUserId, incoming, timestam
   let changed = false;
   if (timestampMs >= (existing.updatedAt || 0)) {
     if (cleanHandle && cleanHandle !== existing.handle) {
-      detachDuplicateHandleInUsersDict(usersDict, targetUserId, cleanHandle);
+      if (handleIndex && typeof existing.handle === 'string' && existing.handle) {
+        const oldLower = existing.handle.toLowerCase();
+        if (handleIndex.get(oldLower) === targetUserId) {
+          handleIndex.delete(oldLower);
+        }
+      }
+      detachDuplicateHandleInUsersDict(usersDict, targetUserId, cleanHandle, handleIndex);
       existing.handle = cleanHandle;
       changed = true;
     }
@@ -73,7 +97,7 @@ function upsertReferencedUserProfile(usersDict, targetUserId, incoming, timestam
     }
   } else {
     if (!existing.handle && cleanHandle) {
-      detachDuplicateHandleInUsersDict(usersDict, targetUserId, cleanHandle);
+      detachDuplicateHandleInUsersDict(usersDict, targetUserId, cleanHandle, handleIndex);
       existing.handle = cleanHandle;
       changed = true;
     }
@@ -322,6 +346,8 @@ export function createStorageController(storageArea, options = {}) {
         }
       }
 
+      const handleIndex = buildHandleIndex(targetAcc.users);
+
       for (const [replyId, inReply] of Object.entries(incomingAcc.replies)) {
         const localReply = targetAcc.replies[replyId];
         if (localReply) {
@@ -337,7 +363,8 @@ export function createStorageController(storageArea, options = {}) {
                 targetAcc.users,
                 inReply.targetUserId,
                 inUser,
-                inUser.updatedAt || inReply.observedAt
+                inUser.updatedAt || inReply.observedAt,
+                handleIndex
               );
             }
           } else {
@@ -357,7 +384,8 @@ export function createStorageController(storageArea, options = {}) {
           targetAcc.users,
           inReply.targetUserId,
           inUser,
-          inUser.updatedAt || inReply.observedAt
+          inUser.updatedAt || inReply.observedAt,
+          handleIndex
         );
       }
     }
@@ -543,6 +571,7 @@ export function createStorageController(storageArea, options = {}) {
         const candidate = structuredClone(cachedState);
         const cleanupRes = cleanupAllAccountsInPlace(candidate, now, windowMs);
         const targetAcc = candidate.accounts[ctx.actorUserId];
+        const handleIndex = buildHandleIndex(targetAcc.users);
 
         const rawEvents = Array.isArray(params.events) ? params.events : [];
         const rawUsers = Array.isArray(params.observedUsers) ? params.observedUsers : [];
@@ -583,7 +612,8 @@ export function createStorageController(storageArea, options = {}) {
                     targetAcc.users,
                     ev.targetUserId,
                     { handle: ev.targetHandle, displayName: ev.targetDisplayName },
-                    ev.observedAt
+                    ev.observedAt,
+                    handleIndex
                   ) || profileUpdated;
               }
             } else {
@@ -611,7 +641,8 @@ export function createStorageController(storageArea, options = {}) {
             targetAcc.users,
             ev.targetUserId,
             { handle: ev.targetHandle, displayName: ev.targetDisplayName },
-            ev.observedAt
+            ev.observedAt,
+            handleIndex
           );
         }
 
@@ -634,7 +665,7 @@ export function createStorageController(storageArea, options = {}) {
             }
           } else if (Object.prototype.hasOwnProperty.call(targetAcc.users, u.userId)) {
             profileUpdated =
-              upsertReferencedUserProfile(targetAcc.users, u.userId, u, now) ||
+              upsertReferencedUserProfile(targetAcc.users, u.userId, u, now, handleIndex) ||
               profileUpdated;
           }
         }
@@ -808,10 +839,13 @@ export function createStorageController(storageArea, options = {}) {
           }
         };
 
+        const rawJson = JSON.stringify(backup);
+
         return {
           ok: true,
           filename: formatBackupFilename(exportDate),
-          backup
+          backup,
+          rawJson
         };
       });
     },

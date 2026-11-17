@@ -15,7 +15,7 @@
   - 实现 Service Worker 信任上下文配置、Popup 与顶层 X 页面权限分离及 `storage.session` 跨重启会话绑定恢复（`src/background.js`）。
   - 实现 DOM 星火徽章分级渲染（SVG 火苗、认证图标后置布局、`MutationObserver` 合并与 `requestAnimationFrame` 分片、虚拟列表节点复用清理及 60 秒过期窗口自动刷新，`src/content.js`、`src/styles.css`）。
   - 实现浅色/深色自适应 Popup 管理界面（`src/popup/`）并通过全部 34 项单元与端到端验收测试（整体行覆盖率 88.13%）。
-- 补齐 4 个尺寸确定性品牌 PNG 图标（`icons/icon16.png`、`icons/icon32.png`、`icons/icon48.png`、`icons/icon128.png`），并接入真实 Chromium 155 未打包扩展加载与 CDP 真实 DOM / 原生 `Request` 回归验收（`tests/remediation.test.js`，全量 61 项测试通过，整体行覆盖率 89.61%）。
+- 补齐 4 个尺寸确定性品牌 PNG 图标（`icons/icon16.png`、`icons/icon32.png`、`icons/icon48.png`、`icons/icon128.png`），并接入真实 Chromium 155 未打包扩展加载与 CDP 真实 DOM / 原生 `Request` 回归验收（`tests/remediation.test.js`，全量 65 项测试通过，整体行覆盖率 89.68%）。
 
 ### 变更
 - 备份导出切换为紧凑 JSON 序列化并引入 `O(1)` 用户 Handle 索引（`src/popup/popup.js`、`src/storage.js`），确保满载 20,000 条回复（约 5.92 MiB）导出的备份体积低于 9 MiB 导入上限且可快速往返恢复。
@@ -44,6 +44,9 @@
 - **[P2]** 修复从未绑定账号的新标签页点击单次暂停与恢复（或在暂停状态下打开面板再开启采集）时，暂停态默认兜底展示的 `savedAccounts[0]` 写入面板记忆并串入“账号待确认”状态的问题；严格隔离“用户显式下拉选择”与“标签页已确认账号”两类来源，禁止将暂停/无活动页的默认兜底账号回写为记忆账号（`src/background.js`、`src/popup/popup.js`）。
 - **[P2]** 修复账号切换按钮（`SideNav_AccountSwitcher_Button`）与帖子作者容器（`[data-testid="User-Name"]`）将 `@sample_me_alt` 等用户名拆分为相邻文本节点或行内延续标签分段渲染时，误把前缀 `@sample_me` 当成完整用户名匹配旧账号的问题；按块级元素边界先拼合同一字段的连续行内文本再提取完整 `@handle` 比对（`src/interceptor.js`、`src/content.js`）。
 - **[P2]** 修复在“账号待确认”标签页手动选择查看账号后关闭并重开 Popup 丢失手选账号的问题；通过 `SET_POPUP_ACCOUNT` 按当前前台标签页 `documentId` 在会话存储（`chrome.storage.session`）持久化并恢复手选账号，跨面板开闭、暂停/恢复及 Service Worker 重启保持一致，跨文档跳转或新账号正式绑定时自动更新重置（`src/background.js`、`src/popup/popup.js`）。
+- **[P1]** 修复确认账号或读过未确认快照后进入暂停态、暂停期间发生 `A -> B -> A` 切号而页面内存停在 `B` 且左下角账号按钮无可核对 `@handle` 时，恢复采集仅凭快照 ID 变化误绑旧账号 `B`、漏记 `A` 首条回复的问题；统一暂停后及 BFCache 恢复身份门禁（`needsPostPauseVerification`），经历任何暂停边界后一律要求由实时账号按钮 `@handle` 佐证或由当前会话新的 `Viewer` 响应确认身份，否则保持“账号待确认”（`src/interceptor.js`）。
+- **[P2]** 修复帖子作者容器与账号按钮行内文本合并后携带时间/中点分隔符（如 `@somebody_else · 2h`、`@somebody_else·2h` 及 Unicode 双向隔离控制符）时无法提取可见 `@handle`，导致链接与文本冲突时将徽章标错人及无链接作者行漏挂徽章的回归问题；改为在拼合连续行内片段基础上剔除双向控制符并按词法边界扫描合法 `@handle`（同时忽略邮箱地址与 `>64` 位超长串、拦截粘连或多用户名冲突，`src/content.js`、`src/interceptor.js`）。
+- **[P2]** 修复在待确认页面手动选择账号 `A`（无论关闭重开 Popup 还是保持 Popup 常开）后网页收到 `Viewer(B)` 确认新账号时，已打开的 Popup 点击“清理过期记录”刷新仍停留在旧手选账号 `A` 且“清空当前账号”误指向 `A` 的问题；移除刷新时对会话手选账号的内存回填，并将当前打开面板的手动覆盖作用域限定于选择时的已绑定活动账号，使网页新确认或切换账号后已打开面板刷新即自动同步至新账号 `B`（`src/popup/popup.js`、`src/background.js`）。
 
 ### 移除
 - (在此记录已移除的功能)

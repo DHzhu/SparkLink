@@ -225,7 +225,6 @@
           if (switcherEl && typeof switcherEl.textContent === 'string') {
             const m = /(?:^|\s)@([A-Za-z0-9_]{1,64})(?:\s|$)/.exec(switcherEl.textContent);
             if (m && m[1].toLowerCase() !== winViewer.handle.toLowerCase()) {
-              state.supersededDynamicActorId = winViewer.actorUserId;
               return false;
             }
           }
@@ -292,6 +291,10 @@
       state.collectionEnabled = nextEnabled && nextSessionId !== null;
       state.captureSessionId = state.collectionEnabled ? nextSessionId : null;
       state.bindingContext = state.collectionEnabled ? nextBinding : null;
+
+      if (data.observedPaused === true || (!state.collectionEnabled && data.stateConfirmed !== false)) {
+        state.hasPausedOnce = true;
+      }
 
       if (!state.collectionEnabled || prevSessionId !== state.captureSessionId) {
         if (prevEnabled || prevSessionId !== null) {

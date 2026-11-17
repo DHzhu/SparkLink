@@ -1134,7 +1134,9 @@ test(
           const res = await fetch(`http://127.0.0.1:${port}/json`);
           if (res.ok) {
             const targets = await res.json();
-            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            pageTarget = targets.find(
+              (t) => t.type === 'page' && t.url === 'about:blank' && t.webSocketDebuggerUrl
+            );
             if (pageTarget) break;
           }
         } catch (_ignore) {
@@ -1944,7 +1946,9 @@ test(
           const res = await fetch(`http://127.0.0.1:${port}/json`);
           if (res.ok) {
             const targets = await res.json();
-            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            pageTarget = targets.find(
+              (t) => t.type === 'page' && t.url === 'about:blank' && t.webSocketDebuggerUrl
+            );
             if (pageTarget) break;
           }
         } catch (_ignore) {}
@@ -2282,7 +2286,9 @@ test(
           const res = await fetch(`http://127.0.0.1:${port}/json`);
           if (res.ok) {
             const targets = await res.json();
-            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            pageTarget = targets.find(
+              (t) => t.type === 'page' && t.url === 'about:blank' && t.webSocketDebuggerUrl
+            );
             if (pageTarget) break;
           }
         } catch (_ignore) {}
@@ -2842,7 +2848,9 @@ test(
           const res = await fetch(`http://127.0.0.1:${port}/json`);
           if (res.ok) {
             const targets = await res.json();
-            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            pageTarget = targets.find(
+              (t) => t.type === 'page' && t.url === 'about:blank' && t.webSocketDebuggerUrl
+            );
             if (pageTarget) break;
           }
         } catch (_ignore) {}
@@ -3386,7 +3394,9 @@ test(
           const res = await fetch(`http://127.0.0.1:${port}/json`);
           if (res.ok) {
             const targets = await res.json();
-            pageTarget = targets.find((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+            pageTarget = targets.find(
+              (t) => t.type === 'page' && t.url === 'about:blank' && t.webSocketDebuggerUrl
+            );
             if (pageTarget) break;
           }
         } catch (_ignore) {}
@@ -3588,6 +3598,635 @@ test(
         shallowCopyEmitted: 0,
         inlineFallbackEmitted: 0,
         genuineChangeActor: '3003003'
+      });
+    } finally {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch (_ignore) {}
+      await new Promise((r) => setTimeout(r, 150));
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch (_ignore) {}
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    }
+  }
+);
+
+test('[P1] Tab opened as A while collection is paused -> switches to B and releases window.__INITIAL_STATE__ -> first enable stays 账号待确认 and counts B reply (+1) after B Viewer, while enabled-at-load tab still bootstraps inline <script>', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_paused_open_inline';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabPausedSender = {
+    id: EXT_ID,
+    tab: { id: 101, active: true },
+    frameId: 0,
+    documentId: 'doc_101',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+  const tabEnabledSender = {
+    id: EXT_ID,
+    tab: { id: 102, active: true },
+    frameId: 0,
+    documentId: 'doc_102',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  const tab101Listeners = new Set();
+  const tab102Listeners = new Set();
+  let activeTabId = 101;
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: activeTabId, active: true }];
+        },
+        async sendMessage(tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          const set = tabId === 101 ? tab101Listeners : tab102Listeners;
+          for (const fn of set) fn(msg, { id: EXT_ID });
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  const inlineScriptNodeA = {
+    textContent:
+      'window.__INITIAL_STATE__ = {"session":{"user_id":"1001001","user":{"screen_name":"sample_me","name":"示例账号"}}};'
+  };
+
+  const replyForB = structuredClone(createTweetFixtures.standardReply.response);
+  replyForB.data.create_tweet.tweet_results.result.rest_id = '2122147641553892001';
+  replyForB.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553892001';
+  replyForB.data.create_tweet.tweet_results.result.core.user_results.result.rest_id = '9009009';
+  replyForB.data.create_tweet.tweet_results.result.core.user_results.result.core.screen_name =
+    'second_account';
+  replyForB.data.create_tweet.tweet_results.result.legacy.user_id_str = '9009009';
+
+  let pausedInitialStateReads = 0;
+  let currentPausedWinState = structuredClone(viewerFixtures.ownProfileInitialState);
+  const win101Listeners = new Map();
+
+  // Tab 101 opens as Account A while collection is PAUSED (default disabled state)
+  const fakeWin101 = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector: () => null,
+      querySelectorAll(sel) {
+        if (sel === 'script:not([src])') return [inlineScriptNodeA];
+        return [];
+      }
+    },
+    fetch(url) {
+      if (String(url).includes('Viewer')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(viewerFixtures.viewerGraphqlLegacy), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
+      if (String(url).includes('CreateTweet')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(replyForB), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    },
+    addEventListener(type, fn) {
+      if (!win101Listeners.has(type)) win101Listeners.set(type, new Set());
+      win101Listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (win101Listeners.has(type)) win101Listeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = win101Listeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin101 });
+        }
+      });
+    }
+  };
+  Object.defineProperty(fakeWin101, '__INITIAL_STATE__', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      pausedInitialStateReads += 1;
+      return currentPausedWinState;
+    }
+  });
+  fakeWin101.top = fakeWin101;
+
+  const pageChrome101 = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabPausedSender),
+      onMessage: {
+        addListener: (fn) => tab101Listeners.add(fn),
+        removeListener: (fn) => tab101Listeners.delete(fn)
+      }
+    }
+  };
+
+  installMainInterceptor(fakeWin101, adapterApi, { nowFn: () => NOW_MS });
+  const bridge101 = installIsolatedBridge(fakeWin101, pageChrome101, {
+    nowFn: () => NOW_MS,
+    retryDelayMs: 5
+  });
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(
+    pausedInitialStateReads,
+    0,
+    'Tab opened while paused must perform 0 window.__INITIAL_STATE__ reads while paused'
+  );
+
+  // User switches to Account B in-page while STILL paused: page receives B's Viewer response and releases window.__INITIAL_STATE__
+  await fakeWin101.fetch('https://x.com/i/api/graphql/ViewerQid/Viewer');
+  await new Promise((r) => setTimeout(r, 25));
+  delete fakeWin101.__INITIAL_STATE__;
+
+  // User enables collection for the FIRST time!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 45));
+
+  const { doc: popupDoc, nodes: popupNodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: popupDoc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const snapAfterFirstEnable = await popup.init();
+
+  assert.equal(
+    bridge101.getBindingContext(),
+    null,
+    'Tab opened while paused must NOT bind stale Account A from initial HTML inline <script> on first enable'
+  );
+  assert.equal(snapAfterFirstEnable.viewerStatus, 'unconfirmed');
+  assert.equal(popupNodes.get('viewer-status-badge').textContent, '账号待确认');
+
+  // Fresh B Viewer arrives -> binds B and records B's first reply (+1)
+  await fakeWin101.fetch('https://x.com/i/api/graphql/ViewerQid/Viewer');
+  await new Promise((r) => setTimeout(r, 35));
+  assert.equal(bridge101.getBindingContext().actorUserId, '9009009');
+
+  await fakeWin101.fetch('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 40));
+  const snapAfterBReply = await popup.refresh();
+  assert.equal(snapAfterBReply.selectedAccount.actorUserId, '9009009');
+  assert.equal(snapAfterBReply.selectedAccount.summary.totalReplies, 1);
+
+  // Verify a brand-new Tab 102 loaded while collection is ALREADY enabled still bootstraps from inline <script> when __INITIAL_STATE__ is absent
+  activeTabId = 102;
+  const win102Listeners = new Map();
+  const fakeWin102 = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      visibilityState: 'visible',
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector: () => null,
+      querySelectorAll(sel) {
+        if (sel === 'script:not([src])') return [inlineScriptNodeA];
+        return [];
+      }
+    },
+    fetch: () => Promise.resolve(new Response('{}', { status: 200 })),
+    addEventListener(type, fn) {
+      if (!win102Listeners.has(type)) win102Listeners.set(type, new Set());
+      win102Listeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (win102Listeners.has(type)) win102Listeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = win102Listeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin102 });
+        }
+      });
+    }
+  };
+  fakeWin102.top = fakeWin102;
+  const pageChrome102 = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabEnabledSender),
+      onMessage: {
+        addListener: (fn) => tab102Listeners.add(fn),
+        removeListener: (fn) => tab102Listeners.delete(fn)
+      }
+    }
+  };
+  installMainInterceptor(fakeWin102, adapterApi, { nowFn: () => NOW_MS });
+  const bridge102 = installIsolatedBridge(fakeWin102, pageChrome102, {
+    nowFn: () => NOW_MS,
+    retryDelayMs: 5
+  });
+  await new Promise((r) => setTimeout(r, 45));
+  assert.ok(bridge102.getBindingContext());
+  assert.equal(bridge102.getBindingContext().actorUserId, '1001001');
+
+  bridge101.destroy();
+  bridge102.destroy();
+});
+
+test('[P2] Transient SideNav_AccountSwitcher_Button stale @handle blocks premature bind without poisoning dynamic viewer A, allowing visibilitychange recheck to bind A and record first reply (+1)', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_transient_switcher';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabSender = {
+    id: EXT_ID,
+    tab: { id: 103, active: true },
+    frameId: 0,
+    documentId: 'doc_103',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  const tabListeners = new Set();
+  const docVisibilityListeners = new Set();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: 103, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          for (const fn of tabListeners) fn(msg, { id: EXT_ID });
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  // Dynamic state is already Account A (@sample_me, 1001001), while switcher button briefly shows @second_account (B)
+  let switcherText = 'Second Account @second_account';
+  let visibilityState = 'visible';
+  const winListeners = new Map();
+
+  const replyForA = structuredClone(createTweetFixtures.standardReply.response);
+  replyForA.data.create_tweet.tweet_results.result.rest_id = '2122147641553893001';
+  replyForA.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553893001';
+
+  const fakeWin = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      get visibilityState() {
+        return visibilityState;
+      },
+      addEventListener(type, fn) {
+        if (type === 'visibilitychange') docVisibilityListeners.add(fn);
+      },
+      removeEventListener(type, fn) {
+        if (type === 'visibilitychange') docVisibilityListeners.delete(fn);
+      },
+      querySelector(sel) {
+        if (sel === '[data-testid="SideNav_AccountSwitcher_Button"]') {
+          return { textContent: switcherText };
+        }
+        return null;
+      },
+      querySelectorAll: () => []
+    },
+    __INITIAL_STATE__: structuredClone(viewerFixtures.ownProfileInitialState),
+    fetch(url) {
+      if (String(url).includes('CreateTweet')) {
+        return Promise.resolve(
+          new Response(JSON.stringify(replyForA), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+          })
+        );
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    },
+    addEventListener(type, fn) {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      winListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (winListeners.has(type)) winListeners.get(type).delete(fn);
+    },
+    postMessage(data, origin) {
+      queueMicrotask(() => {
+        const set = winListeners.get('message');
+        if (set) {
+          for (const fn of set) fn({ data, origin, source: fakeWin });
+        }
+      });
+    }
+  };
+  fakeWin.top = fakeWin;
+
+  const pageChrome = {
+    runtime: {
+      id: EXT_ID,
+      sendMessage: (msg) => bg.handleMessage(msg, tabSender),
+      onMessage: {
+        addListener: (fn) => tabListeners.add(fn),
+        removeListener: (fn) => tabListeners.delete(fn)
+      }
+    }
+  };
+
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  installMainInterceptor(fakeWin, adapterApi, { nowFn: () => NOW_MS });
+  const bridge = installIsolatedBridge(fakeWin, pageChrome, { nowFn: () => NOW_MS, retryDelayMs: 5 });
+  await new Promise((r) => setTimeout(r, 40));
+
+  // 1. Initial probe blocked because switcher button briefly displays @second_account
+  assert.equal(bridge.getBindingContext(), null);
+
+  // 2. Switcher button updates to @sample_me; user switches away and returns to tab -> triggers visibilitychange recheck
+  switcherText = '示例账号 @sample_me';
+  visibilityState = 'hidden';
+  for (const fn of docVisibilityListeners) fn();
+  visibilityState = 'visible';
+  for (const fn of docVisibilityListeners) fn();
+  await new Promise((r) => setTimeout(r, 45));
+
+  assert.ok(
+    bridge.getBindingContext(),
+    'Subsequent visibilitychange recheck after switcher button updates to @sample_me must bind Account A'
+  );
+  assert.equal(bridge.getBindingContext().actorUserId, '1001001');
+
+  // 3. Account A sends first reply -> MUST be counted (+1)!
+  await fakeWin.fetch('https://x.com/i/api/graphql/ReplyQid/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 40));
+
+  const snap = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
+  assert.equal(snap.selectedAccount.actorUserId, '1001001');
+  assert.equal(snap.selectedAccount.summary.totalReplies, 1);
+
+  bridge.destroy();
+});
+
+test(
+  '[P1] & [P2] Real Chromium CDP verification: paused-at-load tab inline <script> guard and transient SideNav_AccountSwitcher_Button recheck',
+  { skip: !fs.existsSync('/usr/bin/chromium') || !fs.existsSync('/usr/bin/xvfb-run') },
+  async () => {
+    const adapterSource = fs.readFileSync(path.resolve('src/x-adapter.js'), 'utf8');
+    const interceptorSource = fs.readFileSync(path.resolve('src/interceptor.js'), 'utf8');
+    const bridgeSource = fs.readFileSync(path.resolve('src/bridge.js'), 'utf8');
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sparklink-chromium-paused-recheck-'));
+    const child = spawn(
+      '/usr/bin/xvfb-run',
+      [
+        '-a',
+        '/usr/bin/chromium',
+        '--remote-debugging-port=0',
+        '--no-first-run',
+        '--no-default-browser-check',
+        `--user-data-dir=${profileDir}`,
+        'about:blank'
+      ],
+      { stdio: ['ignore', 'ignore', 'ignore'], detached: true }
+    );
+
+    try {
+      const portFile = path.join(profileDir, 'DevToolsActivePort');
+      let port = null;
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(portFile)) {
+          const lines = fs.readFileSync(portFile, 'utf8').trim().split('\n');
+          if (lines[0] && /^\d+$/.test(lines[0].trim())) {
+            port = Number(lines[0].trim());
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert.ok(port, 'Chromium DevToolsActivePort must initialize');
+
+      let pageTarget = null;
+      const pageDeadline = Date.now() + 6000;
+      while (Date.now() < pageDeadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/json`);
+          if (res.ok) {
+            const targets = await res.json();
+            pageTarget = targets.find(
+              (t) => t.type === 'page' && t.url === 'about:blank' && t.webSocketDebuggerUrl
+            );
+            if (pageTarget) break;
+          }
+        } catch (_ignore) {}
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      assert.ok(pageTarget, 'Chromium page target must be available');
+
+      const setupExpr = `(() => {
+        const loadCjs = (src) => {
+          const exportsObj = {};
+          const mod = { exports: exportsObj };
+          new Function('module', 'exports', src)(mod, exportsObj);
+          return mod.exports;
+        };
+        window.__sparkTestLoad = loadCjs;
+        window.__sparkTestAdapter = loadCjs(${JSON.stringify(adapterSource)});
+        window.__sparkTestInterceptor = loadCjs(${JSON.stringify(interceptorSource)});
+        return true;
+      })()`;
+
+      const evalExpr = `(async () => {
+        const adapter = window.__sparkTestAdapter;
+        const { installMainInterceptor } = window.__sparkTestInterceptor;
+        const { installIsolatedBridge } = window.__sparkTestLoad(${JSON.stringify(bridgeSource)});
+
+        // Scenario 1: Paused-at-load real DOM with inline <script> A -> switch to B & delete __INITIAL_STATE__ -> first enable
+        document.head.replaceChildren();
+        document.body.replaceChildren();
+        const ssrScript = document.createElement('script');
+        ssrScript.type = 'text/plain';
+        ssrScript.textContent = 'window.__INITIAL_STATE__ = {"session":{"user_id":"1001001","user":{"screen_name":"sample_me","name":"A"}}};';
+        document.head.appendChild(ssrScript);
+
+        let bgEnabled = false;
+        let bgSessionId = null;
+        let bgBinding = null;
+        const runtimeListeners = new Set();
+        const win1Listeners = new Set();
+        const fakeWin1 = {
+          location: { origin: 'https://x.com', href: 'https://x.com/home' },
+          document,
+          __INITIAL_STATE__: { session: { user_id: '1001001', user: { screen_name: 'sample_me', name: 'A' } } },
+          fetch: async () => new Response('{}', { status: 200 }),
+          addEventListener: (t, fn) => { if (t === 'message') win1Listeners.add(fn); },
+          removeEventListener: (t, fn) => { if (t === 'message') win1Listeners.delete(fn); },
+          postMessage: (data, origin) => queueMicrotask(() => {
+            for (const fn of win1Listeners) fn({ data, origin, source: fakeWin1 });
+          })
+        };
+        fakeWin1.top = fakeWin1;
+
+        const fakeChrome1 = {
+          runtime: {
+            id: 'ext_cdp',
+            async sendMessage(msg) {
+              if (msg.type === 'HELLO') {
+                return { ok: true, collectionEnabled: bgEnabled, captureSessionId: bgSessionId, bindingContext: bgBinding, revision: 1 };
+              }
+              if (msg.type === 'BIND_VIEWER') {
+                bgBinding = { bindingId: 'b_' + msg.viewer.actorUserId, actorUserId: msg.viewer.actorUserId, captureSessionId: bgSessionId, collectionGeneration: 1, accountGeneration: 1 };
+                return { ok: true, bindingContext: bgBinding, revision: 2 };
+              }
+              return { ok: true };
+            },
+            onMessage: { addListener: (fn) => runtimeListeners.add(fn), removeListener: (fn) => runtimeListeners.delete(fn) }
+          }
+        };
+
+        installMainInterceptor(fakeWin1, adapter);
+        const bridge1 = installIsolatedBridge(fakeWin1, fakeChrome1, { retryDelayMs: 5 });
+        await new Promise((r) => setTimeout(r, 35));
+
+        // While paused, release __INITIAL_STATE__ (leaving real DOM <script> A) and enable collection for the first time
+        delete fakeWin1.__INITIAL_STATE__;
+        bgEnabled = true;
+        bgSessionId = 1;
+        for (const fn of runtimeListeners) fn({ type: 'STATE_CHANGED', collectionEnabled: true, captureSessionId: 1 }, { id: 'ext_cdp' });
+        await new Promise((r) => setTimeout(r, 40));
+        const pausedOpenFirstEnableActor = bridge1.getBindingContext() ? bridge1.getBindingContext().actorUserId : null;
+        bridge1.destroy();
+
+        // Scenario 2: Real DOM SideNav_AccountSwitcher_Button briefly shows @second_account while __INITIAL_STATE__ is @sample_me, then updates to @sample_me
+        const switcherBtn = document.createElement('button');
+        switcherBtn.setAttribute('data-testid', 'SideNav_AccountSwitcher_Button');
+        switcherBtn.textContent = 'B @second_account';
+        document.body.appendChild(switcherBtn);
+
+        let bg2Binding = null;
+        const win2Listeners = new Set();
+        const fakeWin2 = {
+          location: { origin: 'https://x.com', href: 'https://x.com/home' },
+          document,
+          __INITIAL_STATE__: { session: { user_id: '1001001', user: { screen_name: 'sample_me', name: 'A' } } },
+          fetch: async () => new Response('{}', { status: 200 }),
+          addEventListener: (t, fn) => { if (t === 'message') win2Listeners.add(fn); },
+          removeEventListener: (t, fn) => { if (t === 'message') win2Listeners.delete(fn); },
+          postMessage: (data, origin) => queueMicrotask(() => {
+            for (const fn of win2Listeners) fn({ data, origin, source: fakeWin2 });
+          })
+        };
+        fakeWin2.top = fakeWin2;
+        const fakeChrome2 = {
+          runtime: {
+            id: 'ext_cdp',
+            async sendMessage(msg) {
+              if (msg.type === 'HELLO') {
+                return { ok: true, collectionEnabled: true, captureSessionId: 2, bindingContext: bg2Binding, revision: 1 };
+              }
+              if (msg.type === 'BIND_VIEWER') {
+                bg2Binding = { bindingId: 'b2_' + msg.viewer.actorUserId, actorUserId: msg.viewer.actorUserId, captureSessionId: 2, collectionGeneration: 1, accountGeneration: 1 };
+                return { ok: true, bindingContext: bg2Binding, revision: 2 };
+              }
+              return { ok: true };
+            },
+            onMessage: { addListener() {}, removeListener() {} }
+          }
+        };
+        installMainInterceptor(fakeWin2, adapter);
+        const bridge2 = installIsolatedBridge(fakeWin2, fakeChrome2, { retryDelayMs: 5 });
+        await new Promise((r) => setTimeout(r, 35));
+        const beforeSwitcherCatchup = bridge2.getBindingContext() ? bridge2.getBindingContext().actorUserId : null;
+
+        switcherBtn.textContent = 'A @sample_me';
+        document.dispatchEvent(new Event('visibilitychange'));
+        await new Promise((r) => setTimeout(r, 40));
+        const afterSwitcherCatchup = bridge2.getBindingContext() ? bridge2.getBindingContext().actorUserId : null;
+        bridge2.destroy();
+
+        return {
+          pausedOpenFirstEnableActor,
+          beforeSwitcherCatchup,
+          afterSwitcherCatchup
+        };
+      })()`;
+
+      const cdpResult = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+        const timer = setTimeout(() => {
+          ws.close();
+          reject(new Error('CDP Runtime.evaluate timed out'));
+        }, 8000);
+        ws.addEventListener('open', () => {
+          ws.send(
+            JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: { expression: setupExpr, returnByValue: true }
+            })
+          );
+        });
+        ws.addEventListener('message', (ev) => {
+          const msg = JSON.parse(String(ev.data));
+          if (msg.id === 1) {
+            ws.send(
+              JSON.stringify({
+                id: 2,
+                method: 'Runtime.evaluate',
+                params: { expression: evalExpr, awaitPromise: true, returnByValue: true }
+              })
+            );
+          } else if (msg.id === 2) {
+            clearTimeout(timer);
+            ws.close();
+            resolve(msg);
+          }
+        });
+        ws.addEventListener('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const val = cdpResult.result && cdpResult.result.result && cdpResult.result.result.value;
+      assert.deepEqual(val, {
+        pausedOpenFirstEnableActor: null,
+        beforeSwitcherCatchup: null,
+        afterSwitcherCatchup: '1001001'
       });
     } finally {
       try {

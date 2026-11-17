@@ -294,6 +294,8 @@
 
     const state = {
       mainReady: false,
+      backendStateConfirmed: false,
+      observedPausedFromBackend: false,
       collectionEnabled: false,
       captureSessionId: null,
       bindingContext: null,
@@ -342,7 +344,9 @@
       postToMain('BRIDGE_INIT', {
         collectionEnabled: state.collectionEnabled,
         captureSessionId: state.captureSessionId,
-        bindingContext: state.bindingContext
+        bindingContext: state.bindingContext,
+        stateConfirmed: state.backendStateConfirmed,
+        observedPaused: state.observedPausedFromBackend
       });
     }
 
@@ -350,7 +354,9 @@
       postToMain('SYNC_STATE', {
         collectionEnabled: state.collectionEnabled,
         captureSessionId: state.captureSessionId,
-        bindingContext: state.bindingContext
+        bindingContext: state.bindingContext,
+        stateConfirmed: state.backendStateConfirmed,
+        observedPaused: state.observedPausedFromBackend
       });
     }
 
@@ -501,6 +507,12 @@
         type: 'HELLO',
         origin
       });
+      if (!state.destroyed && isPlainObject(res) && res.ok) {
+        state.backendStateConfirmed = true;
+        if (!res.collectionEnabled) {
+          state.observedPausedFromBackend = true;
+        }
+      }
       if (state.destroyed || attemptSeq !== state.bindAttemptSeq) {
         return;
       }
@@ -913,6 +925,10 @@
       }
 
       if (msg.type === 'STATE_CHANGED') {
+        if (msg.collectionEnabled === false) {
+          state.backendStateConfirmed = true;
+          state.observedPausedFromBackend = true;
+        }
         performHello();
         return;
       }

@@ -410,8 +410,13 @@ export function createBackgroundService(chromeApi, options = {}) {
   async function handlePopupMessage(msg) {
     if (msg.type === 'GET_POPUP_SNAPSHOT') {
       const ctx = await resolveActivePopupContext();
+      const canHonorPreferred =
+        isValidDecimalId(msg.preferredActorUserId) &&
+        (msg.preferredWhenActiveActorId === undefined ||
+          !ctx.activeActorUserId ||
+          ctx.activeActorUserId === msg.preferredWhenActiveActorId);
       let preferredId = null;
-      if (isValidDecimalId(msg.preferredActorUserId)) {
+      if (canHonorPreferred) {
         preferredId = msg.preferredActorUserId;
       } else if (ctx.activeActorUserId) {
         preferredId = ctx.activeActorUserId;

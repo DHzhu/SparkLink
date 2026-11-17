@@ -6214,6 +6214,242 @@ test(
   }
 );
 
+test('[P2] Already-open Popup (both closed-and-reopened and never-closed) switches from manual unconfirmed Account A to newly bound Account B on refresh and targets B on Clear Account', async () => {
+  const NOW_MS = 1794794412000;
+  const EXT_ID = 'sparklink_remed_open_popup_sync';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  let fgTabId = 501;
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: fgTabId, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  // Seed Account A ('1001001', 1 reply) and Account B ('9009009', 0 replies)
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  const seedSender = {
+    id: EXT_ID,
+    tab: { id: 500, active: false },
+    frameId: 0,
+    documentId: 'doc_seed_500',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+  const bindSeedA = await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: 1,
+      viewer: { actorUserId: '1001001', handle: 'alice_first', displayName: 'Alice' }
+    },
+    seedSender
+  );
+  await bg.handleMessage(
+    {
+      type: 'SUBMIT_OBSERVED_BATCH',
+      bindingContext: bindSeedA.bindingContext,
+      events: [
+        {
+          actorUserId: '1001001',
+          replyTweetId: '2122147641553995001',
+          parentTweetId: '2121785253688295001',
+          targetUserId: '2002002',
+          targetHandle: 'friend_one',
+          createdAt: NOW_MS - 1000,
+          observedAt: NOW_MS - 500,
+          source: 'live'
+        }
+      ]
+    },
+    seedSender
+  );
+  await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: 1,
+      viewer: { actorUserId: '9009009', handle: 'bob_second', displayName: 'Bob' }
+    },
+    seedSender
+  );
+
+  // 1. Exact reported repro: Foreground Tab 501 is unconfirmed. Open Popup #1, manually select Account A ('1001001', 1 reply), close Popup #1, reopen Popup #2!
+  const tab501Sender = {
+    id: EXT_ID,
+    tab: { id: 501, active: true },
+    frameId: 0,
+    documentId: 'doc_501_unconfirmed',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+  await bg.handleMessage({ type: 'HELLO' }, tab501Sender);
+
+  const { doc: p1Doc, nodes: p1Nodes } = createPopupDomHarness();
+  const popup1 = createPopupController({
+    document: p1Doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup1.init();
+  assert.equal(p1Nodes.get('viewer-status-badge').textContent, '账号待确认');
+  assert.equal(p1Nodes.get('account-select').value, '');
+
+  p1Nodes.get('account-select').value = '1001001';
+  await p1Nodes.get('account-select').trigger('change');
+  assert.equal(p1Nodes.get('stat-total-replies').textContent, '1');
+
+  // Close Popup #1 and reopen Popup #2 while Tab 501 is STILL unconfirmed -> restores A ('1001001', 1 reply)
+  const { doc: p2Doc, nodes: p2Nodes } = createPopupDomHarness();
+  const popup2 = createPopupController({
+    document: p2Doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const snapP2Init = await popup2.init();
+  assert.equal(snapP2Init.viewerStatus, 'unconfirmed');
+  assert.equal(p2Nodes.get('account-select').value, '1001001');
+  assert.equal(p2Nodes.get('stat-total-replies').textContent, '1');
+
+  // While Tab 501 is STILL unconfirmed, clicking "清理过期记录" in Popup #2 retains A ('1001001', 1 reply)
+  await p2Nodes.get('btn-cleanup').trigger('click');
+  assert.equal(p2Nodes.get('account-select').value, '1001001');
+  assert.equal(p2Nodes.get('stat-total-replies').textContent, '1');
+
+  // Now Tab 501 receives Viewer(B) ('9009009') while Popup #2 STAYS OPEN!
+  await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: snapP2Init.settings.captureSessionId,
+      viewer: { actorUserId: '9009009', handle: 'bob_second', displayName: 'Bob' }
+    },
+    tab501Sender
+  );
+
+  // In the STILL-OPEN Popup #2, click "清理过期记录" -> MUST immediately switch to B ('9009009', 0 replies, 采集中)!
+  await p2Nodes.get('btn-cleanup').trigger('click');
+  assert.equal(p2Nodes.get('viewer-status-badge').textContent, '采集中');
+  assert.equal(
+    p2Nodes.get('account-select').value,
+    '9009009',
+    'Already-open reopened Popup must switch from manual Account A to newly bound Account B on Cleanup click'
+  );
+  assert.equal(
+    p2Nodes.get('stat-total-replies').textContent,
+    '0',
+    'Already-open reopened Popup must show Account B (0 replies) rather than stale Account A (1 reply)'
+  );
+
+  // Clicking "清空当前账号" in Popup #2 MUST target Account B ('9009009'), leaving Account A's 1 reply intact!
+  await p2Nodes.get('btn-clear-account').trigger('click');
+  assert.equal(p2Nodes.get('modal-overlay').hidden, false);
+  assert.ok(
+    p2Nodes.get('modal-body').textContent.includes('9009009'),
+    'Clear Current Account modal must target newly bound Account B (9009009), NOT Account A (1001001)'
+  );
+  await p2Nodes.get('btn-modal-confirm').trigger('click');
+
+  // Re-seed Account B ('9009009') and verify Account A STILL has its 1 reply!
+  const snapCheckA = await bg.handleMessage(
+    { type: 'GET_POPUP_SNAPSHOT', preferredActorUserId: '1001001' },
+    POPUP_SENDER
+  );
+  assert.equal(snapCheckA.selectedAccount.actorUserId, '1001001');
+  assert.equal(snapCheckA.selectedAccount.summary.totalReplies, 1);
+
+  await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: snapCheckA.settings.captureSessionId,
+      viewer: { actorUserId: '9009009', handle: 'bob_second', displayName: 'Bob' }
+    },
+    seedSender
+  );
+
+  // 2. Cousin scenario: Never-closed Popup on unconfirmed Tab 502 selects A, then Tab 502 receives Viewer(B) WITHOUT closing Popup -> switches to B!
+  fgTabId = 502;
+  const tab502Sender = {
+    id: EXT_ID,
+    tab: { id: 502, active: true },
+    frameId: 0,
+    documentId: 'doc_502_never_closed',
+    origin: 'https://x.com',
+    url: 'https://x.com/explore'
+  };
+  await bg.handleMessage({ type: 'HELLO' }, tab502Sender);
+
+  const { doc: p3Doc, nodes: p3Nodes } = createPopupDomHarness();
+  const popup3 = createPopupController({
+    document: p3Doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const snapP3Init = await popup3.init();
+  assert.equal(snapP3Init.viewerStatus, 'unconfirmed');
+  p3Nodes.get('account-select').value = '1001001';
+  await p3Nodes.get('account-select').trigger('change');
+  assert.equal(p3Nodes.get('stat-total-replies').textContent, '1');
+
+  // Without ever closing Popup #3, Tab 502 binds Account B ('9009009') -> click Cleanup -> switches to B!
+  await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: snapP3Init.settings.captureSessionId,
+      viewer: { actorUserId: '9009009', handle: 'bob_second', displayName: 'Bob' }
+    },
+    tab502Sender
+  );
+  await p3Nodes.get('btn-cleanup').trigger('click');
+  assert.equal(
+    p3Nodes.get('account-select').value,
+    '9009009',
+    'Never-closed Popup must also switch to newly bound Account B after manual pick on unconfirmed tab'
+  );
+  assert.equal(p3Nodes.get('stat-total-replies').textContent, '0');
+
+  // 3. Explicit inspection on an ALREADY-bound tab: while Tab 502 is bound to B ('9009009'), manually picking A ('1001001') stays on A across Cleanup while Tab 502 remains bound to B, and switches if Tab 502 live-switches to C ('3003003')!
+  p3Nodes.get('account-select').value = '1001001';
+  await p3Nodes.get('account-select').trigger('change');
+  assert.equal(p3Nodes.get('account-select').value, '1001001');
+  assert.equal(p3Nodes.get('stat-total-replies').textContent, '1');
+  await p3Nodes.get('btn-cleanup').trigger('click');
+  assert.equal(
+    p3Nodes.get('account-select').value,
+    '1001001',
+    'Manual inspection of A on already-bound Tab B must stay on A while Tab B remains bound to B'
+  );
+
+  await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: snapP3Init.settings.captureSessionId,
+      viewer: { actorUserId: '3003003', handle: 'carol_third', displayName: 'Carol' }
+    },
+    tab502Sender
+  );
+  await p3Nodes.get('btn-cleanup').trigger('click');
+  assert.equal(
+    p3Nodes.get('account-select').value,
+    '3003003',
+    'Live account switch on bound tab (B -> C) must switch open Popup to newly bound Account C'
+  );
+});
+
+
 
 
 

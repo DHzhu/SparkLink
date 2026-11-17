@@ -94,6 +94,7 @@ export function createPopupController(options = {}) {
   };
 
   let userSelectedActorId = null;
+  let userSelectedWhenActiveActorId = null;
   let confirmedViewedActorId = null;
   let currentSnapshot = null;
   let pendingModalAction = null;
@@ -450,26 +451,25 @@ export function createPopupController(options = {}) {
     const msg = { type: 'GET_POPUP_SNAPSHOT' };
     if (isValidDecimalId(userSelectedActorId)) {
       msg.preferredActorUserId = userSelectedActorId;
+      msg.preferredWhenActiveActorId = userSelectedWhenActiveActorId;
     } else if (isValidDecimalId(confirmedViewedActorId)) {
       msg.fallbackActorUserId = confirmedViewedActorId;
     }
     const snap = await sendToBackground(msg);
-    if (
-      snap &&
-      snap.ok &&
-      userSelectedActorId &&
-      (!snap.selectedAccount || snap.selectedAccount.actorUserId !== userSelectedActorId)
-    ) {
-      userSelectedActorId = null;
+    if (snap && snap.ok && userSelectedActorId) {
+      const activeNow = isValidDecimalId(snap.activeTabActorUserId)
+        ? snap.activeTabActorUserId
+        : null;
+      if (
+        !snap.selectedAccount ||
+        snap.selectedAccount.actorUserId !== userSelectedActorId ||
+        (activeNow !== null && activeNow !== userSelectedWhenActiveActorId)
+      ) {
+        userSelectedActorId = null;
+        userSelectedWhenActiveActorId = null;
+      }
     }
     if (snap && snap.ok) {
-      if (
-        !userSelectedActorId &&
-        snap.viewerStatus !== 'bound' &&
-        isValidDecimalId(snap.manualTabActorUserId)
-      ) {
-        userSelectedActorId = snap.manualTabActorUserId;
-      }
       if (snap.viewerStatus === 'bound' && isValidDecimalId(snap.activeTabActorUserId)) {
         confirmedViewedActorId = snap.activeTabActorUserId;
       } else if (isValidDecimalId(snap.confirmedTabActorUserId)) {
@@ -532,11 +532,27 @@ export function createPopupController(options = {}) {
     if (els.accountSelect) {
       els.accountSelect.addEventListener('change', async () => {
         const val = els.accountSelect.value;
-        userSelectedActorId = isValidDecimalId(val) ? val : null;
-        await sendToBackground({
+        const selectedId = isValidDecimalId(val) ? val : null;
+        const activeAtSelect =
+          currentSnapshot && isValidDecimalId(currentSnapshot.activeTabActorUserId)
+            ? currentSnapshot.activeTabActorUserId
+            : null;
+        const setRes = await sendToBackground({
           type: 'SET_POPUP_ACCOUNT',
-          actorUserId: userSelectedActorId
+          actorUserId: selectedId
         });
+        if (
+          activeAtSelect === null &&
+          setRes &&
+          setRes.ok &&
+          setRes.saved === true
+        ) {
+          userSelectedActorId = null;
+          userSelectedWhenActiveActorId = null;
+        } else {
+          userSelectedActorId = selectedId;
+          userSelectedWhenActiveActorId = selectedId ? activeAtSelect : null;
+        }
         await refresh();
       });
     }

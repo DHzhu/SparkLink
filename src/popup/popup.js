@@ -463,6 +463,13 @@ export function createPopupController(options = {}) {
       userSelectedActorId = null;
     }
     if (snap && snap.ok) {
+      if (
+        !userSelectedActorId &&
+        snap.viewerStatus !== 'bound' &&
+        isValidDecimalId(snap.manualTabActorUserId)
+      ) {
+        userSelectedActorId = snap.manualTabActorUserId;
+      }
       if (snap.viewerStatus === 'bound' && isValidDecimalId(snap.activeTabActorUserId)) {
         confirmedViewedActorId = snap.activeTabActorUserId;
       } else if (isValidDecimalId(snap.confirmedTabActorUserId)) {
@@ -526,6 +533,10 @@ export function createPopupController(options = {}) {
       els.accountSelect.addEventListener('change', async () => {
         const val = els.accountSelect.value;
         userSelectedActorId = isValidDecimalId(val) ? val : null;
+        await sendToBackground({
+          type: 'SET_POPUP_ACCOUNT',
+          actorUserId: userSelectedActorId
+        });
         await refresh();
       });
     }

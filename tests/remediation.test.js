@@ -5410,8 +5410,144 @@ test('[P2] Popup provenance isolation: Pause -> Resume and Paused -> Enable on a
   await p2Nodes.get('collection-toggle').trigger('change');
   p2Nodes.get('collection-toggle').checked = true;
   await p2Nodes.get('collection-toggle').trigger('change');
+  // Simulate bridge.js STATE_CHANGED -> same-document HELLO re-handshake
+  await bg.handleMessage({ type: 'HELLO' }, neverBoundTabSender);
   assert.equal(p2Nodes.get('account-select').value, '1001001');
   assert.equal(p2Nodes.get('stat-total-replies').textContent, '1');
+
+  // 5. [P2] Close Popup #2 and reopen a brand-new Popup #3 on the SAME unconfirmed webpage (doc_302_never_bound) ->
+  //    MUST restore manual selection Account A ('1001001', 1 reply, Clear Account enabled), NOT revert to placeholder!
+  const { doc: p3Doc, nodes: p3Nodes } = createPopupDomHarness();
+  const popup3 = createPopupController({
+    document: p3Doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const s3Reopen = await popup3.init();
+  assert.equal(s3Reopen.viewerStatus, 'unconfirmed');
+  assert.equal(
+    p3Nodes.get('account-select').value,
+    '1001001',
+    'Closing and reopening Popup on the same unconfirmed webpage must retain manual Account A selection'
+  );
+  assert.equal(p3Nodes.get('stat-total-replies').textContent, '1');
+  assert.equal(p3Nodes.get('btn-clear-account').disabled, false);
+
+  // 6. Simulate MV3 Service Worker restart (fresh background instance reading storage.session) + reopen Popup #4 -> still retains A!
+  const bgRestarted = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: fgTabId, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+  const { doc: p4Doc, nodes: p4Nodes } = createPopupDomHarness();
+  const popup4 = createPopupController({
+    document: p4Doc,
+    runtime: { sendMessage: (m) => bgRestarted.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup4.init();
+  assert.equal(p4Nodes.get('account-select').value, '1001001');
+  assert.equal(p4Nodes.get('stat-total-replies').textContent, '1');
+
+  // 7. Cross-tab isolation: switch foreground to another unconfirmed X Tab 303 -> shows placeholder ('', 0 replies)
+  fgTabId = 303;
+  await bgRestarted.handleMessage(
+    { type: 'HELLO' },
+    {
+      id: EXT_ID,
+      tab: { id: 303, active: true },
+      frameId: 0,
+      documentId: 'doc_303_other',
+      origin: 'https://x.com',
+      url: 'https://x.com/explore'
+    }
+  );
+  const { doc: p5Doc, nodes: p5Nodes } = createPopupDomHarness();
+  const popup5 = createPopupController({
+    document: p5Doc,
+    runtime: { sendMessage: (m) => bgRestarted.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup5.init();
+  assert.equal(p5Nodes.get('account-select').value, '');
+  assert.equal(p5Nodes.get('stat-total-replies').textContent, '0');
+
+  // Switch back to Tab 302 -> still retains Account A ('1001001', 1 reply)
+  fgTabId = 302;
+  const { doc: p6Doc, nodes: p6Nodes } = createPopupDomHarness();
+  const popup6 = createPopupController({
+    document: p6Doc,
+    runtime: { sendMessage: (m) => bgRestarted.handleMessage(m, POPUP_SENDER) }
+  });
+  const s6Snap = await popup6.init();
+  assert.equal(p6Nodes.get('account-select').value, '1001001');
+  assert.equal(p6Nodes.get('stat-total-replies').textContent, '1');
+
+  // 8. When Tab 302 newly confirms Account B ('9009009') via BIND_VIEWER, fresh Popup prioritizes confirmed B and clears pre-bind manual pick
+  await bgRestarted.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: s6Snap.settings.captureSessionId,
+      viewer: { actorUserId: '9009009', handle: 'bob_second', displayName: 'Bob' }
+    },
+    neverBoundTabSender
+  );
+  const { doc: p7Doc, nodes: p7Nodes } = createPopupDomHarness();
+  const popup7 = createPopupController({
+    document: p7Doc,
+    runtime: { sendMessage: (m) => bgRestarted.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup7.init();
+  assert.equal(p7Nodes.get('viewer-status-badge').textContent, '采集中');
+  assert.equal(p7Nodes.get('account-select').value, '9009009');
+  assert.equal(p7Nodes.get('stat-total-replies').textContent, '0');
+
+  // 9. Document navigation (new documentId) resets manual selection to placeholder, and CLEAR_ACCOUNT cleans up manualSelectedActorUserId
+  p7Nodes.get('collection-toggle').checked = false;
+  await p7Nodes.get('collection-toggle').trigger('change');
+  p7Nodes.get('collection-toggle').checked = true;
+  await p7Nodes.get('collection-toggle').trigger('change');
+  p7Nodes.get('account-select').value = '1001001';
+  await p7Nodes.get('account-select').trigger('change');
+
+  const nav2Sender = {
+    ...neverBoundTabSender,
+    documentId: 'doc_302_navigated_2'
+  };
+  await bgRestarted.handleMessage({ type: 'HELLO' }, nav2Sender);
+  const { doc: p8Doc, nodes: p8Nodes } = createPopupDomHarness();
+  const popup8 = createPopupController({
+    document: p8Doc,
+    runtime: { sendMessage: (m) => bgRestarted.handleMessage(m, POPUP_SENDER) }
+  });
+  await popup8.init();
+  assert.equal(
+    p8Nodes.get('account-select').value,
+    '',
+    'Navigating tab to a new documentId must reset per-document manual selection'
+  );
+
+  // Manual select A on new document, then delete A via Clear Account -> cleans up manual selection cleanly
+  p8Nodes.get('account-select').value = '1001001';
+  await p8Nodes.get('account-select').trigger('change');
+  assert.equal(p8Nodes.get('stat-total-replies').textContent, '1');
+  await p8Nodes.get('btn-clear-account').trigger('click');
+  await p8Nodes.get('btn-modal-confirm').trigger('click');
+  assert.equal(p8Nodes.get('account-select').value, '');
+  assert.equal(p8Nodes.get('stat-total-replies').textContent, '0');
 });
 
 

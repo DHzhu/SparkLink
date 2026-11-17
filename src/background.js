@@ -11,6 +11,7 @@ const MAX_TRACKED_TABS = 64;
 
 const POPUP_ONLY_TYPES = new Set([
   'GET_POPUP_SNAPSHOT',
+  'SET_POPUP_ACCOUNT',
   'SET_COLLECTION_ENABLED',
   'CLEANUP_EXPIRED',
   'EXPORT_BACKUP',
@@ -332,6 +333,7 @@ export function createBackgroundService(chromeApi, options = {}) {
     if (!ctrl.ok) {
       return {
         activeActorUserId: null,
+        manualSelectedActorUserId: null,
         lastConfirmedActorUserId: null,
         viewerStatus: 'storage_error',
         diagnostics: emptyDiagnostics()
@@ -340,13 +342,24 @@ export function createBackgroundService(chromeApi, options = {}) {
 
     const fgEntry = await resolveForegroundTabEntry();
     const lastConfirmedActorUserId =
-      fgEntry && isValidDecimalId(fgEntry.lastConfirmedActorUserId)
+      fgEntry &&
+      isValidDecimalId(fgEntry.lastConfirmedActorUserId) &&
+      ctrl.accountGenerations &&
+      ctrl.accountGenerations[fgEntry.lastConfirmedActorUserId]
         ? fgEntry.lastConfirmedActorUserId
+        : null;
+    const manualSelectedActorUserId =
+      fgEntry &&
+      isValidDecimalId(fgEntry.manualSelectedActorUserId) &&
+      ctrl.accountGenerations &&
+      ctrl.accountGenerations[fgEntry.manualSelectedActorUserId]
+        ? fgEntry.manualSelectedActorUserId
         : null;
 
     if (!ctrl.settings.collectionEnabled) {
       return {
         activeActorUserId: null,
+        manualSelectedActorUserId,
         lastConfirmedActorUserId,
         viewerStatus: 'paused',
         diagnostics: emptyDiagnostics()
@@ -356,6 +369,7 @@ export function createBackgroundService(chromeApi, options = {}) {
     if (!fgEntry) {
       return {
         activeActorUserId: null,
+        manualSelectedActorUserId: null,
         lastConfirmedActorUserId: null,
         viewerStatus: 'no_x_tab',
         diagnostics: emptyDiagnostics()
@@ -377,6 +391,7 @@ export function createBackgroundService(chromeApi, options = {}) {
     if (fgEntry.bindingContext && bindingMatchesState(fgEntry.bindingContext, ctrl)) {
       return {
         activeActorUserId: fgEntry.bindingContext.actorUserId,
+        manualSelectedActorUserId,
         lastConfirmedActorUserId: fgEntry.bindingContext.actorUserId,
         viewerStatus: 'bound',
         diagnostics
@@ -385,6 +400,7 @@ export function createBackgroundService(chromeApi, options = {}) {
 
     return {
       activeActorUserId: null,
+      manualSelectedActorUserId,
       lastConfirmedActorUserId,
       viewerStatus: 'unconfirmed',
       diagnostics
@@ -399,6 +415,8 @@ export function createBackgroundService(chromeApi, options = {}) {
         preferredId = msg.preferredActorUserId;
       } else if (ctx.activeActorUserId) {
         preferredId = ctx.activeActorUserId;
+      } else if (ctx.manualSelectedActorUserId) {
+        preferredId = ctx.manualSelectedActorUserId;
       } else if (isValidDecimalId(msg.fallbackActorUserId)) {
         preferredId = msg.fallbackActorUserId;
       } else if (ctx.lastConfirmedActorUserId) {
@@ -413,10 +431,32 @@ export function createBackgroundService(chromeApi, options = {}) {
       return {
         ...snap,
         activeTabActorUserId: ctx.activeActorUserId,
+        manualTabActorUserId: ctx.manualSelectedActorUserId,
         confirmedTabActorUserId: ctx.activeActorUserId || ctx.lastConfirmedActorUserId || null,
         viewerStatus: ctx.viewerStatus,
         diagnostics: ctx.diagnostics
       };
+    }
+
+    if (msg.type === 'SET_POPUP_ACCOUNT') {
+      return enqueueSessionOp(async () => {
+        const fgEntry = await resolveForegroundTabEntry();
+        if (!fgEntry) {
+          return { ok: true, saved: false, manualTabActorUserId: null };
+        }
+        const requestedId = isValidDecimalId(msg.actorUserId) ? msg.actorUserId : null;
+        let validActorId = null;
+        if (requestedId) {
+          const ctrl = await storage.getControlState();
+          if (ctrl.ok && ctrl.accountGenerations && ctrl.accountGenerations[requestedId]) {
+            validActorId = requestedId;
+          }
+        }
+        fgEntry.manualSelectedActorUserId = validActorId;
+        fgEntry.updatedAt = nowFn();
+        await persistSessionTabs();
+        return { ok: true, saved: true, manualTabActorUserId: validActorId };
+      });
     }
 
     if (msg.type === 'SET_COLLECTION_ENABLED') {
@@ -477,6 +517,9 @@ export function createBackgroundService(chromeApi, options = {}) {
         for (const entry of sessionTabsCache.values()) {
           if (entry.lastConfirmedActorUserId === actorId) {
             entry.lastConfirmedActorUserId = null;
+          }
+          if (entry.manualSelectedActorUserId === actorId) {
+            entry.manualSelectedActorUserId = null;
           }
           if (entry.bindingContext && entry.bindingContext.actorUserId === actorId) {
             const oldBindingId = entry.bindingContext.bindingId;
@@ -557,6 +600,10 @@ export function createBackgroundService(chromeApi, options = {}) {
           : sameDoc && isValidDecimalId(existing.lastConfirmedActorUserId)
           ? existing.lastConfirmedActorUserId
           : null;
+        const preservedManualActorId =
+          sameDoc && isValidDecimalId(existing.manualSelectedActorUserId)
+            ? existing.manualSelectedActorUserId
+            : null;
 
         upsertSessionTab(xSender.tabKey, {
           tabId: xSender.tabId,
@@ -565,6 +612,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           origin: xSender.origin,
           bindingContext: restoredBinding,
           lastConfirmedActorUserId: preservedLastActorId,
+          manualSelectedActorUserId: preservedManualActorId,
           diagnostics: restoredBinding && existing ? existing.diagnostics : null,
           updatedAt: nowFn()
         });
@@ -647,6 +695,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           origin: xSender.origin,
           bindingContext,
           lastConfirmedActorUserId: msg.viewer.actorUserId,
+          manualSelectedActorUserId: null,
           diagnostics: null,
           updatedAt: nowFn()
         });

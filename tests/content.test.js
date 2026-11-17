@@ -587,3 +587,163 @@ test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-muta
   controller.destroy(); // idempotent
 });
 
+test('[P2] Coalesced author inline runs with middle-dot timestamps, bidi isolates, segmented handles, email display names, glued handles, and overlong tokens', async () => {
+  const counts = {
+    '3001': 12, // sample_friend -> active
+    '3002': 4 // sample_me -> acquaintance
+  };
+  const { body, win, bridge } = createFakeDomAndBridge(counts);
+  const customHandles = new Map([
+    ['sample_friend', '3001'],
+    ['sample_me', '3002']
+  ]);
+  bridge.resolveUserIdByHandle = (h) => customHandles.get(String(h).toLowerCase()) || null;
+
+  const controller = installContentBadges(win, bridge, {
+    debounceMs: 5,
+    frameBudgetMs: 50,
+    windowRefreshMs: 60000
+  });
+
+  function makeAuthorBox() {
+    const article = new FakeElement('article');
+    article.setAttribute('data-testid', 'tweet');
+    const box = new FakeElement('div');
+    box.setAttribute('data-testid', 'User-Name');
+    article.appendChild(box);
+    body.appendChild(article);
+    return box;
+  }
+
+  // 1. Conflicting profile link /sample_friend + inline spans `<span>@somebody_else</span><span> · 2h</span>` -> MUST refuse badge!
+  const conflictSpaced = makeAuthorBox();
+  const linkFriend1 = new FakeElement('a');
+  linkFriend1.setAttribute('href', '/sample_friend');
+  linkFriend1.textContent = 'Sample Friend';
+  conflictSpaced.appendChild(linkFriend1);
+  const metaRow1 = new FakeElement('div');
+  const hSpan1 = new FakeElement('span');
+  hSpan1.textContent = '@somebody_else';
+  const tSpan1 = new FakeElement('span');
+  tSpan1.textContent = ' · 2h';
+  metaRow1.appendChild(hSpan1);
+  metaRow1.appendChild(tSpan1);
+  conflictSpaced.appendChild(metaRow1);
+
+  // 2. Conflicting profile link /sample_friend + unspaced middle-dot `@somebody_else·2h` -> MUST refuse badge!
+  const conflictTight = makeAuthorBox();
+  const linkFriend2 = new FakeElement('a');
+  linkFriend2.setAttribute('href', '/sample_friend');
+  linkFriend2.textContent = 'Sample Friend';
+  conflictTight.appendChild(linkFriend2);
+  const metaRow2 = new FakeElement('div');
+  const hSpan2 = new FakeElement('span');
+  hSpan2.textContent = '@somebody_else·2h';
+  metaRow2.appendChild(hSpan2);
+  conflictTight.appendChild(metaRow2);
+
+  // 3. Conflicting profile link /sample_friend + Unicode bidi-isolated `⁦@somebody_else⁩ • 2h` -> MUST refuse badge!
+  const conflictBidi = makeAuthorBox();
+  const linkFriend3 = new FakeElement('a');
+  linkFriend3.setAttribute('href', '/sample_friend');
+  linkFriend3.textContent = 'Sample Friend';
+  conflictBidi.appendChild(linkFriend3);
+  const metaRow3 = new FakeElement('div');
+  const hSpan3 = new FakeElement('span');
+  hSpan3.textContent = '⁦@somebody_else⁩ • 2h';
+  metaRow3.appendChild(hSpan3);
+  conflictBidi.appendChild(metaRow3);
+
+  // 4. Linkless author row with coalesced `<span>@sample_friend</span><span> · 2h</span>` -> MUST render badge!
+  const linklessSpans = makeAuthorBox();
+  const nameDiv4 = new FakeElement('div');
+  nameDiv4.textContent = 'Sample Friend';
+  linklessSpans.appendChild(nameDiv4);
+  const metaRow4 = new FakeElement('div');
+  const hSpan4 = new FakeElement('span');
+  hSpan4.textContent = '@sample_friend';
+  const tSpan4 = new FakeElement('span');
+  tSpan4.textContent = ' · 2h';
+  metaRow4.appendChild(hSpan4);
+  metaRow4.appendChild(tSpan4);
+  linklessSpans.appendChild(metaRow4);
+
+  // 5. Linkless author row with single text run `@sample_friend · 2h` -> MUST render badge!
+  const linklessSingle = makeAuthorBox();
+  const metaRow5 = new FakeElement('div');
+  metaRow5.textContent = '@sample_friend · 2h';
+  linklessSingle.appendChild(metaRow5);
+
+  // 6. Segmented handle `<span>@sample_me</span><span>_alt</span><span> · 2h</span>` -> coalesced as @sample_me_alt, NEVER prefix-matches @sample_me!
+  const segmentedSuffix = makeAuthorBox();
+  const metaRow6 = new FakeElement('div');
+  const segA = new FakeElement('span');
+  segA.textContent = '@sample_me';
+  const segB = new FakeElement('span');
+  segB.textContent = '_alt';
+  const segC = new FakeElement('span');
+  segC.textContent = ' · 2h';
+  metaRow6.appendChild(segA);
+  metaRow6.appendChild(segB);
+  metaRow6.appendChild(segC);
+  segmentedSuffix.appendChild(metaRow6);
+
+  // 7. Display name containing email `contact@company.com` + `/sample_friend` + `@sample_friend · 2h` -> ignores email, renders badge!
+  const emailDisplay = makeAuthorBox();
+  const linkFriend7 = new FakeElement('a');
+  linkFriend7.setAttribute('href', '/sample_friend');
+  const emailNameSpan = new FakeElement('span');
+  emailNameSpan.textContent = 'contact@company.com';
+  linkFriend7.appendChild(emailNameSpan);
+  emailDisplay.appendChild(linkFriend7);
+  const metaRow7 = new FakeElement('div');
+  const hSpan7 = new FakeElement('span');
+  hSpan7.textContent = '@sample_friend · 2h';
+  metaRow7.appendChild(hSpan7);
+  emailDisplay.appendChild(metaRow7);
+
+  // 8. Glued handles `@sample_friend@somebody_else · 2h` and overlong `>64`-char `@` run -> both yield 0 badges!
+  const gluedConflict = makeAuthorBox();
+  const metaRow8 = new FakeElement('div');
+  metaRow8.textContent = '@sample_friend@somebody_else · 2h';
+  gluedConflict.appendChild(metaRow8);
+
+  const overlongBox = makeAuthorBox();
+  const metaRow9 = new FakeElement('div');
+  metaRow9.textContent = `@sample_friend_${'x'.repeat(60)} · 2h`; // 75 handle chars (> 64)
+  overlongBox.appendChild(metaRow9);
+
+  controller.refreshNow();
+  await new Promise((r) => setTimeout(r, 45));
+
+  assert.equal(
+    conflictSpaced.querySelector('.sparklink-badge'),
+    null,
+    'Link /sample_friend with @somebody_else · 2h must NOT misbadge @somebody_else'
+  );
+  assert.equal(conflictTight.querySelector('.sparklink-badge'), null);
+  assert.equal(conflictBidi.querySelector('.sparklink-badge'), null);
+  assert.ok(
+    linklessSpans.querySelector('.sparklink-badge'),
+    'Linkless @sample_friend + " · 2h" spans must render Spark badge'
+  );
+  assert.ok(
+    linklessSingle.querySelector('.sparklink-badge'),
+    'Linkless single-run "@sample_friend · 2h" must render Spark badge'
+  );
+  assert.equal(
+    segmentedSuffix.querySelector('.sparklink-badge'),
+    null,
+    'Segmented @sample_me + _alt + " · 2h" must coalesce as sample_me_alt and never prefix-match sample_me'
+  );
+  assert.ok(
+    emailDisplay.querySelector('.sparklink-badge'),
+    'Email inside display name must not block valid @sample_friend · 2h'
+  );
+  assert.equal(gluedConflict.querySelector('.sparklink-badge'), null);
+  assert.equal(overlongBox.querySelector('.sparklink-badge'), null);
+
+  controller.destroy();
+});
+
+

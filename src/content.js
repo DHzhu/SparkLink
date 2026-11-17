@@ -31,7 +31,7 @@
 
   const PROFILE_HREF_RE = /^\/([A-Za-z0-9_]{1,64})\/?$/;
   const STATUS_HREF_RE = /^\/([A-Za-z0-9_]{1,64})\/status\/([1-9][0-9]{0,31})(?:[/?#]|$)/;
-  const AT_HANDLE_RE = /^@([A-Za-z0-9_]{1,64})$/;
+  const BIDI_FORMAT_RE = /[‎‏‪-‮⁦-⁩]/g;
   const INLINE_CONTINUATION_TAGS = new Set([
     'SPAN',
     'BDI',
@@ -201,6 +201,80 @@
     return segments;
   }
 
+  function isHandleCharCode(code) {
+    return (
+      (code >= 48 && code <= 57) ||
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      code === 95
+    );
+  }
+
+  function scanCoalescedHandleTokens(raw, recordHandle) {
+    if (typeof raw !== 'string' || raw.indexOf('@') === -1) {
+      return true;
+    }
+    const clean = raw.replace(BIDI_FORMAT_RE, '');
+    const len = clean.length;
+    let idx = 0;
+    let prevTokenWasHandle = false;
+    let prevTokenEnd = -1;
+
+    while (idx < len) {
+      if (clean.charCodeAt(idx) !== 64) {
+        idx += 1;
+        continue;
+      }
+
+      let leftBlocked = false;
+      if (idx > 0 && !(prevTokenWasHandle && prevTokenEnd === idx)) {
+        let checkIdx = idx - 1;
+        while (
+          checkIdx >= 0 &&
+          (clean[checkIdx] === '.' || clean[checkIdx] === '+' || clean[checkIdx] === '-')
+        ) {
+          checkIdx -= 1;
+        }
+        if (checkIdx >= 0 && isHandleCharCode(clean.charCodeAt(checkIdx))) {
+          leftBlocked = true;
+        }
+      }
+
+      let end = idx + 1;
+      while (end < len && isHandleCharCode(clean.charCodeAt(end))) {
+        end += 1;
+      }
+      const handleLen = end - (idx + 1);
+
+      if (leftBlocked || handleLen === 0 || handleLen > 64) {
+        prevTokenWasHandle = false;
+        prevTokenEnd = -1;
+        idx = end > idx + 1 ? end : idx + 1;
+        continue;
+      }
+
+      if (
+        end < len &&
+        clean[end] === '.' &&
+        end + 1 < len &&
+        isHandleCharCode(clean.charCodeAt(end + 1))
+      ) {
+        prevTokenWasHandle = false;
+        prevTokenEnd = -1;
+        idx = end;
+        continue;
+      }
+
+      if (!recordHandle(clean.slice(idx + 1, end))) {
+        return false;
+      }
+      prevTokenWasHandle = true;
+      prevTokenEnd = end;
+      idx = end;
+    }
+    return true;
+  }
+
   function extractCandidateIdentity(container, bridge) {
     if (!container || typeof container.querySelectorAll !== 'function') {
       return null;
@@ -226,18 +300,22 @@
       profileHandle = candidate;
     }
 
-    // Cross-check visible @handle text across coalesced inline text runs
+    // Cross-check visible @handle text across coalesced inline text runs (including middle-dot/timestamp suffixes)
     let textHandle = null;
+    const recordTextHandle = (h) => {
+      if (!h) {
+        return true;
+      }
+      if (textHandle && textHandle.toLowerCase() !== h.toLowerCase()) {
+        return false;
+      }
+      textHandle = h;
+      return true;
+    };
     const segments = collectCoalescedAuthorTextSegments(container);
     for (let i = 0; i < segments.length; i += 1) {
-      const rawText = segments[i].trim();
-      const atMatch = AT_HANDLE_RE.exec(rawText);
-      if (atMatch) {
-        const h = atMatch[1];
-        if (textHandle && textHandle.toLowerCase() !== h.toLowerCase()) {
-          return null;
-        }
-        textHandle = h;
+      if (!scanCoalescedHandleTokens(segments[i], recordTextHandle)) {
+        return null;
       }
     }
 

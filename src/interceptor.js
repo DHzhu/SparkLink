@@ -115,6 +115,82 @@
     return segments;
   }
 
+  const BIDI_FORMAT_RE = /[‎‏‪-‮⁦-⁩]/g;
+
+  function isHandleCharCode(code) {
+    return (
+      (code >= 48 && code <= 57) ||
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      code === 95
+    );
+  }
+
+  function scanCoalescedHandleTokens(raw, recordHandle) {
+    if (typeof raw !== 'string' || raw.indexOf('@') === -1) {
+      return true;
+    }
+    const clean = raw.replace(BIDI_FORMAT_RE, '');
+    const len = clean.length;
+    let idx = 0;
+    let prevTokenWasHandle = false;
+    let prevTokenEnd = -1;
+
+    while (idx < len) {
+      if (clean.charCodeAt(idx) !== 64) {
+        idx += 1;
+        continue;
+      }
+
+      let leftBlocked = false;
+      if (idx > 0 && !(prevTokenWasHandle && prevTokenEnd === idx)) {
+        let checkIdx = idx - 1;
+        while (
+          checkIdx >= 0 &&
+          (clean[checkIdx] === '.' || clean[checkIdx] === '+' || clean[checkIdx] === '-')
+        ) {
+          checkIdx -= 1;
+        }
+        if (checkIdx >= 0 && isHandleCharCode(clean.charCodeAt(checkIdx))) {
+          leftBlocked = true;
+        }
+      }
+
+      let end = idx + 1;
+      while (end < len && isHandleCharCode(clean.charCodeAt(end))) {
+        end += 1;
+      }
+      const handleLen = end - (idx + 1);
+
+      if (leftBlocked || handleLen === 0 || handleLen > 64) {
+        prevTokenWasHandle = false;
+        prevTokenEnd = -1;
+        idx = end > idx + 1 ? end : idx + 1;
+        continue;
+      }
+
+      if (
+        end < len &&
+        clean[end] === '.' &&
+        end + 1 < len &&
+        isHandleCharCode(clean.charCodeAt(end + 1))
+      ) {
+        prevTokenWasHandle = false;
+        prevTokenEnd = -1;
+        idx = end;
+        continue;
+      }
+
+      if (!recordHandle(clean.slice(idx + 1, end))) {
+        return false;
+      }
+      prevTokenWasHandle = true;
+      prevTokenEnd = end;
+      idx = end;
+    }
+    return true;
+  }
+
   const installedWindows = new WeakMap();
   const textEncoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
   const textDecoder = typeof TextDecoder === 'function' ? new TextDecoder('utf-8', { fatal: false }) : null;
@@ -195,14 +271,10 @@
       bindingContext: null,
       latestGraphqlViewer: null,
       hasPausedOnce: false,
-      needsPausedLoadVerification: false,
+      needsPostPauseVerification: false,
       hasSeenGraphqlViewer: false,
       hasSeenDynamicStateViewer: false,
       supersededDynamicActorId: null,
-      lastDynamicStateActorId: null,
-      windowSnapshotStale: false,
-      staleDynamicActorId: null,
-      staleActiveActorId: null,
       activeClones: 0
     };
 
@@ -272,7 +344,6 @@
       const dynViewer = adapter.extractViewerFromWindow(win, { allowInlineScript: false });
       if (dynViewer && dynViewer.actorUserId) {
         state.hasSeenDynamicStateViewer = true;
-        state.lastDynamicStateActorId = dynViewer.actorUserId;
         if (
           state.supersededDynamicActorId &&
           dynViewer.actorUserId !== state.supersededDynamicActorId
@@ -281,7 +352,6 @@
         }
         return dynViewer;
       }
-      state.lastDynamicStateActorId = null;
       return null;
     }
 
@@ -300,25 +370,9 @@
       return adapter.extractViewerFromWindow(win, { allowInlineScript: true });
     }
 
-    function markWindowSnapshotStale(fallbackActorId) {
-      const latestGqlId =
-        state.latestGraphqlViewer && state.latestGraphqlViewer.actorUserId
-          ? state.latestGraphqlViewer.actorUserId
-          : null;
-      const activeId = fallbackActorId || latestGqlId || null;
-      if (!state.hasSeenDynamicStateViewer && !state.hasSeenGraphqlViewer && !activeId) {
-        state.needsPausedLoadVerification = true;
-      }
+    function markWindowSnapshotStale() {
       state.hasPausedOnce = true;
-      if (state.needsPausedLoadVerification) {
-        return;
-      }
-      if (!state.windowSnapshotStale || activeId) {
-        state.staleDynamicActorId = state.lastDynamicStateActorId;
-        state.staleActiveActorId =
-          activeId || state.lastDynamicStateActorId || state.staleActiveActorId || null;
-      }
-      state.windowSnapshotStale = true;
+      state.needsPostPauseVerification = true;
     }
 
     function inspectAccountSwitcherHandle() {
@@ -344,41 +398,10 @@
           foundHandle = h;
           return true;
         };
-        const scanTextTokens = (raw) => {
-          if (typeof raw !== 'string') {
-            return true;
-          }
-          const trimmed = raw.trim();
-          if (!trimmed) {
-            return true;
-          }
-          const exact = /^@([A-Za-z0-9_]{1,64})$/.exec(trimmed);
-          if (exact) {
-            return recordHandle(exact[1]);
-          }
-          const tokenRe = /(?:^|\s)@(\S+)/g;
-          let m;
-          while ((m = tokenRe.exec(trimmed)) !== null) {
-            const candidate = m[1];
-            if (/^[A-Za-z0-9_]{1,64}$/.test(candidate)) {
-              if (!recordHandle(candidate)) {
-                return false;
-              }
-            } else if (/^[A-Za-z0-9_]{1,64}(?:@[A-Za-z0-9_]{1,64})+$/.test(candidate)) {
-              const glued = candidate.split('@');
-              for (let k = 0; k < glued.length; k += 1) {
-                if (!recordHandle(glued[k])) {
-                  return false;
-                }
-              }
-            }
-          }
-          return true;
-        };
 
         const segments = collectCoalescedTextSegments(switcherEl);
         for (let i = 0; i < segments.length; i += 1) {
-          if (!scanTextTokens(segments[i])) {
+          if (!scanCoalescedHandleTokens(segments[i], recordHandle)) {
             return { status: 'conflict', handle: null };
           }
         }
@@ -396,12 +419,6 @@
       if (!winViewer || !winViewer.actorUserId) {
         return false;
       }
-      if (
-        state.supersededDynamicActorId &&
-        winViewer.actorUserId === state.supersededDynamicActorId
-      ) {
-        return false;
-      }
 
       const switcher = inspectAccountSwitcherHandle();
       if (switcher.status === 'conflict') {
@@ -410,35 +427,31 @@
       let switcherConfirmed = false;
       if (switcher.status === 'present') {
         if (!winViewer.handle) {
-          if (state.needsPausedLoadVerification) {
-            return false;
-          }
-        } else if (switcher.handle.toLowerCase() !== winViewer.handle.toLowerCase()) {
           return false;
-        } else {
-          switcherConfirmed = true;
         }
+        if (switcher.handle.toLowerCase() !== winViewer.handle.toLowerCase()) {
+          return false;
+        }
+        switcherConfirmed = true;
       }
 
-      if (state.needsPausedLoadVerification) {
+      if (state.needsPostPauseVerification) {
         if (!switcherConfirmed) {
           return false;
         }
-        state.needsPausedLoadVerification = false;
-      }
-
-      if (!state.windowSnapshotStale) {
+        state.needsPostPauseVerification = false;
+        if (state.supersededDynamicActorId === winViewer.actorUserId) {
+          state.supersededDynamicActorId = null;
+        }
         return true;
       }
-      if (state.staleDynamicActorId && winViewer.actorUserId === state.staleDynamicActorId) {
+
+      if (
+        state.supersededDynamicActorId &&
+        winViewer.actorUserId === state.supersededDynamicActorId
+      ) {
         return false;
       }
-      if (state.staleActiveActorId && winViewer.actorUserId === state.staleActiveActorId) {
-        return false;
-      }
-      state.windowSnapshotStale = false;
-      state.staleDynamicActorId = null;
-      state.staleActiveActorId = null;
       return true;
     }
 
@@ -488,20 +501,12 @@
       state.bindingContext = state.collectionEnabled ? nextBinding : null;
 
       if (data.observedPaused === true || (!state.collectionEnabled && data.stateConfirmed !== false)) {
-        if (
-          !state.hasSeenDynamicStateViewer &&
-          !state.hasSeenGraphqlViewer &&
-          !prevActorId &&
-          !state.bindingContext
-        ) {
-          state.needsPausedLoadVerification = true;
-        }
-        state.hasPausedOnce = true;
+        markWindowSnapshotStale();
       }
 
       if (!state.collectionEnabled || prevSessionId !== state.captureSessionId) {
         if (prevEnabled || prevSessionId !== null) {
-          markWindowSnapshotStale(prevActorId);
+          markWindowSnapshotStale();
         }
         state.latestGraphqlViewer = null;
         cancelActiveReaders(() => true);
@@ -515,15 +520,12 @@
       }
 
       if (state.collectionEnabled && state.bindingContext) {
+        state.needsPostPauseVerification = false;
         if (
           !prevEnabled ||
           prevSessionId !== state.captureSessionId ||
           prevActorId !== state.bindingContext.actorUserId
         ) {
-          state.needsPausedLoadVerification = false;
-          state.windowSnapshotStale = false;
-          state.staleDynamicActorId = null;
-          state.staleActiveActorId = null;
           const dynViewer = readDynamicStateViewer();
           if (dynViewer && dynViewer.actorUserId !== state.bindingContext.actorUserId) {
             state.supersededDynamicActorId = dynViewer.actorUserId;
@@ -594,10 +596,7 @@
         const viewer = adapter.extractViewerFromGraphql(payload);
         if (viewer) {
           state.hasSeenGraphqlViewer = true;
-          state.needsPausedLoadVerification = false;
-          state.windowSnapshotStale = false;
-          state.staleDynamicActorId = null;
-          state.staleActiveActorId = null;
+          state.needsPostPauseVerification = false;
           const dynViewer = readDynamicStateViewer();
           if (dynViewer && dynViewer.actorUserId !== viewer.actorUserId) {
             state.supersededDynamicActorId = dynViewer.actorUserId;
@@ -1068,6 +1067,12 @@
 
     if (typeof win.addEventListener === 'function') {
       win.addEventListener('message', onWindowMessage);
+      win.addEventListener('pageshow', (ev) => {
+        if (ev && ev.persisted) {
+          markWindowSnapshotStale();
+          state.latestGraphqlViewer = null;
+        }
+      });
       win.addEventListener('DOMContentLoaded', () => {
         if (state.collectionEnabled && !state.bindingContext) {
           maybeProbeInitialViewer();

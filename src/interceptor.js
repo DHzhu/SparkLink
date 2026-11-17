@@ -88,6 +88,8 @@
       bindingContext: null,
       latestGraphqlViewer: null,
       hasPausedOnce: false,
+      needsPausedLoadVerification: false,
+      pausedLoadBaselineActorId: null,
       hasSeenGraphqlViewer: false,
       hasSeenDynamicStateViewer: false,
       supersededDynamicActorId: null,
@@ -198,6 +200,9 @@
           ? state.latestGraphqlViewer.actorUserId
           : null;
       const activeId = fallbackActorId || latestGqlId || null;
+      if (!state.hasSeenDynamicStateViewer && !state.hasSeenGraphqlViewer && !activeId) {
+        state.needsPausedLoadVerification = true;
+      }
       state.hasPausedOnce = true;
       if (!state.windowSnapshotStale || activeId) {
         state.staleDynamicActorId = state.lastDynamicStateActorId;
@@ -205,6 +210,95 @@
           activeId || state.lastDynamicStateActorId || state.staleActiveActorId || null;
       }
       state.windowSnapshotStale = true;
+    }
+
+    function inspectAccountSwitcherHandle() {
+      if (!win.document || typeof win.document.querySelector !== 'function') {
+        return { status: 'missing', handle: null };
+      }
+      try {
+        const switcherEl = win.document.querySelector(
+          '[data-testid="SideNav_AccountSwitcher_Button"]'
+        );
+        if (!switcherEl) {
+          return { status: 'missing', handle: null };
+        }
+
+        let foundHandle = null;
+        const recordHandle = (h) => {
+          if (!h) {
+            return true;
+          }
+          if (foundHandle && foundHandle.toLowerCase() !== h.toLowerCase()) {
+            return false;
+          }
+          foundHandle = h;
+          return true;
+        };
+        const scanTextTokens = (raw) => {
+          if (typeof raw !== 'string') {
+            return true;
+          }
+          const trimmed = raw.trim();
+          if (!trimmed) {
+            return true;
+          }
+          const exact = /^@([A-Za-z0-9_]{1,64})$/.exec(trimmed);
+          if (exact) {
+            return recordHandle(exact[1]);
+          }
+          const tokenRe = /(?:^|\s)@([A-Za-z0-9_]{1,64})(?=\s|$)/g;
+          let m;
+          while ((m = tokenRe.exec(trimmed)) !== null) {
+            if (!recordHandle(m[1])) {
+              return false;
+            }
+          }
+          return true;
+        };
+
+        const stack = [switcherEl];
+        let inspectedSubtree = false;
+        while (stack.length > 0) {
+          const node = stack.pop();
+          if (!node) {
+            continue;
+          }
+          const childNodes = node.childNodes;
+          if (childNodes && typeof childNodes.length === 'number' && childNodes.length > 0) {
+            inspectedSubtree = true;
+            for (let i = childNodes.length - 1; i >= 0; i -= 1) {
+              const child = childNodes[i];
+              if (!child) {
+                continue;
+              }
+              if (child.nodeType === 3) {
+                if (!scanTextTokens(child.nodeValue || child.textContent || '')) {
+                  return { status: 'conflict', handle: null };
+                }
+              } else if (child.nodeType === 1) {
+                stack.push(child);
+              }
+            }
+          } else if (node.children && typeof node.children.length === 'number' && node.children.length > 0) {
+            inspectedSubtree = true;
+            for (let i = node.children.length - 1; i >= 0; i -= 1) {
+              stack.push(node.children[i]);
+            }
+          } else if (node !== switcherEl || !inspectedSubtree) {
+            if (!scanTextTokens(node.textContent || '')) {
+              return { status: 'conflict', handle: null };
+            }
+          }
+        }
+
+        if (foundHandle) {
+          return { status: 'present', handle: foundHandle };
+        }
+      } catch (_err) {
+        // Ignore DOM query errors
+      }
+      return { status: 'missing', handle: null };
     }
 
     function canTrustWindowSnapshot(winViewer) {
@@ -217,21 +311,44 @@
       ) {
         return false;
       }
-      if (winViewer.handle && win.document && typeof win.document.querySelector === 'function') {
-        try {
-          const switcherEl = win.document.querySelector(
-            '[data-testid="SideNav_AccountSwitcher_Button"]'
-          );
-          if (switcherEl && typeof switcherEl.textContent === 'string') {
-            const m = /(?:^|\s)@([A-Za-z0-9_]{1,64})(?:\s|$)/.exec(switcherEl.textContent);
-            if (m && m[1].toLowerCase() !== winViewer.handle.toLowerCase()) {
-              return false;
-            }
+
+      const switcher = inspectAccountSwitcherHandle();
+      if (switcher.status === 'conflict') {
+        return false;
+      }
+      let switcherConfirmed = false;
+      if (switcher.status === 'present') {
+        if (!winViewer.handle) {
+          if (state.needsPausedLoadVerification) {
+            return false;
           }
-        } catch (_err) {
-          // Ignore DOM query errors
+        } else if (switcher.handle.toLowerCase() !== winViewer.handle.toLowerCase()) {
+          return false;
+        } else {
+          switcherConfirmed = true;
         }
       }
+
+      if (state.needsPausedLoadVerification) {
+        if (!switcherConfirmed) {
+          if (!state.pausedLoadBaselineActorId) {
+            const inlineViewer = adapter.extractViewerFromWindow(win, {
+              allowDynamicState: false,
+              allowInlineScript: true
+            });
+            state.pausedLoadBaselineActorId =
+              inlineViewer && inlineViewer.actorUserId
+                ? inlineViewer.actorUserId
+                : winViewer.actorUserId;
+          }
+          if (winViewer.actorUserId === state.pausedLoadBaselineActorId) {
+            return false;
+          }
+        }
+        state.needsPausedLoadVerification = false;
+        state.pausedLoadBaselineActorId = null;
+      }
+
       if (!state.windowSnapshotStale) {
         return true;
       }
@@ -293,6 +410,14 @@
       state.bindingContext = state.collectionEnabled ? nextBinding : null;
 
       if (data.observedPaused === true || (!state.collectionEnabled && data.stateConfirmed !== false)) {
+        if (
+          !state.hasSeenDynamicStateViewer &&
+          !state.hasSeenGraphqlViewer &&
+          !prevActorId &&
+          !state.bindingContext
+        ) {
+          state.needsPausedLoadVerification = true;
+        }
         state.hasPausedOnce = true;
       }
 
@@ -304,6 +429,9 @@
         cancelActiveReaders(() => true);
         engine.revokeBinding(null);
       } else if (prevBindingId && (!nextBinding || nextBinding.bindingId !== prevBindingId)) {
+        if (!nextBinding) {
+          state.latestGraphqlViewer = null;
+        }
         cancelActiveReaders((t) => t.bindingId === prevBindingId);
         engine.revokeBinding(prevBindingId);
       }
@@ -314,6 +442,8 @@
           prevSessionId !== state.captureSessionId ||
           prevActorId !== state.bindingContext.actorUserId
         ) {
+          state.needsPausedLoadVerification = false;
+          state.pausedLoadBaselineActorId = null;
           state.windowSnapshotStale = false;
           state.staleDynamicActorId = null;
           state.staleActiveActorId = null;
@@ -387,6 +517,8 @@
         const viewer = adapter.extractViewerFromGraphql(payload);
         if (viewer) {
           state.hasSeenGraphqlViewer = true;
+          state.needsPausedLoadVerification = false;
+          state.pausedLoadBaselineActorId = null;
           state.windowSnapshotStale = false;
           state.staleDynamicActorId = null;
           state.staleActiveActorId = null;

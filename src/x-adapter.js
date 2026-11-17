@@ -1215,10 +1215,12 @@
     if (!win || typeof win !== 'object') {
       return null;
     }
+    const allowDynamicState =
+      !isPlainObject(options) || options.allowDynamicState !== false;
     const allowInlineScript =
       !isPlainObject(options) || options.allowInlineScript !== false;
     try {
-      if (isPlainObject(win.__INITIAL_STATE__)) {
+      if (allowDynamicState && isPlainObject(win.__INITIAL_STATE__)) {
         const direct = extractViewerFromInitialState(win.__INITIAL_STATE__);
         if (direct) {
           return direct;

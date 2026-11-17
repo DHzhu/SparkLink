@@ -4395,6 +4395,655 @@ test('[P2] Unconfirmed state retains previously viewed Account B in open/reopene
   assert.equal(freshPopupNodes.get('stat-total-replies').textContent, '1');
 });
 
+test('[P1] Paused-at-load snapshot freshness matrix: stale window.__INITIAL_STATE__ A without switcher handle stays unconfirmed, updated state B binds B, nested DOM switcher @handle corroborates, and same-session binding loss resets GraphQL cache', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_paused_freshness_matrix';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+  let fgTabId = 201;
+  const tabListenersByTab = new Map();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        query: async () => [{ id: fgTabId, active: true }],
+        sendMessage: async (tid, msg) => {
+          const set = tabListenersByTab.get(tid);
+          if (!set || set.size === 0) {
+            throw new Error('No content script');
+          }
+          let responseVal = { ok: true };
+          for (const fn of set) {
+            fn(msg, { id: EXT_ID }, (r) => {
+              responseVal = r;
+            });
+          }
+          return responseVal;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  const viewerBGraphql = {
+    data: {
+      viewer: {
+        user_results: {
+          result: {
+            __typename: 'User',
+            rest_id: '9009009',
+            core: { screen_name: 'second_account', name: '第二账号' },
+            legacy: {}
+          }
+        }
+      }
+    }
+  };
+  const replyByB1 = structuredClone(createTweetFixtures.standardReply.response);
+  replyByB1.data.create_tweet.tweet_results.result.rest_id = '2122147641553971001';
+  replyByB1.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553971001';
+  replyByB1.data.create_tweet.tweet_results.result.core.user_results.result.rest_id = '9009009';
+  replyByB1.data.create_tweet.tweet_results.result.core.user_results.result.core.screen_name = 'second_account';
+  replyByB1.data.create_tweet.tweet_results.result.legacy.user_id_str = '9009009';
+
+  const replyByB2 = structuredClone(replyByB1);
+  replyByB2.data.create_tweet.tweet_results.result.rest_id = '2122147641553971002';
+  replyByB2.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553971002';
+
+  function makeTabHarness(tabId, docId, { inlineJson = null, initialState = undefined, switcherEl = null }) {
+    const sender = {
+      id: EXT_ID,
+      tab: { id: tabId, active: true },
+      frameId: 0,
+      documentId: docId,
+      origin: 'https://x.com',
+      url: 'https://x.com/home'
+    };
+    const winListeners = new Map();
+    const tabSet = new Set();
+    tabListenersByTab.set(tabId, tabSet);
+
+    let stateObj = initialState;
+    let stateReads = 0;
+    const inlineScripts = inlineJson
+      ? [{ textContent: `window.__INITIAL_STATE__ = ${inlineJson};` }]
+      : [];
+
+    const fakeWin = {
+      location: { origin: 'https://x.com', href: 'https://x.com/home' },
+      document: {
+        visibilityState: 'visible',
+        addEventListener(type, fn) {
+          if (!winListeners.has(`doc:${type}`)) winListeners.set(`doc:${type}`, new Set());
+          winListeners.get(`doc:${type}`).add(fn);
+        },
+        removeEventListener(type, fn) {
+          if (winListeners.has(`doc:${type}`)) winListeners.get(`doc:${type}`).delete(fn);
+        },
+        querySelector: (sel) =>
+          sel === '[data-testid="SideNav_AccountSwitcher_Button"]' ? switcherEl : null,
+        querySelectorAll: (sel) => (sel === 'script:not([src])' ? inlineScripts : [])
+      },
+      fetch(url) {
+        if (String(url).includes('Viewer')) {
+          return Promise.resolve(
+            new Response(JSON.stringify(viewerBGraphql), {
+              status: 200,
+              headers: { 'content-type': 'application/json' }
+            })
+          );
+        }
+        if (String(url).includes('ReplyB1')) {
+          return Promise.resolve(
+            new Response(JSON.stringify(replyByB1), {
+              status: 200,
+              headers: { 'content-type': 'application/json' }
+            })
+          );
+        }
+        if (String(url).includes('ReplyB2')) {
+          return Promise.resolve(
+            new Response(JSON.stringify(replyByB2), {
+              status: 200,
+              headers: { 'content-type': 'application/json' }
+            })
+          );
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }));
+      },
+      addEventListener(type, fn) {
+        if (!winListeners.has(type)) winListeners.set(type, new Set());
+        winListeners.get(type).add(fn);
+      },
+      removeEventListener(type, fn) {
+        if (winListeners.has(type)) winListeners.get(type).delete(fn);
+      },
+      postMessage(data, origin) {
+        queueMicrotask(() => {
+          const set = winListeners.get('message');
+          if (set) {
+            for (const fn of set) fn({ data, origin, source: fakeWin });
+          }
+        });
+      }
+    };
+    fakeWin.top = fakeWin;
+    Object.defineProperty(fakeWin, '__INITIAL_STATE__', {
+      configurable: true,
+      enumerable: true,
+      get() {
+        stateReads += 1;
+        return stateObj;
+      },
+      set(v) {
+        stateObj = v;
+      }
+    });
+
+    const pageChrome = {
+      runtime: {
+        id: EXT_ID,
+        sendMessage: (msg) => bg.handleMessage(msg, sender),
+        onMessage: {
+          addListener: (fn) => tabSet.add(fn),
+          removeListener: (fn) => tabSet.delete(fn)
+        }
+      }
+    };
+
+    const interceptor = installMainInterceptor(fakeWin, adapterApi, { nowFn: () => NOW_MS });
+    const bridge = installIsolatedBridge(fakeWin, pageChrome, { nowFn: () => NOW_MS, retryDelayMs: 5 });
+    return {
+      fakeWin,
+      interceptor,
+      bridge,
+      getStateReads: () => stateReads,
+      triggerVisibility() {
+        const set = winListeners.get('doc:visibilitychange');
+        if (set) {
+          for (const fn of set) fn();
+        }
+      }
+    };
+  }
+
+  // Case 1 (Finding #1): Tab 201 opens as A while paused, switches A -> B while paused,
+  // window.__INITIAL_STATE__ STILL holds A, and icon-only switcher button has NO @handle!
+  const ssrAJson = JSON.stringify({
+    session: { user_id: '1001001', user: { screen_name: 'sample_me', name: 'A' } }
+  });
+  const tab201 = makeTabHarness(201, 'doc_paused_stale_a', {
+    inlineJson: ssrAJson,
+    initialState: structuredClone(viewerFixtures.ownProfileInitialState),
+    switcherEl: { textContent: 'AvatarOnly', childNodes: [{ nodeType: 3, nodeValue: 'AvatarOnly' }] }
+  });
+  await new Promise((r) => setTimeout(r, 35));
+  assert.equal(tab201.getStateReads(), 0, '0 reads while paused');
+
+  // User switches A -> B while paused (Viewer B response ignored while paused, __INITIAL_STATE__ remains A!)
+  await tab201.fakeWin.fetch('https://x.com/i/api/graphql/PausedSwitch/Viewer');
+  assert.equal(tab201.getStateReads(), 0);
+
+  // First-time collection enable -> MUST stay 账号待确认 (unconfirmed), NEVER binding stale A!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 45));
+  assert.equal(tab201.bridge.getBindingContext(), null);
+  const snap201Enable = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
+  assert.equal(snap201Enable.viewerStatus, 'unconfirmed');
+  assert.equal(snap201Enable.activeTabActorUserId, null);
+
+  // Once fresh B Viewer arrives, Tab 201 binds B and records B's reply (+1)
+  await tab201.fakeWin.fetch('https://x.com/i/api/graphql/ActiveConfirmB/Viewer');
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(tab201.bridge.getBindingContext().actorUserId, '9009009');
+  await tab201.fakeWin.fetch('https://x.com/i/api/graphql/ReplyB1/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 45));
+  const snap201Bound = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
+  assert.equal(snap201Bound.selectedAccount.actorUserId, '9009009');
+  assert.equal(snap201Bound.selectedAccount.summary.totalReplies, 1);
+  tab201.bridge.destroy();
+
+  // Case 2: Pause again, open Tab 202 as A (inline <script> A), switch A -> B while paused AND update __INITIAL_STATE__ to B ->
+  // first-time enable detects mutation ('9009009' !== '1001001'), binds B immediately, and counts B's first reply (+1 -> total 2)!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  fgTabId = 202;
+  const tab202 = makeTabHarness(202, 'doc_paused_updated_b', {
+    inlineJson: ssrAJson,
+    initialState: structuredClone(viewerFixtures.ownProfileInitialState),
+    switcherEl: null
+  });
+  await new Promise((r) => setTimeout(r, 35));
+  // Update __INITIAL_STATE__ to B while still paused
+  tab202.fakeWin.__INITIAL_STATE__ = {
+    session: { user_id: '9009009', user: { screen_name: 'second_account', name: '第二账号' } }
+  };
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 45));
+  assert.equal(tab202.bridge.getBindingContext().actorUserId, '9009009');
+  await tab202.fakeWin.fetch('https://x.com/i/api/graphql/ReplyB2/CreateTweet', {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  await new Promise((r) => setTimeout(r, 45));
+  const snap202 = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
+  assert.equal(snap202.selectedAccount.actorUserId, '9009009');
+  assert.equal(snap202.selectedAccount.summary.totalReplies, 2);
+  tab202.bridge.destroy();
+
+  // Case 3 (Audit Cousin A1): Paused-at-load Tab 203 with NO inline <script>, __INITIAL_STATE__ = A (@sample_me),
+  // and nested SideNav_AccountSwitcher_Button `<div><span>Alice</span></div><div><span>@sample_me</span></div>`
+  // whose concatenated textContent is "Alice@sample_me" (no whitespace before @)!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  fgTabId = 203;
+  const nestedSwitcher = {
+    textContent: 'Alice@sample_me',
+    childNodes: [
+      {
+        nodeType: 1,
+        textContent: 'Alice',
+        childNodes: [{ nodeType: 3, nodeValue: 'Alice' }]
+      },
+      {
+        nodeType: 1,
+        textContent: '@sample_me',
+        childNodes: [{ nodeType: 3, nodeValue: '@sample_me' }]
+      }
+    ]
+  };
+  const tab203 = makeTabHarness(203, 'doc_paused_nested_switcher', {
+    inlineJson: null,
+    initialState: structuredClone(viewerFixtures.ownProfileInitialState),
+    switcherEl: nestedSwitcher
+  });
+  await new Promise((r) => setTimeout(r, 35));
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 45));
+  assert.equal(
+    tab203.bridge.getBindingContext() && tab203.bridge.getBindingContext().actorUserId,
+    '1001001',
+    'Nested DOM spans inside SideNav_AccountSwitcher_Button must corroborate @sample_me even without whitespace in textContent'
+  );
+  tab203.bridge.destroy();
+
+  // Case 4 (Audit Cousin A2): Paused-at-load Tab 204 with NO inline <script> and NO switcher @handle ->
+  // stays unconfirmed on first enable (establishing 1001001 as baseline), then mutating __INITIAL_STATE__ to 9009009 binds B on visibility recheck;
+  // also direct SYNC_STATE binding clearance resets latestGraphqlViewer!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  fgTabId = 204;
+  const tab204 = makeTabHarness(204, 'doc_paused_no_inline', {
+    inlineJson: null,
+    initialState: structuredClone(viewerFixtures.ownProfileInitialState),
+    switcherEl: null
+  });
+  await new Promise((r) => setTimeout(r, 35));
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 45));
+  assert.equal(tab204.bridge.getBindingContext(), null);
+
+  tab204.fakeWin.__INITIAL_STATE__ = {
+    session: { user_id: '9009009', user: { screen_name: 'second_account', name: '第二账号' } }
+  };
+  tab204.triggerVisibility();
+  await new Promise((r) => setTimeout(r, 45));
+  assert.equal(tab204.bridge.getBindingContext().actorUserId, '9009009');
+  tab204.bridge.destroy();
+
+  // Case 5: Conflicting @handles inside SideNav_AccountSwitcher_Button veto probe, and same-session SYNC_STATE(bindingContext: null) clears latestGraphqlViewer!
+  const directOutbound = [];
+  const directListeners = new Map();
+  let directSwitcher = {
+    textContent: '@sample_me@second_account',
+    childNodes: [
+      { nodeType: 3, nodeValue: '@sample_me' },
+      { nodeType: 3, nodeValue: '@second_account' }
+    ]
+  };
+  const directWin = {
+    location: { origin: 'https://x.com', href: 'https://x.com/home' },
+    document: {
+      querySelector: () => directSwitcher,
+      querySelectorAll: () => []
+    },
+    __INITIAL_STATE__: structuredClone(viewerFixtures.ownProfileInitialState),
+    fetch: async () =>
+      new Response(JSON.stringify(viewerBGraphql), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      }),
+    addEventListener(type, fn) {
+      if (!directListeners.has(type)) directListeners.set(type, new Set());
+      directListeners.get(type).add(fn);
+    },
+    postMessage(data) {
+      directOutbound.push(data);
+    }
+  };
+  installMainInterceptor(directWin, adapterApi);
+  const sendDirect = (data) => {
+    for (const fn of directListeners.get('message') || []) {
+      fn({ data, origin: 'https://x.com', source: directWin });
+    }
+  };
+  sendDirect({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'BRIDGE_INIT',
+    nonce: 'nonce_direct_conflict',
+    collectionEnabled: true,
+    captureSessionId: 50,
+    bindingContext: null
+  });
+  // Conflicting @sample_me + @second_account inside switcher button must veto initial probe!
+  assert.equal(
+    directOutbound.filter((d) => d.type === 'VIEWER_EVIDENCE').length,
+    0,
+    'Conflicting switcher handles must veto probe'
+  );
+  // Viewer GraphQL confirms B (9009009) and binds B, while __INITIAL_STATE__ is deleted
+  await directWin.fetch('https://x.com/i/api/graphql/V50/Viewer');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(directOutbound.filter((d) => d.type === 'VIEWER_EVIDENCE').length, 1);
+  delete directWin.__INITIAL_STATE__;
+  sendDirect({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'SYNC_STATE',
+    nonce: 'nonce_direct_conflict',
+    collectionEnabled: true,
+    captureSessionId: 50,
+    bindingContext: {
+      bindingId: 'bind_b_50',
+      actorUserId: '9009009',
+      captureSessionId: 50,
+      collectionGeneration: 1,
+      accountGeneration: 1
+    }
+  });
+  // Same-session binding loss (bindingContext -> null) MUST clear latestGraphqlViewer so stale B is not re-emitted!
+  sendDirect({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'SYNC_STATE',
+    nonce: 'nonce_direct_conflict',
+    collectionEnabled: true,
+    captureSessionId: 50,
+    bindingContext: null
+  });
+  assert.equal(
+    directOutbound.filter((d) => d.type === 'VIEWER_EVIDENCE').length,
+    1,
+    'Same-session binding clearance must reset latestGraphqlViewer'
+  );
+});
+
+test(
+  '[P1] Real Chromium CDP verification: paused-at-load stale __INITIAL_STATE__ A without switcher @handle stays unconfirmed, updated B binds, and nested DOM spans corroborate',
+  { skip: !fs.existsSync('/usr/bin/chromium') || !fs.existsSync('/usr/bin/xvfb-run') },
+  async () => {
+    const adapterSource = fs.readFileSync(path.resolve('src/x-adapter.js'), 'utf8');
+    const interceptorSource = fs.readFileSync(path.resolve('src/interceptor.js'), 'utf8');
+    const bridgeSource = fs.readFileSync(path.resolve('src/bridge.js'), 'utf8');
+    const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sparklink-chromium-freshness-'));
+    const child = spawn(
+      '/usr/bin/xvfb-run',
+      [
+        '-a',
+        '/usr/bin/chromium',
+        '--remote-debugging-port=0',
+        '--no-first-run',
+        '--no-default-browser-check',
+        `--user-data-dir=${profileDir}`,
+        'about:blank'
+      ],
+      { stdio: ['ignore', 'ignore', 'ignore'], detached: true }
+    );
+
+    try {
+      const portFile = path.join(profileDir, 'DevToolsActivePort');
+      let port = null;
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(portFile)) {
+          const lines = fs.readFileSync(portFile, 'utf8').trim().split('\n');
+          if (lines[0] && /^\d+$/.test(lines[0].trim())) {
+            port = Number(lines[0].trim());
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      assert.ok(port, 'Chromium DevToolsActivePort must initialize');
+
+      let pageTarget = null;
+      const pageDeadline = Date.now() + 6000;
+      while (Date.now() < pageDeadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/json`);
+          if (res.ok) {
+            const targets = await res.json();
+            pageTarget = targets.find(
+              (t) => t.type === 'page' && t.url === 'about:blank' && t.webSocketDebuggerUrl
+            );
+            if (pageTarget) break;
+          }
+        } catch (_ignore) {}
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      assert.ok(pageTarget, 'Chromium page target must be available');
+
+      const setupExpr = `(() => {
+        const loadCjs = (src) => {
+          const exportsObj = {};
+          const mod = { exports: exportsObj };
+          new Function('module', 'exports', src)(mod, exportsObj);
+          return mod.exports;
+        };
+        window.__sparkTestLoad = loadCjs;
+        window.__sparkTestAdapter = loadCjs(${JSON.stringify(adapterSource)});
+        window.__sparkTestInterceptor = loadCjs(${JSON.stringify(interceptorSource)});
+        return true;
+      })()`;
+
+      const evalExpr = `(async () => {
+        const adapter = window.__sparkTestAdapter;
+        const { installMainInterceptor } = window.__sparkTestInterceptor;
+        const { installIsolatedBridge } = window.__sparkTestLoad(${JSON.stringify(bridgeSource)});
+
+        async function runPausedOpenCase(mutateDuringPauseFn, setupDomFn) {
+          document.head.replaceChildren();
+          document.body.replaceChildren();
+          const ssrScript = document.createElement('script');
+          ssrScript.type = 'text/plain';
+          ssrScript.textContent = 'window.__INITIAL_STATE__ = {"session":{"user_id":"1001001","user":{"screen_name":"sample_me","name":"A"}}};';
+          document.head.appendChild(ssrScript);
+          setupDomFn();
+
+          let bgEnabled = false;
+          let bgSessionId = null;
+          let bgBinding = null;
+          const runtimeListeners = new Set();
+          const winListeners = new Set();
+          const fakeWin = {
+            location: { origin: 'https://x.com', href: 'https://x.com/home' },
+            document,
+            __INITIAL_STATE__: { session: { user_id: '1001001', user: { screen_name: 'sample_me', name: 'A' } } },
+            fetch: async () => new Response('{}', { status: 200 }),
+            addEventListener: (t, fn) => { if (t === 'message') winListeners.add(fn); },
+            removeEventListener: (t, fn) => { if (t === 'message') winListeners.delete(fn); },
+            postMessage: (data, origin) => queueMicrotask(() => {
+              for (const fn of winListeners) fn({ data, origin, source: fakeWin });
+            })
+          };
+          fakeWin.top = fakeWin;
+          const fakeChrome = {
+            runtime: {
+              id: 'ext_cdp_freshness',
+              async sendMessage(msg) {
+                if (msg.type === 'HELLO') {
+                  return { ok: true, collectionEnabled: bgEnabled, captureSessionId: bgSessionId, bindingContext: bgBinding, revision: 1 };
+                }
+                if (msg.type === 'BIND_VIEWER') {
+                  bgBinding = { bindingId: 'b_' + msg.viewer.actorUserId, actorUserId: msg.viewer.actorUserId, captureSessionId: bgSessionId, collectionGeneration: 1, accountGeneration: 1 };
+                  return { ok: true, bindingContext: bgBinding, revision: 2 };
+                }
+                return { ok: true };
+              },
+              onMessage: { addListener: (fn) => runtimeListeners.add(fn), removeListener: (fn) => runtimeListeners.delete(fn) }
+            }
+          };
+
+          installMainInterceptor(fakeWin, adapter);
+          const bridge = installIsolatedBridge(fakeWin, fakeChrome, { retryDelayMs: 5 });
+          await new Promise((r) => setTimeout(r, 35));
+
+          mutateDuringPauseFn(fakeWin);
+
+          bgEnabled = true;
+          bgSessionId = 1;
+          for (const fn of runtimeListeners) {
+            fn({ type: 'STATE_CHANGED', collectionEnabled: true, captureSessionId: 1 }, { id: 'ext_cdp_freshness' });
+          }
+          await new Promise((r) => setTimeout(r, 40));
+          const actor = bridge.getBindingContext() ? bridge.getBindingContext().actorUserId : null;
+          bridge.destroy();
+          return actor;
+        }
+
+        // 1. Stale __INITIAL_STATE__ = A + collapsed icon-only switcher button (no @handle) -> MUST be null (unconfirmed)!
+        const staleANoHandleActor = await runPausedOpenCase(
+          () => {},
+          () => {
+            const btn = document.createElement('button');
+            btn.setAttribute('data-testid', 'SideNav_AccountSwitcher_Button');
+            const icon = document.createElement('div');
+            icon.textContent = 'Avatar';
+            btn.appendChild(icon);
+            document.body.appendChild(btn);
+          }
+        );
+
+        // 2. Updated __INITIAL_STATE__ = B (9009009) vs inline <script> A (1001001) + icon-only switcher -> MUST bind 9009009!
+        const updatedBNoHandleActor = await runPausedOpenCase(
+          (w) => {
+            w.__INITIAL_STATE__ = { session: { user_id: '9009009', user: { screen_name: 'second_account', name: 'B' } } };
+          },
+          () => {}
+        );
+
+        // 3. __INITIAL_STATE__ = A + real nested spans <div><span>Alice</span></div><div><span>@sample_me</span></div> (textContent === "Alice@sample_me") -> MUST corroborate 1001001!
+        const nestedDomCorroboratedActor = await runPausedOpenCase(
+          () => {},
+          () => {
+            const btn = document.createElement('button');
+            btn.setAttribute('data-testid', 'SideNav_AccountSwitcher_Button');
+            const d1 = document.createElement('div');
+            const s1 = document.createElement('span');
+            s1.textContent = 'Alice';
+            d1.appendChild(s1);
+            const d2 = document.createElement('div');
+            const s2 = document.createElement('span');
+            s2.textContent = '@sample_me';
+            d2.appendChild(s2);
+            btn.appendChild(d1);
+            btn.appendChild(d2);
+            document.body.appendChild(btn);
+          }
+        );
+
+        // 4. __INITIAL_STATE__ = A + real nested spans <div><span>Bob</span></div><div><span>@second_account</span></div> (textContent === "Bob@second_account" without space) -> MUST veto A (null)!
+        const nestedDomMismatchActor = await runPausedOpenCase(
+          () => {},
+          () => {
+            const btn = document.createElement('button');
+            btn.setAttribute('data-testid', 'SideNav_AccountSwitcher_Button');
+            const d1 = document.createElement('div');
+            const s1 = document.createElement('span');
+            s1.textContent = 'Bob';
+            d1.appendChild(s1);
+            const d2 = document.createElement('div');
+            const s2 = document.createElement('span');
+            s2.textContent = '@second_account';
+            d2.appendChild(s2);
+            btn.appendChild(d1);
+            btn.appendChild(d2);
+            document.body.appendChild(btn);
+          }
+        );
+
+        return {
+          staleANoHandleActor,
+          updatedBNoHandleActor,
+          nestedDomCorroboratedActor,
+          nestedDomMismatchActor
+        };
+      })()`;
+
+      const cdpResult = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+        const timer = setTimeout(() => {
+          ws.close();
+          reject(new Error('CDP Runtime.evaluate timed out'));
+        }, 8000);
+        ws.addEventListener('open', () => {
+          ws.send(
+            JSON.stringify({
+              id: 1,
+              method: 'Runtime.evaluate',
+              params: { expression: setupExpr, returnByValue: true }
+            })
+          );
+        });
+        ws.addEventListener('message', (ev) => {
+          const msg = JSON.parse(String(ev.data));
+          if (msg.id === 1) {
+            ws.send(
+              JSON.stringify({
+                id: 2,
+                method: 'Runtime.evaluate',
+                params: { expression: evalExpr, awaitPromise: true, returnByValue: true }
+              })
+            );
+          } else if (msg.id === 2) {
+            clearTimeout(timer);
+            ws.close();
+            resolve(msg);
+          }
+        });
+        ws.addEventListener('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const val = cdpResult.result && cdpResult.result.result && cdpResult.result.result.value;
+      assert.deepEqual(val, {
+        staleANoHandleActor: null,
+        updatedBNoHandleActor: '9009009',
+        nestedDomCorroboratedActor: '1001001',
+        nestedDomMismatchActor: null
+      });
+    } finally {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch (_ignore) {}
+      await new Promise((r) => setTimeout(r, 150));
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch (_ignore) {}
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    }
+  }
+);
+
 
 
 

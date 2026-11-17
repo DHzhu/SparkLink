@@ -4395,7 +4395,7 @@ test('[P2] Unconfirmed state retains previously viewed Account B in open/reopene
   assert.equal(freshPopupNodes.get('stat-total-replies').textContent, '1');
 });
 
-test('[P1] Paused-at-load snapshot freshness matrix: stale window.__INITIAL_STATE__ A without switcher handle stays unconfirmed, updated state B binds B, nested DOM switcher @handle corroborates, and same-session binding loss resets GraphQL cache', async () => {
+test('[P1] & [P2] Paused-at-load snapshot freshness & segmented DOM matrix: historical snapshots without switcher handle stay unconfirmed, nested spans corroborate, segmented text runs veto prefix match, and same-session binding loss resets GraphQL cache', async () => {
   const NOW_MS = 1794794402000;
   const EXT_ID = 'sparklink_remed_paused_freshness_matrix';
   const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
@@ -4494,9 +4494,44 @@ test('[P1] Paused-at-load snapshot freshness matrix: stale window.__INITIAL_STAT
         querySelectorAll: (sel) => (sel === 'script:not([src])' ? inlineScripts : [])
       },
       fetch(url) {
+        if (String(url).includes('ViewerA')) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                data: {
+                  viewer: {
+                    user_results: {
+                      result: {
+                        __typename: 'User',
+                        rest_id: '1001001',
+                        core: { screen_name: 'sample_me', name: 'A' },
+                        legacy: {}
+                      }
+                    }
+                  }
+                }
+              }),
+              {
+                status: 200,
+                headers: { 'content-type': 'application/json' }
+              }
+            )
+          );
+        }
         if (String(url).includes('Viewer')) {
           return Promise.resolve(
             new Response(JSON.stringify(viewerBGraphql), {
+              status: 200,
+              headers: { 'content-type': 'application/json' }
+            })
+          );
+        }
+        if (String(url).includes('ReplyA1')) {
+          const replyByA1 = structuredClone(createTweetFixtures.standardReply.response);
+          replyByA1.data.create_tweet.tweet_results.result.rest_id = '2122147641553971009';
+          replyByA1.data.create_tweet.tweet_results.result.legacy.id_str = '2122147641553971009';
+          return Promise.resolve(
+            new Response(JSON.stringify(replyByA1), {
               status: 200,
               headers: { 'content-type': 'application/json' }
             })
@@ -4615,8 +4650,10 @@ test('[P1] Paused-at-load snapshot freshness matrix: stale window.__INITIAL_STAT
   assert.equal(snap201Bound.selectedAccount.summary.totalReplies, 1);
   tab201.bridge.destroy();
 
-  // Case 2: Pause again, open Tab 202 as A (inline <script> A), switch A -> B while paused AND update __INITIAL_STATE__ to B ->
-  // first-time enable detects mutation ('9009009' !== '1001001'), binds B immediately, and counts B's first reply (+1 -> total 2)!
+  // Case 2 ([P1] A -> B -> A paused-load ambiguity): Pause again, open Tab 202 as A (inline <script> A),
+  // switch A -> B while paused (updating __INITIAL_STATE__ to B), then switch B -> A while still paused
+  // WITHOUT rewriting __INITIAL_STATE__ (so inline <script> = A, __INITIAL_STATE__ = B, switcher has NO @handle) ->
+  // first-time enable MUST stay 账号待确认 (unconfirmed), NEVER misbinding B, until fresh ViewerA confirms A (+1 reply)!
   await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
   fgTabId = 202;
   const tab202 = makeTabHarness(202, 'doc_paused_updated_b', {
@@ -4625,21 +4662,33 @@ test('[P1] Paused-at-load snapshot freshness matrix: stale window.__INITIAL_STAT
     switcherEl: null
   });
   await new Promise((r) => setTimeout(r, 35));
-  // Update __INITIAL_STATE__ to B while still paused
+  // __INITIAL_STATE__ became B during A -> B, then user switched back B -> A without updating __INITIAL_STATE__
   tab202.fakeWin.__INITIAL_STATE__ = {
     session: { user_id: '9009009', user: { screen_name: 'second_account', name: '第二账号' } }
   };
   await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
   await new Promise((r) => setTimeout(r, 45));
-  assert.equal(tab202.bridge.getBindingContext().actorUserId, '9009009');
-  await tab202.fakeWin.fetch('https://x.com/i/api/graphql/ReplyB2/CreateTweet', {
+  assert.equal(
+    tab202.bridge.getBindingContext(),
+    null,
+    'Two differing pre-enable snapshots (inline A vs __INITIAL_STATE__ B) without switcher @handle must stay unconfirmed'
+  );
+  const snap202Pending = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
+  assert.equal(snap202Pending.viewerStatus, 'unconfirmed');
+  assert.equal(snap202Pending.activeTabActorUserId, null);
+
+  // Fresh ViewerA arrives -> binds A (1001001) and counts A's reply (+1)
+  await tab202.fakeWin.fetch('https://x.com/i/api/graphql/ViewerA/Viewer');
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(tab202.bridge.getBindingContext().actorUserId, '1001001');
+  await tab202.fakeWin.fetch('https://x.com/i/api/graphql/ReplyA1/CreateTweet', {
     method: 'POST',
     body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
   });
   await new Promise((r) => setTimeout(r, 45));
   const snap202 = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
-  assert.equal(snap202.selectedAccount.actorUserId, '9009009');
-  assert.equal(snap202.selectedAccount.summary.totalReplies, 2);
+  assert.equal(snap202.selectedAccount.actorUserId, '1001001');
+  assert.equal(snap202.selectedAccount.summary.totalReplies, 1);
   tab202.bridge.destroy();
 
   // Case 3 (Audit Cousin A1): Paused-at-load Tab 203 with NO inline <script>, __INITIAL_STATE__ = A (@sample_me),
@@ -4677,27 +4726,69 @@ test('[P1] Paused-at-load snapshot freshness matrix: stale window.__INITIAL_STAT
   );
   tab203.bridge.destroy();
 
-  // Case 4 (Audit Cousin A2): Paused-at-load Tab 204 with NO inline <script> and NO switcher @handle ->
-  // stays unconfirmed on first enable (establishing 1001001 as baseline), then mutating __INITIAL_STATE__ to 9009009 binds B on visibility recheck;
-  // also direct SYNC_STATE binding clearance resets latestGraphqlViewer!
+  // Case 4 ([P2] Segmented switcher text nodes + unconfirmed re-pause before live switcher corroboration):
+  // Tab 204 has __INITIAL_STATE__ = A (@sample_me), while SideNav_AccountSwitcher_Button renders @sample_me_alt
+  // split across adjacent Text("@sample_me") + Text("_alt")! MUST stay unconfirmed (never prefix-matching @sample_me)!
+  // Even across a second Pause -> Resume while still unconfirmed, once switcher renders @sample_me it corroborates A cleanly!
   await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
   fgTabId = 204;
-  const tab204 = makeTabHarness(204, 'doc_paused_no_inline', {
+  let dynamicSwitcher204 = {
+    tagName: 'BUTTON',
+    textContent: '@sample_me_alt',
+    childNodes: [
+      {
+        nodeType: 1,
+        tagName: 'SPAN',
+        textContent: '@sample_me_alt',
+        childNodes: [
+          { nodeType: 3, nodeValue: '@sample_me' },
+          { nodeType: 3, nodeValue: '_alt' }
+        ]
+      }
+    ]
+  };
+  const tab204 = makeTabHarness(204, 'doc_paused_segmented_switcher', {
     inlineJson: null,
     initialState: structuredClone(viewerFixtures.ownProfileInitialState),
     switcherEl: null
   });
+  tab204.fakeWin.document.querySelector = (sel) =>
+    sel === '[data-testid="SideNav_AccountSwitcher_Button"]' ? dynamicSwitcher204 : null;
   await new Promise((r) => setTimeout(r, 35));
   await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
   await new Promise((r) => setTimeout(r, 45));
-  assert.equal(tab204.bridge.getBindingContext(), null);
+  assert.equal(
+    tab204.bridge.getBindingContext(),
+    null,
+    'Adjacent Text("@sample_me") + Text("_alt") must be coalesced as @sample_me_alt and NEVER prefix-match @sample_me'
+  );
 
-  tab204.fakeWin.__INITIAL_STATE__ = {
-    session: { user_id: '9009009', user: { screen_name: 'second_account', name: '第二账号' } }
+  // Pause again before any viewer was ever confirmed, then switcher renders segmented Text("@") + Comment + Text("sample_me") -> Resume binds A!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  await new Promise((r) => setTimeout(r, 25));
+  dynamicSwitcher204 = {
+    tagName: 'BUTTON',
+    textContent: '@sample_me',
+    childNodes: [
+      {
+        nodeType: 1,
+        tagName: 'SPAN',
+        textContent: '@sample_me',
+        childNodes: [
+          { nodeType: 3, nodeValue: '@' },
+          { nodeType: 8, nodeValue: '' },
+          { nodeType: 3, nodeValue: 'sample_me' }
+        ]
+      }
+    ]
   };
-  tab204.triggerVisibility();
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
   await new Promise((r) => setTimeout(r, 45));
-  assert.equal(tab204.bridge.getBindingContext().actorUserId, '9009009');
+  assert.equal(
+    tab204.bridge.getBindingContext() && tab204.bridge.getBindingContext().actorUserId,
+    '1001001',
+    'Unconfirmed pause must not poison windowSnapshotStale, and segmented "@" + "sample_me" must corroborate 1001001'
+  );
   tab204.bridge.destroy();
 
   // Case 5: Conflicting @handles inside SideNav_AccountSwitcher_Button veto probe, and same-session SYNC_STATE(bindingContext: null) clears latestGraphqlViewer!
@@ -4786,12 +4877,13 @@ test('[P1] Paused-at-load snapshot freshness matrix: stale window.__INITIAL_STAT
 });
 
 test(
-  '[P1] Real Chromium CDP verification: paused-at-load stale __INITIAL_STATE__ A without switcher @handle stays unconfirmed, updated B binds, and nested DOM spans corroborate',
+  '[P1] & [P2] Real Chromium CDP verification: paused-at-load historical snapshots without switcher @handle stay unconfirmed, nested DOM spans corroborate, and segmented text/span runs coalesce',
   { skip: !fs.existsSync('/usr/bin/chromium') || !fs.existsSync('/usr/bin/xvfb-run') },
   async () => {
     const adapterSource = fs.readFileSync(path.resolve('src/x-adapter.js'), 'utf8');
     const interceptorSource = fs.readFileSync(path.resolve('src/interceptor.js'), 'utf8');
     const bridgeSource = fs.readFileSync(path.resolve('src/bridge.js'), 'utf8');
+    const contentSource = fs.readFileSync(path.resolve('src/content.js'), 'utf8');
     const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sparklink-chromium-freshness-'));
     const child = spawn(
       '/usr/bin/xvfb-run',
@@ -4931,7 +5023,7 @@ test(
           }
         );
 
-        // 2. Updated __INITIAL_STATE__ = B (9009009) vs inline <script> A (1001001) + icon-only switcher -> MUST bind 9009009!
+        // 2. [P1] Updated __INITIAL_STATE__ = B (9009009) vs inline <script> A (1001001) + no switcher @handle (indistinguishable from A -> B -> A) -> MUST stay null (unconfirmed)!
         const updatedBNoHandleActor = await runPausedOpenCase(
           (w) => {
             w.__INITIAL_STATE__ = { session: { user_id: '9009009', user: { screen_name: 'second_account', name: 'B' } } };
@@ -4979,11 +5071,122 @@ test(
           }
         );
 
+        // 5. [P2] Real DOM adjacent Text("@sample_me") + Text("_alt") inside SideNav_AccountSwitcher_Button while __INITIAL_STATE__ = @sample_me -> MUST veto prefix match and stay null (unconfirmed)!
+        const segmentedTextPrefixMismatchActor = await runPausedOpenCase(
+          () => {},
+          () => {
+            const btn = document.createElement('button');
+            btn.setAttribute('data-testid', 'SideNav_AccountSwitcher_Button');
+            const d = document.createElement('div');
+            const sp = document.createElement('span');
+            sp.appendChild(document.createTextNode('@sample_me'));
+            sp.appendChild(document.createTextNode('_alt'));
+            d.appendChild(sp);
+            btn.appendChild(d);
+            document.body.appendChild(btn);
+          }
+        );
+
+        // 6. [P2] Real DOM inline <span>@sample_me</span><span>_alt</span> inside SideNav_AccountSwitcher_Button while __INITIAL_STATE__ = @sample_me -> MUST also stay null!
+        const segmentedSpanPrefixMismatchActor = await runPausedOpenCase(
+          () => {},
+          () => {
+            const btn = document.createElement('button');
+            btn.setAttribute('data-testid', 'SideNav_AccountSwitcher_Button');
+            const d = document.createElement('div');
+            const sp1 = document.createElement('span');
+            sp1.textContent = '@sample_me';
+            const sp2 = document.createElement('span');
+            sp2.textContent = '_alt';
+            d.appendChild(sp1);
+            d.appendChild(sp2);
+            btn.appendChild(d);
+            document.body.appendChild(btn);
+          }
+        );
+
+        // 7. Block boundary preservation: <div><span>@sample_me</span></div><div><span>Protected</span></div> -> MUST corroborate @sample_me (1001001), never merging across block <div>s!
+        const blockSeparatedCorroboratedActor = await runPausedOpenCase(
+          () => {},
+          () => {
+            const btn = document.createElement('button');
+            btn.setAttribute('data-testid', 'SideNav_AccountSwitcher_Button');
+            const outer = document.createElement('div');
+            const d1 = document.createElement('div');
+            const s1 = document.createElement('span');
+            s1.textContent = '@sample_me';
+            d1.appendChild(s1);
+            const d2 = document.createElement('div');
+            const s2 = document.createElement('span');
+            s2.textContent = 'Protected';
+            d2.appendChild(s2);
+            outer.appendChild(d1);
+            outer.appendChild(d2);
+            btn.appendChild(outer);
+            document.body.appendChild(btn);
+          }
+        );
+
+        // 8. [Cousin] src/content.js segmented Text("@sample_me") + Text("_alt") inside [data-testid="User-Name"]
+        const { installContentBadges } = window.__sparkTestLoad(${JSON.stringify(contentSource)});
+        document.body.replaceChildren();
+        const conflictHeader = document.createElement('div');
+        conflictHeader.setAttribute('data-testid', 'User-Name');
+        const linkA = document.createElement('a');
+        linkA.setAttribute('href', '/sample_me');
+        linkA.textContent = 'Sample Me';
+        const handleSpan = document.createElement('span');
+        handleSpan.appendChild(document.createTextNode('@sample_me'));
+        handleSpan.appendChild(document.createTextNode('_alt'));
+        conflictHeader.appendChild(linkA);
+        conflictHeader.appendChild(handleSpan);
+        document.body.appendChild(conflictHeader);
+
+        const validSegmentedHeader = document.createElement('div');
+        validSegmentedHeader.setAttribute('data-testid', 'User-Name');
+        const validSpan = document.createElement('span');
+        validSpan.appendChild(document.createTextNode('@'));
+        validSpan.appendChild(document.createComment('react'));
+        validSpan.appendChild(document.createTextNode('friend_two'));
+        validSegmentedHeader.appendChild(validSpan);
+        document.body.appendChild(validSegmentedHeader);
+
+        const contentCtrl = installContentBadges(
+          window,
+          {
+            getBindingContext: () => ({ bindingId: 'b_content_seg', actorUserId: '1001001' }),
+            getRevision: () => 1,
+            subscribe: () => () => {},
+            resolveUserIdByHandle: (h) => {
+              const lower = String(h).toLowerCase();
+              if (lower === 'sample_me') return '222';
+              if (lower === 'friend_two') return '333';
+              return null;
+            },
+            resolveAuthorByTweetId: () => null,
+            queryCounts: async (ids) => {
+              const counts = {};
+              for (const id of ids) counts[id] = 15;
+              return { ok: true, bindingId: 'b_content_seg', revision: 1, counts };
+            }
+          },
+          { debounceMs: 0 }
+        );
+        await new Promise((r) => setTimeout(r, 60));
+        const conflictBadgeCount = conflictHeader.querySelectorAll('.sparklink-badge').length;
+        const validSegmentedBadgeCount = validSegmentedHeader.querySelectorAll('.sparklink-badge').length;
+        contentCtrl.destroy();
+
         return {
           staleANoHandleActor,
           updatedBNoHandleActor,
           nestedDomCorroboratedActor,
-          nestedDomMismatchActor
+          nestedDomMismatchActor,
+          segmentedTextPrefixMismatchActor,
+          segmentedSpanPrefixMismatchActor,
+          blockSeparatedCorroboratedActor,
+          conflictBadgeCount,
+          validSegmentedBadgeCount
         };
       })()`;
 
@@ -5027,9 +5230,14 @@ test(
       const val = cdpResult.result && cdpResult.result.result && cdpResult.result.result.value;
       assert.deepEqual(val, {
         staleANoHandleActor: null,
-        updatedBNoHandleActor: '9009009',
+        updatedBNoHandleActor: null,
         nestedDomCorroboratedActor: '1001001',
-        nestedDomMismatchActor: null
+        nestedDomMismatchActor: null,
+        segmentedTextPrefixMismatchActor: null,
+        segmentedSpanPrefixMismatchActor: null,
+        blockSeparatedCorroboratedActor: '1001001',
+        conflictBadgeCount: 0,
+        validSegmentedBadgeCount: 1
       });
     } finally {
       try {

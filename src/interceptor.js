@@ -7,6 +7,113 @@
   const DEFAULT_MAX_REQUEST_BYTES = 256 * 1024;
   const DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
   const DEFAULT_CLONE_TIMEOUT_MS = 2000;
+  const INLINE_CONTINUATION_TAGS = new Set([
+    'SPAN',
+    'BDI',
+    'BDO',
+    'B',
+    'I',
+    'EM',
+    'STRONG',
+    'SMALL',
+    'MARK',
+    'U',
+    'S',
+    'SUB',
+    'SUP',
+    'CODE',
+    'FONT',
+    'ABBR',
+    'CITE',
+    'Q',
+    'WBR'
+  ]);
+
+  function collectCoalescedTextSegments(rootEl) {
+    const segments = [];
+    let current = '';
+
+    function flush() {
+      if (current.length > 0) {
+        segments.push(current);
+        current = '';
+      }
+    }
+
+    function appendInlinePiece(piece, splitLeadingAt) {
+      if (!piece) {
+        return;
+      }
+      if (
+        splitLeadingAt &&
+        current.length > 0 &&
+        !/\s$/.test(current) &&
+        piece.charCodeAt(0) === 64
+      ) {
+        flush();
+      }
+      current += piece;
+    }
+
+    function walk(node, isRoot, splitNextLeadingAt) {
+      if (!node) {
+        return;
+      }
+      if (node.nodeType === 3) {
+        const val =
+          node.nodeValue !== undefined && node.nodeValue !== null
+            ? String(node.nodeValue)
+            : node.textContent || '';
+        appendInlinePiece(val, splitNextLeadingAt);
+        return;
+      }
+      if (!isRoot && node.nodeType !== 1) {
+        return;
+      }
+      const tag = typeof node.tagName === 'string' ? node.tagName.toUpperCase() : '';
+      const isInline = !isRoot && INLINE_CONTINUATION_TAGS.has(tag);
+      if (!isInline) {
+        flush();
+      }
+      const childNodes = node.childNodes;
+      const hasChildNodes = Boolean(childNodes && typeof childNodes.length === 'number');
+      const children = !hasChildNodes ? node.children : null;
+      const hasChildren = Boolean(
+        children && typeof children.length === 'number' && children.length > 0
+      );
+      if (hasChildNodes) {
+        let firstTextInInline = isInline;
+        for (let i = 0; i < childNodes.length; i += 1) {
+          const prevLen = current.length;
+          walk(childNodes[i], false, firstTextInInline);
+          if (firstTextInInline && current.length !== prevLen) {
+            firstTextInInline = false;
+          }
+        }
+      } else if (hasChildren) {
+        let firstTextInInline = isInline;
+        for (let i = 0; i < children.length; i += 1) {
+          const prevLen = current.length;
+          walk(children[i], false, firstTextInInline);
+          if (firstTextInInline && current.length !== prevLen) {
+            firstTextInInline = false;
+          }
+        }
+      } else {
+        appendInlinePiece(
+          typeof node.textContent === 'string' ? node.textContent : '',
+          isInline
+        );
+      }
+      if (!isInline) {
+        flush();
+      }
+    }
+
+    walk(rootEl, true, false);
+    flush();
+    return segments;
+  }
 
   const installedWindows = new WeakMap();
   const textEncoder = typeof TextEncoder === 'function' ? new TextEncoder() : null;
@@ -89,7 +196,6 @@
       latestGraphqlViewer: null,
       hasPausedOnce: false,
       needsPausedLoadVerification: false,
-      pausedLoadBaselineActorId: null,
       hasSeenGraphqlViewer: false,
       hasSeenDynamicStateViewer: false,
       supersededDynamicActorId: null,
@@ -204,6 +310,9 @@
         state.needsPausedLoadVerification = true;
       }
       state.hasPausedOnce = true;
+      if (state.needsPausedLoadVerification) {
+        return;
+      }
       if (!state.windowSnapshotStale || activeId) {
         state.staleDynamicActorId = state.lastDynamicStateActorId;
         state.staleActiveActorId =
@@ -247,48 +356,30 @@
           if (exact) {
             return recordHandle(exact[1]);
           }
-          const tokenRe = /(?:^|\s)@([A-Za-z0-9_]{1,64})(?=\s|$)/g;
+          const tokenRe = /(?:^|\s)@(\S+)/g;
           let m;
           while ((m = tokenRe.exec(trimmed)) !== null) {
-            if (!recordHandle(m[1])) {
-              return false;
+            const candidate = m[1];
+            if (/^[A-Za-z0-9_]{1,64}$/.test(candidate)) {
+              if (!recordHandle(candidate)) {
+                return false;
+              }
+            } else if (/^[A-Za-z0-9_]{1,64}(?:@[A-Za-z0-9_]{1,64})+$/.test(candidate)) {
+              const glued = candidate.split('@');
+              for (let k = 0; k < glued.length; k += 1) {
+                if (!recordHandle(glued[k])) {
+                  return false;
+                }
+              }
             }
           }
           return true;
         };
 
-        const stack = [switcherEl];
-        let inspectedSubtree = false;
-        while (stack.length > 0) {
-          const node = stack.pop();
-          if (!node) {
-            continue;
-          }
-          const childNodes = node.childNodes;
-          if (childNodes && typeof childNodes.length === 'number' && childNodes.length > 0) {
-            inspectedSubtree = true;
-            for (let i = childNodes.length - 1; i >= 0; i -= 1) {
-              const child = childNodes[i];
-              if (!child) {
-                continue;
-              }
-              if (child.nodeType === 3) {
-                if (!scanTextTokens(child.nodeValue || child.textContent || '')) {
-                  return { status: 'conflict', handle: null };
-                }
-              } else if (child.nodeType === 1) {
-                stack.push(child);
-              }
-            }
-          } else if (node.children && typeof node.children.length === 'number' && node.children.length > 0) {
-            inspectedSubtree = true;
-            for (let i = node.children.length - 1; i >= 0; i -= 1) {
-              stack.push(node.children[i]);
-            }
-          } else if (node !== switcherEl || !inspectedSubtree) {
-            if (!scanTextTokens(node.textContent || '')) {
-              return { status: 'conflict', handle: null };
-            }
+        const segments = collectCoalescedTextSegments(switcherEl);
+        for (let i = 0; i < segments.length; i += 1) {
+          if (!scanTextTokens(segments[i])) {
+            return { status: 'conflict', handle: null };
           }
         }
 
@@ -331,22 +422,9 @@
 
       if (state.needsPausedLoadVerification) {
         if (!switcherConfirmed) {
-          if (!state.pausedLoadBaselineActorId) {
-            const inlineViewer = adapter.extractViewerFromWindow(win, {
-              allowDynamicState: false,
-              allowInlineScript: true
-            });
-            state.pausedLoadBaselineActorId =
-              inlineViewer && inlineViewer.actorUserId
-                ? inlineViewer.actorUserId
-                : winViewer.actorUserId;
-          }
-          if (winViewer.actorUserId === state.pausedLoadBaselineActorId) {
-            return false;
-          }
+          return false;
         }
         state.needsPausedLoadVerification = false;
-        state.pausedLoadBaselineActorId = null;
       }
 
       if (!state.windowSnapshotStale) {
@@ -443,7 +521,6 @@
           prevActorId !== state.bindingContext.actorUserId
         ) {
           state.needsPausedLoadVerification = false;
-          state.pausedLoadBaselineActorId = null;
           state.windowSnapshotStale = false;
           state.staleDynamicActorId = null;
           state.staleActiveActorId = null;
@@ -518,7 +595,6 @@
         if (viewer) {
           state.hasSeenGraphqlViewer = true;
           state.needsPausedLoadVerification = false;
-          state.pausedLoadBaselineActorId = null;
           state.windowSnapshotStale = false;
           state.staleDynamicActorId = null;
           state.staleActiveActorId = null;

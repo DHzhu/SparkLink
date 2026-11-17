@@ -32,6 +32,27 @@
   const PROFILE_HREF_RE = /^\/([A-Za-z0-9_]{1,64})\/?$/;
   const STATUS_HREF_RE = /^\/([A-Za-z0-9_]{1,64})\/status\/([1-9][0-9]{0,31})(?:[/?#]|$)/;
   const AT_HANDLE_RE = /^@([A-Za-z0-9_]{1,64})$/;
+  const INLINE_CONTINUATION_TAGS = new Set([
+    'SPAN',
+    'BDI',
+    'BDO',
+    'B',
+    'I',
+    'EM',
+    'STRONG',
+    'SMALL',
+    'MARK',
+    'U',
+    'S',
+    'SUB',
+    'SUP',
+    'CODE',
+    'FONT',
+    'ABBR',
+    'CITE',
+    'Q',
+    'WBR'
+  ]);
 
   const installedControllers = new WeakMap();
 
@@ -94,6 +115,92 @@
     return true;
   }
 
+  function collectCoalescedAuthorTextSegments(rootEl) {
+    const segments = [];
+    let current = '';
+
+    function flush() {
+      if (current.length > 0) {
+        segments.push(current);
+        current = '';
+      }
+    }
+
+    function appendInlinePiece(piece, splitLeadingAt) {
+      if (!piece) {
+        return;
+      }
+      if (
+        splitLeadingAt &&
+        current.length > 0 &&
+        !/\s$/.test(current) &&
+        piece.charCodeAt(0) === 64
+      ) {
+        flush();
+      }
+      current += piece;
+    }
+
+    function walk(node, isRoot, splitNextLeadingAt) {
+      if (!node) {
+        return;
+      }
+      if (node.nodeType === 3) {
+        const val =
+          node.nodeValue !== undefined && node.nodeValue !== null
+            ? String(node.nodeValue)
+            : node.textContent || '';
+        appendInlinePiece(val, splitNextLeadingAt);
+        return;
+      }
+      if ((!isRoot && node.nodeType !== 1) || isSparklinkNode(node)) {
+        return;
+      }
+      const tag = typeof node.tagName === 'string' ? node.tagName.toUpperCase() : '';
+      const isInline = !isRoot && INLINE_CONTINUATION_TAGS.has(tag);
+      if (!isInline) {
+        flush();
+      }
+      const childNodes = node.childNodes;
+      const hasChildNodes = Boolean(childNodes && typeof childNodes.length === 'number');
+      const children = !hasChildNodes ? node.children : null;
+      const hasChildren = Boolean(
+        children && typeof children.length === 'number' && children.length > 0
+      );
+      if (hasChildNodes) {
+        let firstTextInInline = isInline;
+        for (let i = 0; i < childNodes.length; i += 1) {
+          const prevLen = current.length;
+          walk(childNodes[i], false, firstTextInInline);
+          if (firstTextInInline && current.length !== prevLen) {
+            firstTextInInline = false;
+          }
+        }
+      } else if (hasChildren) {
+        let firstTextInInline = isInline;
+        for (let i = 0; i < children.length; i += 1) {
+          const prevLen = current.length;
+          walk(children[i], false, firstTextInInline);
+          if (firstTextInInline && current.length !== prevLen) {
+            firstTextInInline = false;
+          }
+        }
+      } else {
+        appendInlinePiece(
+          typeof node.textContent === 'string' ? node.textContent : '',
+          isInline
+        );
+      }
+      if (!isInline) {
+        flush();
+      }
+    }
+
+    walk(rootEl, true, false);
+    flush();
+    return segments;
+  }
+
   function extractCandidateIdentity(container, bridge) {
     if (!container || typeof container.querySelectorAll !== 'function') {
       return null;
@@ -119,49 +226,18 @@
       profileHandle = candidate;
     }
 
-    // Cross-check visible @handle text across HTMLCollection / NodeList subtrees
+    // Cross-check visible @handle text across coalesced inline text runs
     let textHandle = null;
-    const stack = [container];
-    while (stack.length > 0) {
-      const node = stack.pop();
-      if (!node || (node !== container && node.nodeType !== 1) || isSparklinkNode(node)) {
-        continue;
-      }
-      const childNodes = node.childNodes;
-      if (childNodes && typeof childNodes.length === 'number' && childNodes.length > 0) {
-        for (let j = childNodes.length - 1; j >= 0; j -= 1) {
-          const child = childNodes[j];
-          if (!child) {
-            continue;
-          }
-          if (child.nodeType === 3) {
-            const rawText = (child.nodeValue || child.textContent || '').trim();
-            const atMatch = AT_HANDLE_RE.exec(rawText);
-            if (atMatch) {
-              const h = atMatch[1];
-              if (textHandle && textHandle.toLowerCase() !== h.toLowerCase()) {
-                return null;
-              }
-              textHandle = h;
-            }
-          } else if (child.nodeType === 1) {
-            stack.push(child);
-          }
+    const segments = collectCoalescedAuthorTextSegments(container);
+    for (let i = 0; i < segments.length; i += 1) {
+      const rawText = segments[i].trim();
+      const atMatch = AT_HANDLE_RE.exec(rawText);
+      if (atMatch) {
+        const h = atMatch[1];
+        if (textHandle && textHandle.toLowerCase() !== h.toLowerCase()) {
+          return null;
         }
-      } else if (node.children && typeof node.children.length === 'number' && node.children.length > 0) {
-        for (let j = node.children.length - 1; j >= 0; j -= 1) {
-          stack.push(node.children[j]);
-        }
-      } else {
-        const rawText = (node.textContent || '').trim();
-        const atMatch = AT_HANDLE_RE.exec(rawText);
-        if (atMatch) {
-          const h = atMatch[1];
-          if (textHandle && textHandle.toLowerCase() !== h.toLowerCase()) {
-            return null;
-          }
-          textHandle = h;
-        }
+        textHandle = h;
       }
     }
 

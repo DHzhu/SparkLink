@@ -15,7 +15,7 @@
   - 实现 Service Worker 信任上下文配置、Popup 与顶层 X 页面权限分离及 `storage.session` 跨重启会话绑定恢复（`src/background.js`）。
   - 实现 DOM 星火徽章分级渲染（SVG 火苗、认证图标后置布局、`MutationObserver` 合并与 `requestAnimationFrame` 分片、虚拟列表节点复用清理及 60 秒过期窗口自动刷新，`src/content.js`、`src/styles.css`）。
   - 实现浅色/深色自适应 Popup 管理界面（`src/popup/`）并通过全部 34 项单元与端到端验收测试（整体行覆盖率 88.13%）。
-- 补齐 4 个尺寸确定性品牌 PNG 图标（`icons/icon16.png`、`icons/icon32.png`、`icons/icon48.png`、`icons/icon128.png`），并接入真实 Chromium 155 未打包扩展加载与 CDP 真实 DOM / 原生 `Request` 回归验收（`tests/remediation.test.js`，全量 58 项测试通过，整体行覆盖率 89.55%）。
+- 补齐 4 个尺寸确定性品牌 PNG 图标（`icons/icon16.png`、`icons/icon32.png`、`icons/icon48.png`、`icons/icon128.png`），并接入真实 Chromium 155 未打包扩展加载与 CDP 真实 DOM / 原生 `Request` 回归验收（`tests/remediation.test.js`，全量 61 项测试通过，整体行覆盖率 89.51%）。
 
 ### 变更
 - 备份导出切换为紧凑 JSON 序列化并引入 `O(1)` 用户 Handle 索引（`src/popup/popup.js`、`src/storage.js`），确保满载 20,000 条回复（约 5.92 MiB）导出的备份体积低于 9 MiB 导入上限且可快速往返恢复。
@@ -40,6 +40,8 @@
 - **[P1]** 修复采集处于关闭状态时打开标签页、页内从账号 A 切到 B 并释放 `window.__INITIAL_STATE__` 后首次开启采集仍回退读取初始 HTML 内联 `<script>` 误绑旧账号 A 的问题；在桥接握手同步后台已确认的暂停状态（`stateConfirmed` / `observedPaused`）后立即标记文档曾处于暂停态（暂停期间零页面读取），将初始 HTML 内联 `<script>` 严格限定于已开启采集时新加载的文档（`src/bridge.js`、`src/interceptor.js`）。
 - **[P2]** 修复左下角账号切换按钮（`SideNav_AccountSwitcher_Button`）DOM 用户名短暂滞后于动态 `window.__INITIAL_STATE__` 时将该动态账号写入 `supersededDynamicActorId` 导致后续切回标签页重探仍无法绑定的问题；DOM 按钮不一致仅拦截当次探测而不污染动态账号状态，按钮同步后再次探测即可正常绑定并计入首条回复（`src/interceptor.js`）。
 - **[P2]** 修复“账号待确认”期间 Popup 面板自动回退选中字典序首个本地账号（`savedAccounts[0]`）导致展示错位历史统计的问题；待确认状态下优先保持当前面板或同一前台文档最近查看/确认的账号，全新未确认标签页则展示“待确认（请选择查看账号）”占位项等待自动确认或用户显式选择（`src/storage.js`、`src/background.js`、`src/popup/popup.js`）。
+- **[P1]** 修复暂停期间加载的文档在页内切号（`A -> B`）而内存 `window.__INITIAL_STATE__` 仍保留 `A`、且左下角账号按钮无可核对用户名时首次开启采集误绑旧账号 `A` 的问题；为所有在确认身份前经历过暂停态的文档启用全局快照时效核验（`needsPausedLoadVerification`），仅当左下角按钮子树实时 `@handle` 明确匹配（同时支持嵌套无空格 DOM 文本节点提取）或内存 `window.__INITIAL_STATE__` 相对初始 HTML `<script>` 基线已真实变更为新账号时才信任，否则保持“账号待确认”，并在同会话解绑时清空旧 GraphQL 身份缓存（`src/x-adapter.js`、`src/interceptor.js`）。
+- **[P2]** 修复从未绑定账号的新标签页点击单次暂停与恢复（或在暂停状态下打开面板再开启采集）时，暂停态默认兜底展示的 `savedAccounts[0]` 写入面板记忆并串入“账号待确认”状态的问题；严格隔离“用户显式下拉选择”与“标签页已确认账号”两类来源，禁止将暂停/无活动页的默认兜底账号回写为记忆账号（`src/background.js`、`src/popup/popup.js`）。
 
 ### 移除
 - (在此记录已移除的功能)

@@ -94,6 +94,7 @@ export function createPopupController(options = {}) {
   };
 
   let userSelectedActorId = null;
+  let lastViewedActorId = null;
   let currentSnapshot = null;
   let pendingModalAction = null;
 
@@ -402,16 +403,22 @@ export function createPopupController(options = {}) {
         els.accountSelect.value = '';
         els.accountSelect.disabled = true;
       } else {
-        const opts = accounts.map((acc) => {
+        const opts = [];
+        if (!snap.selectedAccount) {
+          const pendingOpt = doc.createElement('option');
+          pendingOpt.value = '';
+          pendingOpt.textContent = '待确认（请选择查看账号）';
+          opts.push(pendingOpt);
+        }
+        for (const acc of accounts) {
           const opt = doc.createElement('option');
           opt.value = acc.actorUserId;
           opt.textContent = formatAccountOptionLabel(acc, snap.activeTabActorUserId);
-          return opt;
-        });
+          opts.push(opt);
+        }
         els.accountSelect.replaceChildren(...opts);
         els.accountSelect.disabled = false;
-        const selectedId = snap.selectedAccount ? snap.selectedAccount.actorUserId : accounts[0].actorUserId;
-        els.accountSelect.value = selectedId;
+        els.accountSelect.value = snap.selectedAccount ? snap.selectedAccount.actorUserId : '';
       }
     }
 
@@ -443,6 +450,8 @@ export function createPopupController(options = {}) {
     const msg = { type: 'GET_POPUP_SNAPSHOT' };
     if (isValidDecimalId(userSelectedActorId)) {
       msg.preferredActorUserId = userSelectedActorId;
+    } else if (isValidDecimalId(lastViewedActorId)) {
+      msg.fallbackActorUserId = lastViewedActorId;
     }
     const snap = await sendToBackground(msg);
     if (
@@ -452,6 +461,9 @@ export function createPopupController(options = {}) {
       (!snap.selectedAccount || snap.selectedAccount.actorUserId !== userSelectedActorId)
     ) {
       userSelectedActorId = null;
+    }
+    if (snap && snap.ok) {
+      lastViewedActorId = snap.selectedAccount ? snap.selectedAccount.actorUserId : null;
     }
     renderSnapshot(snap);
     return snap;
@@ -677,6 +689,9 @@ export function createPopupController(options = {}) {
             if (userSelectedActorId === action.actorUserId) {
               userSelectedActorId = null;
             }
+            if (lastViewedActorId === action.actorUserId) {
+              lastViewedActorId = null;
+            }
             showFeedback('已清空指定账号数据');
           } else {
             showFeedback((res && res.message) || '清空账号失败');
@@ -689,6 +704,7 @@ export function createPopupController(options = {}) {
           const res = await sendToBackground({ type: 'CLEAR_ALL' });
           closeModal();
           userSelectedActorId = null;
+          lastViewedActorId = null;
           if (res && res.ok) {
             showFeedback('已清空全部数据并暂停采集');
           } else {

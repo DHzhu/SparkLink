@@ -3153,6 +3153,13 @@ test('[P1] Shallow-copying window.__INITIAL_STATE__ without changing account fie
   assert.equal(snapAfterResume.viewerStatus, 'unconfirmed');
   assert.equal(snapAfterResume.activeTabActorUserId, null);
   assert.equal(popupNodes.get('viewer-status-badge').textContent, '账号待确认');
+  assert.equal(
+    snapAfterResume.selectedAccount && snapAfterResume.selectedAccount.actorUserId,
+    '9009009',
+    'Open Popup viewing Account B (0 replies) must NOT auto-switch to Account A (1 reply) during 账号待确认'
+  );
+  assert.equal(popupNodes.get('account-select').value, '9009009');
+  assert.equal(popupNodes.get('stat-total-replies').textContent, '0');
 
   // 5. Fresh Viewer for B confirms B and records B's reply (+1)
   currentReplyPayload = replyForB;
@@ -4240,6 +4247,153 @@ test(
     }
   }
 );
+
+test('[P2] Unconfirmed state retains previously viewed Account B in open/reopened Popup and awaits explicit user choice on brand-new unconfirmed tabs instead of auto-switching to savedAccounts[0] (Account A)', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_popup_unconfirmed_retain';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const tabBSender = {
+    id: EXT_ID,
+    tab: { id: 105, active: true },
+    frameId: 0,
+    documentId: 'doc_105_b',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+  const freshTabSender = {
+    id: EXT_ID,
+    tab: { id: 106, active: true },
+    frameId: 0,
+    documentId: 'doc_106_fresh',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  let fgTabId = 105;
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: fgTabId, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  // 1. Seed Account A ('1001001', 1 reply) and bind Tab 105 to Account B ('9009009', 0 replies)
+  const enable1 = await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  await bg.handleMessage({ type: 'HELLO' }, tabBSender);
+  const bindA = await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: enable1.settings.captureSessionId,
+      viewer: { actorUserId: '1001001', handle: 'alice_first', displayName: 'Alice' }
+    },
+    tabBSender
+  );
+  await bg.handleMessage(
+    {
+      type: 'SUBMIT_OBSERVED_BATCH',
+      bindingContext: bindA.bindingContext,
+      events: [
+        {
+          actorUserId: '1001001',
+          replyTweetId: '2122147641553894001',
+          parentTweetId: '2121785253688246272',
+          targetUserId: '2002002',
+          targetHandle: 'friend_1',
+          targetDisplayName: 'Friend 1',
+          createdAt: NOW_MS - 2000,
+          observedAt: NOW_MS - 1000,
+          source: 'live'
+        }
+      ]
+    },
+    tabBSender
+  );
+  await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: enable1.settings.captureSessionId,
+      viewer: { actorUserId: '9009009', handle: 'bob_second', displayName: 'Bob' }
+    },
+    tabBSender
+  );
+
+  // 2. Open Popup -> displays Account B (0 replies), user never touches account-select
+  const { doc: popupDoc, nodes: popupNodes } = createPopupDomHarness();
+  const popup = createPopupController({
+    document: popupDoc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const snapInitial = await popup.init();
+  assert.equal(snapInitial.viewerStatus, 'bound');
+  assert.equal(snapInitial.selectedAccount.actorUserId, '9009009');
+  assert.equal(popupNodes.get('account-select').value, '9009009');
+  assert.equal(popupNodes.get('stat-total-replies').textContent, '0');
+
+  // 3. Click Pause then Resume inside the SAME open Popup -> viewerStatus is 账号待确认, MUST retain Account B (0 replies)!
+  popupNodes.get('collection-toggle').checked = false;
+  await popupNodes.get('collection-toggle').trigger('change');
+  assert.equal(popupNodes.get('viewer-status-badge').textContent, '已暂停');
+  assert.equal(popupNodes.get('account-select').value, '9009009');
+  assert.equal(popupNodes.get('stat-total-replies').textContent, '0');
+
+  popupNodes.get('collection-toggle').checked = true;
+  await popupNodes.get('collection-toggle').trigger('change');
+  assert.equal(popupNodes.get('viewer-status-badge').textContent, '账号待确认');
+  assert.equal(popupNodes.get('account-select').value, '9009009');
+  assert.equal(popupNodes.get('stat-total-replies').textContent, '0');
+
+  // 4. Reopen a brand-new Popup panel on the SAME Tab 105 while still unconfirmed -> still retains Tab 105's last confirmed Account B!
+  const { doc: reopenedDoc, nodes: reopenedNodes } = createPopupDomHarness();
+  const reopenedPopup = createPopupController({
+    document: reopenedDoc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const snapReopened = await reopenedPopup.init();
+  assert.equal(snapReopened.viewerStatus, 'unconfirmed');
+  assert.equal(snapReopened.selectedAccount.actorUserId, '9009009');
+  assert.equal(reopenedNodes.get('account-select').value, '9009009');
+  assert.equal(reopenedNodes.get('stat-total-replies').textContent, '0');
+
+  // 5. Switch foreground to a brand-new unconfirmed X Tab 106 (never bound any account) and open a fresh Popup ->
+  //    MUST NOT auto-select savedAccounts[0] (Account A), instead awaits confirmation or explicit user selection!
+  fgTabId = 106;
+  await bg.handleMessage({ type: 'HELLO' }, freshTabSender);
+  const { doc: freshPopupDoc, nodes: freshPopupNodes } = createPopupDomHarness();
+  const freshPopup = createPopupController({
+    document: freshPopupDoc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const snapFreshUnconfirmed = await freshPopup.init();
+  assert.equal(snapFreshUnconfirmed.viewerStatus, 'unconfirmed');
+  assert.equal(snapFreshUnconfirmed.selectedAccount, null);
+  assert.equal(freshPopupNodes.get('account-select').value, '');
+  assert.equal(freshPopupNodes.get('stat-total-replies').textContent, '0');
+  assert.equal(freshPopupNodes.get('btn-clear-account').disabled, true);
+
+  // User explicitly chooses Account A in dropdown -> now displays Account A's 1 reply!
+  freshPopupNodes.get('account-select').value = '1001001';
+  await freshPopupNodes.get('account-select').trigger('change');
+  assert.equal(freshPopupNodes.get('account-select').value, '1001001');
+  assert.equal(freshPopupNodes.get('stat-total-replies').textContent, '1');
+});
 
 
 

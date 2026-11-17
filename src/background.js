@@ -332,23 +332,31 @@ export function createBackgroundService(chromeApi, options = {}) {
     if (!ctrl.ok) {
       return {
         activeActorUserId: null,
+        lastConfirmedActorUserId: null,
         viewerStatus: 'storage_error',
         diagnostics: emptyDiagnostics()
       };
     }
 
+    const fgEntry = await resolveForegroundTabEntry();
+    const lastConfirmedActorUserId =
+      fgEntry && isValidDecimalId(fgEntry.lastConfirmedActorUserId)
+        ? fgEntry.lastConfirmedActorUserId
+        : null;
+
     if (!ctrl.settings.collectionEnabled) {
       return {
         activeActorUserId: null,
+        lastConfirmedActorUserId,
         viewerStatus: 'paused',
         diagnostics: emptyDiagnostics()
       };
     }
 
-    const fgEntry = await resolveForegroundTabEntry();
     if (!fgEntry) {
       return {
         activeActorUserId: null,
+        lastConfirmedActorUserId: null,
         viewerStatus: 'no_x_tab',
         diagnostics: emptyDiagnostics()
       };
@@ -369,6 +377,7 @@ export function createBackgroundService(chromeApi, options = {}) {
     if (fgEntry.bindingContext && bindingMatchesState(fgEntry.bindingContext, ctrl)) {
       return {
         activeActorUserId: fgEntry.bindingContext.actorUserId,
+        lastConfirmedActorUserId: fgEntry.bindingContext.actorUserId,
         viewerStatus: 'bound',
         diagnostics
       };
@@ -376,6 +385,7 @@ export function createBackgroundService(chromeApi, options = {}) {
 
     return {
       activeActorUserId: null,
+      lastConfirmedActorUserId,
       viewerStatus: 'unconfirmed',
       diagnostics
     };
@@ -384,10 +394,19 @@ export function createBackgroundService(chromeApi, options = {}) {
   async function handlePopupMessage(msg) {
     if (msg.type === 'GET_POPUP_SNAPSHOT') {
       const ctx = await resolveActivePopupContext();
-      const preferredId = isValidDecimalId(msg.preferredActorUserId)
-        ? msg.preferredActorUserId
-        : ctx.activeActorUserId;
-      const snap = await storage.getPopupSnapshot(preferredId);
+      let preferredId = null;
+      if (isValidDecimalId(msg.preferredActorUserId)) {
+        preferredId = msg.preferredActorUserId;
+      } else if (ctx.activeActorUserId) {
+        preferredId = ctx.activeActorUserId;
+      } else if (isValidDecimalId(msg.fallbackActorUserId)) {
+        preferredId = msg.fallbackActorUserId;
+      } else if (ctx.lastConfirmedActorUserId) {
+        preferredId = ctx.lastConfirmedActorUserId;
+      }
+      const snap = await storage.getPopupSnapshot(preferredId, undefined, {
+        allowDefaultFallback: ctx.viewerStatus !== 'unconfirmed'
+      });
       if (!snap.ok) {
         return snap;
       }
@@ -455,6 +474,9 @@ export function createBackgroundService(chromeApi, options = {}) {
         }
         const affectedTabIds = [];
         for (const entry of sessionTabsCache.values()) {
+          if (entry.lastConfirmedActorUserId === actorId) {
+            entry.lastConfirmedActorUserId = null;
+          }
           if (entry.bindingContext && entry.bindingContext.actorUserId === actorId) {
             const oldBindingId = entry.bindingContext.bindingId;
             entry.bindingContext = null;
@@ -528,12 +550,20 @@ export function createBackgroundService(chromeApi, options = {}) {
           restoredBinding = existing.bindingContext;
         }
 
+        const sameDoc = Boolean(existing && existing.documentId === xSender.documentId);
+        const preservedLastActorId = restoredBinding
+          ? restoredBinding.actorUserId
+          : sameDoc && isValidDecimalId(existing.lastConfirmedActorUserId)
+          ? existing.lastConfirmedActorUserId
+          : null;
+
         upsertSessionTab(xSender.tabKey, {
           tabId: xSender.tabId,
           active: xSender.active,
           documentId: xSender.documentId,
           origin: xSender.origin,
           bindingContext: restoredBinding,
+          lastConfirmedActorUserId: preservedLastActorId,
           diagnostics: restoredBinding && existing ? existing.diagnostics : null,
           updatedAt: nowFn()
         });
@@ -591,6 +621,7 @@ export function createBackgroundService(chromeApi, options = {}) {
         ) {
           syncExclusiveActiveTab(xSender.tabKey, xSender.active);
           existing.active = xSender.active;
+          existing.lastConfirmedActorUserId = msg.viewer.actorUserId;
           existing.updatedAt = nowFn();
           await persistSessionTabs();
           return {
@@ -614,6 +645,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           documentId: xSender.documentId,
           origin: xSender.origin,
           bindingContext,
+          lastConfirmedActorUserId: msg.viewer.actorUserId,
           diagnostics: null,
           updatedAt: nowFn()
         });

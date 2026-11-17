@@ -976,9 +976,11 @@ export function createStorageController(storageArea, options = {}) {
       };
     },
 
-    async getPopupSnapshot(preferredActorUserId, explicitNowMs) {
+    async getPopupSnapshot(preferredActorUserId, explicitNowMs, options) {
       await ensureInitialized();
       const now = isValidTimestampMs(explicitNowMs) ? explicitNowMs : nowFn();
+      const allowDefaultFallback =
+        !isPlainObject(options) || options.allowDefaultFallback !== false;
       if (corruptedReason || !cachedState) {
         return {
           ok: false,
@@ -1003,7 +1005,7 @@ export function createStorageController(storageArea, options = {}) {
       let selectedId = null;
       if (preferredActorUserId && cachedState.accounts[preferredActorUserId]) {
         selectedId = preferredActorUserId;
-      } else if (savedAccounts.length > 0) {
+      } else if (allowDefaultFallback && savedAccounts.length > 0) {
         selectedId = savedAccounts[0].actorUserId;
       }
 

@@ -5044,6 +5044,168 @@ test(
   }
 );
 
+test('[P2] Popup provenance isolation: Pause -> Resume and Paused -> Enable on a never-bound tab never leak default savedAccounts[0] into unconfirmed state, while manual choice and confirmed tabs stay retained', async () => {
+  const NOW_MS = 1794794402000;
+  const EXT_ID = 'sparklink_remed_popup_provenance';
+  const POPUP_SENDER = { id: EXT_ID, url: `chrome-extension://${EXT_ID}/src/popup/popup.html` };
+  const seedTabSender = {
+    id: EXT_ID,
+    tab: { id: 301, active: true },
+    frameId: 0,
+    documentId: 'doc_301_seed',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+  const neverBoundTabSender = {
+    id: EXT_ID,
+    tab: { id: 302, active: true },
+    frameId: 0,
+    documentId: 'doc_302_never_bound',
+    origin: 'https://x.com',
+    url: 'https://x.com/home'
+  };
+
+  let fgTabId = 301;
+  const localArea = createMockArea();
+  const sessionArea = createMockArea();
+
+  const bg = createBackgroundService(
+    {
+      storage: { local: localArea, session: sessionArea },
+      runtime: {
+        id: EXT_ID,
+        getURL: (p) => `chrome-extension://${EXT_ID}/${p.replace(/^\//, '')}`,
+        onMessage: { addListener() {} }
+      },
+      tabs: {
+        async query() {
+          return [{ id: fgTabId, active: true }];
+        },
+        async sendMessage(_tabId, msg) {
+          if (msg && msg.type === 'PING_X_TAB') return { ok: true, alive: true };
+          return undefined;
+        },
+        onRemoved: { addListener() {} }
+      }
+    },
+    { nowFn: () => NOW_MS }
+  );
+
+  // Seed Account A ('1001001', 1 reply) and Account B ('9009009', 0 replies)
+  const enableRes = await bg.handleMessage(
+    { type: 'SET_COLLECTION_ENABLED', enabled: true },
+    POPUP_SENDER
+  );
+  await bg.handleMessage({ type: 'HELLO' }, seedTabSender);
+  const bindA = await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: enableRes.settings.captureSessionId,
+      viewer: { actorUserId: '1001001', handle: 'alice_first', displayName: 'Alice' }
+    },
+    seedTabSender
+  );
+  await bg.handleMessage(
+    {
+      type: 'SUBMIT_OBSERVED_BATCH',
+      bindingContext: bindA.bindingContext,
+      events: [
+        {
+          actorUserId: '1001001',
+          replyTweetId: '2122147641553981001',
+          parentTweetId: '2121785253688246272',
+          targetUserId: '2002002',
+          targetHandle: 'friend_1',
+          targetDisplayName: 'Friend 1',
+          createdAt: NOW_MS - 2000,
+          observedAt: NOW_MS - 1000,
+          source: 'live'
+        }
+      ]
+    },
+    seedTabSender
+  );
+  await bg.handleMessage(
+    {
+      type: 'BIND_VIEWER',
+      captureSessionId: enableRes.settings.captureSessionId,
+      viewer: { actorUserId: '9009009', handle: 'bob_second', displayName: 'Bob' }
+    },
+    seedTabSender
+  );
+
+  // 1. Switch foreground to brand-new Tab 302 (never bound any account) while collection is enabled
+  fgTabId = 302;
+  await bg.handleMessage({ type: 'HELLO' }, neverBoundTabSender);
+
+  const { doc: p1Doc, nodes: p1Nodes } = createPopupDomHarness();
+  const popup1 = createPopupController({
+    document: p1Doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const s1Init = await popup1.init();
+  assert.equal(s1Init.viewerStatus, 'unconfirmed');
+  assert.equal(p1Nodes.get('account-select').value, '');
+  assert.equal(p1Nodes.get('stat-total-replies').textContent, '0');
+  assert.equal(p1Nodes.get('btn-clear-account').disabled, true);
+
+  // 2. Finding #2: User clicks Pause (while paused, Popup displays savedAccounts[0] = A for offline viewing),
+  //    then clicks Resume -> MUST return to unselected placeholder ('', 0 replies, Clear Account disabled)!
+  p1Nodes.get('collection-toggle').checked = false;
+  await p1Nodes.get('collection-toggle').trigger('change');
+  assert.equal(p1Nodes.get('viewer-status-badge').textContent, '已暂停');
+  assert.equal(p1Nodes.get('account-select').value, '1001001');
+  assert.equal(p1Nodes.get('stat-total-replies').textContent, '1');
+
+  p1Nodes.get('collection-toggle').checked = true;
+  await p1Nodes.get('collection-toggle').trigger('change');
+  assert.equal(p1Nodes.get('viewer-status-badge').textContent, '账号待确认');
+  assert.equal(
+    p1Nodes.get('account-select').value,
+    '',
+    'Pause -> Resume on a never-bound tab must NOT leak paused default Account A into unconfirmed state'
+  );
+  assert.equal(p1Nodes.get('stat-total-replies').textContent, '0');
+  assert.equal(p1Nodes.get('btn-clear-account').disabled, true);
+
+  // 3. Audit Cousin B1: Pause collection, close Popup, open a brand-new Popup WHILE PAUSED on Tab 302 (shows default A),
+  //    then click Enable -> MUST also show unselected placeholder ('', 0 replies, Clear Account disabled)!
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  const { doc: p2Doc, nodes: p2Nodes } = createPopupDomHarness();
+  const popup2 = createPopupController({
+    document: p2Doc,
+    runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
+  });
+  const s2PausedInit = await popup2.init();
+  assert.equal(s2PausedInit.viewerStatus, 'paused');
+  assert.equal(p2Nodes.get('account-select').value, '1001001');
+
+  p2Nodes.get('collection-toggle').checked = true;
+  await p2Nodes.get('collection-toggle').trigger('change');
+  assert.equal(p2Nodes.get('viewer-status-badge').textContent, '账号待确认');
+  assert.equal(
+    p2Nodes.get('account-select').value,
+    '',
+    'Opening Popup while paused on a never-bound tab and clicking Enable must NOT leak default Account A'
+  );
+  assert.equal(p2Nodes.get('stat-total-replies').textContent, '0');
+  assert.equal(p2Nodes.get('btn-clear-account').disabled, true);
+
+  // 4. Explicit user dropdown selection IS preserved across Pause -> Resume even on a never-bound tab!
+  p2Nodes.get('account-select').value = '1001001';
+  await p2Nodes.get('account-select').trigger('change');
+  assert.equal(p2Nodes.get('account-select').value, '1001001');
+  assert.equal(p2Nodes.get('stat-total-replies').textContent, '1');
+  assert.equal(p2Nodes.get('btn-clear-account').disabled, false);
+
+  p2Nodes.get('collection-toggle').checked = false;
+  await p2Nodes.get('collection-toggle').trigger('change');
+  p2Nodes.get('collection-toggle').checked = true;
+  await p2Nodes.get('collection-toggle').trigger('change');
+  assert.equal(p2Nodes.get('account-select').value, '1001001');
+  assert.equal(p2Nodes.get('stat-total-replies').textContent, '1');
+});
+
 
 
 

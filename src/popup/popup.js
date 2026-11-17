@@ -94,7 +94,7 @@ export function createPopupController(options = {}) {
   };
 
   let userSelectedActorId = null;
-  let lastViewedActorId = null;
+  let confirmedViewedActorId = null;
   let currentSnapshot = null;
   let pendingModalAction = null;
 
@@ -450,8 +450,8 @@ export function createPopupController(options = {}) {
     const msg = { type: 'GET_POPUP_SNAPSHOT' };
     if (isValidDecimalId(userSelectedActorId)) {
       msg.preferredActorUserId = userSelectedActorId;
-    } else if (isValidDecimalId(lastViewedActorId)) {
-      msg.fallbackActorUserId = lastViewedActorId;
+    } else if (isValidDecimalId(confirmedViewedActorId)) {
+      msg.fallbackActorUserId = confirmedViewedActorId;
     }
     const snap = await sendToBackground(msg);
     if (
@@ -463,7 +463,17 @@ export function createPopupController(options = {}) {
       userSelectedActorId = null;
     }
     if (snap && snap.ok) {
-      lastViewedActorId = snap.selectedAccount ? snap.selectedAccount.actorUserId : null;
+      if (snap.viewerStatus === 'bound' && isValidDecimalId(snap.activeTabActorUserId)) {
+        confirmedViewedActorId = snap.activeTabActorUserId;
+      } else if (isValidDecimalId(snap.confirmedTabActorUserId)) {
+        confirmedViewedActorId = snap.confirmedTabActorUserId;
+      } else if (
+        confirmedViewedActorId &&
+        (!Array.isArray(snap.savedAccounts) ||
+          !snap.savedAccounts.some((acc) => acc.actorUserId === confirmedViewedActorId))
+      ) {
+        confirmedViewedActorId = null;
+      }
     }
     renderSnapshot(snap);
     return snap;
@@ -689,8 +699,8 @@ export function createPopupController(options = {}) {
             if (userSelectedActorId === action.actorUserId) {
               userSelectedActorId = null;
             }
-            if (lastViewedActorId === action.actorUserId) {
-              lastViewedActorId = null;
+            if (confirmedViewedActorId === action.actorUserId) {
+              confirmedViewedActorId = null;
             }
             showFeedback('已清空指定账号数据');
           } else {
@@ -704,7 +714,7 @@ export function createPopupController(options = {}) {
           const res = await sendToBackground({ type: 'CLEAR_ALL' });
           closeModal();
           userSelectedActorId = null;
-          lastViewedActorId = null;
+          confirmedViewedActorId = null;
           if (res && res.ok) {
             showFeedback('已清空全部数据并暂停采集');
           } else {

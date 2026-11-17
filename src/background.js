@@ -413,6 +413,7 @@ export function createBackgroundService(chromeApi, options = {}) {
       return {
         ...snap,
         activeTabActorUserId: ctx.activeActorUserId,
+        confirmedTabActorUserId: ctx.activeActorUserId || ctx.lastConfirmedActorUserId || null,
         viewerStatus: ctx.viewerStatus,
         diagnostics: ctx.diagnostics
       };

@@ -67,7 +67,7 @@ Popup 的概览标题和覆盖说明使用以下文案。
 
 概览、排行和徽章都按当前账号窗口内的唯一回复计数。“最近回复时间”取这些记录中最大的 `createdAt`，空集合显示“尚无已记录回复”。备份里的时间可能来自另一台设备。页面缓存、接口变更和未加载的历史都会影响覆盖程度，首版不计算本机观测时长或历史完成百分比。
 
-日常浏览采用被动观测。只有用户从 Popup 启动七天同步时，扩展才在非活动标签页进入本人回复列表，按游标低频分页。缺少可用分页入口时，在同一标签页按日期读取 X 的最新搜索结果。
+日常浏览采用被动观测。只有用户从 Popup 启动七天同步时，扩展才打开并切换到专用前台标签页进入本人回复列表，仅通过受限速的原生页面滚动触发 X 自身前端加载分页并被动拦截响应。缺少可用分页入口时，在同一前台标签页按 UTC 日期读取 X 的最新搜索结果并同样通过原生滚动翻页。
 
 跨设备自动同步、安装前完整历史或双向互动统计，需要另行设计数据来源与授权方案。
 
@@ -189,11 +189,11 @@ Service Worker 按事件唤醒。每次启动先读取持久化状态，按第 6
 
 #### User-initiated seven-day sync
 
-- 开启采集并确认当前账号后，用户在 Popup 的“数据管理”点击“同步近 7 天回复”。后台只允许一个任务。非活动标签页先打开本人主页，确认账号和采集会话后进入页面已有的“回复”链接。
+- 开启采集并确认当前账号后，用户在 Popup 的“数据管理”点击“同步近 7 天回复”。后台只允许一个任务。扩展打开并激活专用前台标签页（同步期间需停留在该标签页以确保浏览器视口布局与无限滚动回调生效），先进入本人主页，确认账号和采集会话后进入页面已有的“回复”链接。
 - 以点击时刻为截止点，按服务端创建时间纳入闭区间内最近 168 小时的本人回复。后台核对任务、标签页、文档及绑定，按回复 ID 增量合并。徽章和排行继续使用 30 天窗口。
-- The dedicated tab first opens the native Replies link. For a verified `UserTweetsAndReplies` GET, the page can request the next bottom cursor against the same observed operation and actor. The extension worker grants one advance per acknowledged page. The page keeps the request and cursor in memory, rejects redirects and repeated cursors, and drops the transport on termination. Request-specific signatures and XHR-specific header values are not reconstructed.
-- When no usable first page appears within 45 seconds, or a valid page has no usable continuation, reuse that tab for one X Latest search result page per UTC date. The exact query restricts the author, replies and dates. Independently verify author ID, direct reply fields and the inclusive 168-hour window before writing. Search coverage depends on indexing and the first batch returned for each date. A recognized empty batch counts as a read. A missing response, an incompatible payload or an unconfirmed viewer is reported separately.
-- Wait at least 12 seconds between outbound advances, limit a run to eight accepted pages and five minutes, and retain a 15-minute start cooldown. The tab can stay in the background for both paths. No scrolling or separate API key is required.
+- 专用标签页仅依赖页面原生滚动触发 X 前端自身签发的分页请求（携带动态 `x-client-transaction-id`），扩展绝不自行构造、重放任何 GraphQL 请求，也不读取 Cookie、`ct0` 或鉴权请求头。后台对每个已确认页面仅授予一次翻页推进；主环境在触发滚动前即将当前底部游标标记为已消费，拒绝重复游标并在任务结束时清空内存游标状态。
+- 若 45 秒内未读到可用首页，或当前时间线已无后续分页且尚未跨越 7 天边界，则复用同一专用标签页按 UTC 日期打开 X 最新搜索页（限定作者、回复与单日区间），并在单日结果存在后续游标时同样通过受限速的原生滚动翻页，读完当日后再推进到前一日。写入前独立校验作者 ID、直接回复字段及闭区间 168 小时窗口。已识别的空结果集计为当日已读；缺失响应、不兼容载荷或账号失验分别上报。
+- 相邻推进至少间隔 12 秒，时间线阶段最多 8 页、按日搜索阶段最多 32 次推进，单次任务总时限 5 分钟，并保留 15 分钟启动冷却。同步诊断日志默认静默关闭，仅在用户在 Popup“数据管理”中显式开启“调试日志”开关时输出至控制台。
 - 两次手动启动至少相隔 15 分钟，冷却时间在浏览器重启后保留。遇到 HTTP 429、已识别的限流错误或登录验证要求时停止并冷却至少 1 小时。若服务器通过 `Retry-After` 或 `x-rate-limit-reset` 指定更晚时间，按更晚时间执行。服务不可用时也停止并尊重服务器指定的等待时间。[X 限流响应头说明](https://docs.x.com/x-api/fundamentals/rate-limits#checking-your-limits)
 - 用户可停止任务。关闭专用页、离开任务页面、暂停采集或账号变化会终止任务。已写入的记录保留，Popup 展示已读页数、新增、重复、停止原因和可再次启动的时间。冷却到期只恢复按钮，下一次同步仍由用户发起。
 
@@ -627,7 +627,7 @@ Popup 使用外部本地脚本，不使用内联事件处理或 eval。首版不
 
 | 机制 | x-mutual-checker v1.9.3 | SparkLink 首版规格 |
 | --- | --- | --- |
-| 数据从哪里来 | 用户启动扫描后，扩展主动分页读取关注列表，也可使用自动滚动回退。[扫描入口](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/inject.js#L303-L360) | 读取 X 本身加载的回复数据。普通浏览被动记录，手动七天同步在专用页限速加载。 |
+| 数据从哪里来 | 用户启动扫描后，扩展主动分页读取关注列表，也可使用自动滚动回退。[扫描入口](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/inject.js#L303-L360) | 读取 X 本身加载的回复数据。普通浏览被动记录，手动七天同步在专用前台标签页通过限速原生滚动触发页面自身加载并被动拦截响应，不自建或重放接口请求。 |
 | 保存什么 | Content Script 按当前账号写入互关、未回关和取关等状态，再与下次扫描结果比较。[存储结构](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/content.js#L104-L120) | Service Worker 串行保存每条成功回复，按回复 ID 去重。徽章和排行榜从窗口内的事件计算。 |
 | 页面如何接入 | 页面主执行环境在文档开始时注入，隔离环境的 Content Script 在页面空闲时加载。[扩展清单](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/manifest.json#L17-L40) | 主执行环境与隔离环境的消息桥都在文档开始时注入。绑定当前账号后才接收观测，徽章在页面空闲时初始化。 |
 

@@ -5,8 +5,6 @@ import {
 } from '../schema.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
-const FLAME_PATH_D =
-  'M8.6 1.2c.3 2.1-.6 3.5-1.8 4.8-1.1 1.2-2.1 2.4-2.1 4.2 0 2.3 1.8 4.1 4.1 4.1 2.6 0 4.5-2.1 4.5-4.8 0-2.6-1.6-4.7-3.1-6.1-.2 1.1-.8 1.9-1.6 2.4.3-1.4.4-2.9 0-4.6z';
 
 function pad2(num) {
   return String(num).padStart(2, '0');
@@ -42,13 +40,18 @@ function deriveAvatarInitial(entry) {
 
 function createFlameSvg(doc) {
   const svg = doc.createElementNS(SVG_NS, 'svg');
-  svg.setAttribute('viewBox', '0 0 16 16');
-  svg.setAttribute('width', '12');
-  svg.setAttribute('height', '12');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('class', 'sparklink-fire-art');
   svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  const core = doc.createElementNS(SVG_NS, 'circle');
+  core.setAttribute('class', 'sparklink-fire-core');
+  core.setAttribute('cx', '12');
+  core.setAttribute('cy', '12');
+  core.setAttribute('r', '9.5');
+  svg.appendChild(core);
   const path = doc.createElementNS(SVG_NS, 'path');
-  path.setAttribute('d', FLAME_PATH_D);
-  path.setAttribute('fill', 'currentColor');
+  path.setAttribute('class', 'sparklink-fire-shape');
   svg.appendChild(path);
   return svg;
 }
@@ -80,6 +83,8 @@ export function createPopupController(options = {}) {
     top20List: doc.getElementById('top20-list'),
     top20Empty: doc.getElementById('top20-empty'),
     btnCleanup: doc.getElementById('btn-cleanup'),
+    btnHistorySync: doc.getElementById('btn-history-sync'),
+    historyStatus: doc.getElementById('history-sync-status'),
     btnExport: doc.getElementById('btn-export'),
     btnImport: doc.getElementById('btn-import'),
     fileImport: doc.getElementById('file-import'),
@@ -97,7 +102,9 @@ export function createPopupController(options = {}) {
   let userSelectedWhenActiveActorId = null;
   let confirmedViewedActorId = null;
   let currentSnapshot = null;
+  let refreshSeq = 0;
   let pendingModalAction = null;
+  let syncDeadlineTimer = null;
 
   async function sendToBackground(payload) {
     try {
@@ -344,7 +351,7 @@ export function createPopupController(options = {}) {
       const tierLabel = entry.tierInfo ? entry.tierInfo.label : '初识互动';
 
       const pill = doc.createElement('span');
-      pill.className = `tier-pill tier-pill-${tierKey}`;
+      pill.className = `tier-pill sparklink-tier-${tierKey}`;
       pill.setAttribute(
         'title',
         entry.tierInfo && entry.tierInfo.tooltip ? entry.tierInfo.tooltip : tierLabel
@@ -352,10 +359,13 @@ export function createPopupController(options = {}) {
       pill.appendChild(createFlameSvg(doc));
 
       const pillText = doc.createElement('span');
-      pillText.textContent = `${tierLabel} · ${entry.count}`;
+      pillText.textContent = tierLabel;
       pill.appendChild(pillText);
 
+      const count = doc.createElement('span');
+      count.textContent = `${entry.count} 次`;
       right.appendChild(pill);
+      right.appendChild(count);
       li.appendChild(left);
       li.appendChild(right);
       return li;
@@ -364,8 +374,65 @@ export function createPopupController(options = {}) {
     els.top20List.replaceChildren(...rows);
   }
 
+  function isCurrentClearTarget(action, snap) {
+    const account = snap?.selectedAccount;
+    return Boolean(
+      snap?.ok && account &&
+      account.actorUserId === action.actorUserId &&
+      account.accountGeneration === action.accountGeneration
+    );
+  }
+
+  function renderHistorySync(snap) {
+    if (!els.btnHistorySync || !els.historyStatus) return;
+    clearTimeout(syncDeadlineTimer);
+    const job = snap?.historySync;
+    const running = job?.status === 'running';
+    const canStart = snap?.viewerStatus === 'bound' && snap?.settings?.collectionEnabled &&
+      snap.selectedAccount?.handle && snap.selectedAccount.actorUserId === snap.activeTabActorUserId;
+    const wait = (snap?.historyNextStart || 0) - Date.now();
+    const cooling = !running && wait > 0;
+    const resumeTime = cooling ? new Date(snap.historyNextStart).toLocaleString('zh-CN',
+      { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+    const cooldownText = cooling ? ' 可于 ' + resumeTime + ' 后再次手动同步。' : '';
+    if (cooling) {
+      syncDeadlineTimer = setTimeout(refresh, Math.min(wait + 100, 2147483647));
+      syncDeadlineTimer.unref?.();
+    }
+    els.btnHistorySync.disabled = !running && (!canStart || cooling);
+    els.btnHistorySync.textContent = running ? '停止同步' : '同步近 7 天回复';
+    if (!job) {
+      els.historyStatus.textContent = (canStart ? '将在后台分页读取本人回复。可以关闭弹窗。' : '开启采集并选中当前 X 页的账号后可同步。') + cooldownText;
+      return;
+    }
+    const reasons = {
+      rate_limited: 'X 已限流，同步已停止', verification: 'X 要求登录或验证，同步已停止', unavailable: 'X 暂时无法加载回复',
+      searched: '已查完各日期的首批搜索结果，可能有遗漏', search_stalled: '未读到当日搜索结果，无法判断当天是否有回复',
+      first_page: '未读到回复列表第一页', end: '已读到列表末尾', boundary: '已读到 7 天边界', cancelled: '已停止',
+      unrecognized: '部分回复无法识别', stalled: '页面未返回更多回复', timeout: '已达到本次读取时限',
+      page_limit: '已达到本次读取上限，可能有遗漏', account_changed: '账号或采集会话已变化',
+      navigation: '页面已离开或无法打开回复页', closed: '同步标签页已关闭',
+      paused: '采集已暂停', storage: '本地存储写入失败'
+    };
+    const state = running ? '正在同步' : job.status === 'partial' ? '部分同步' : '同步结束';
+    const progress = job.mode === 'search'
+      ? '正在后台搜索 ' + (job.searchQuery?.match(/since:(\d{4}-\d{2}-\d{2})/)?.[1] || '当日') + ' 的首批回复'
+      : '正在后台读取本人回复列表';
+    const detail = running ? progress : reasons[job.reason] || '已停止';
+    els.historyStatus.textContent = `@${job.handle} ${state} · ${detail}。已读取 ${job.pages} 页，新增 ${job.added} 条，重复 ${job.duplicates} 条。${cooldownText}`;
+    if (running) {
+      syncDeadlineTimer = setTimeout(refresh, Math.max(250, job.deadline - Date.now() + 100));
+      syncDeadlineTimer.unref?.();
+    }
+  }
+
   function renderSnapshot(snap) {
     currentSnapshot = snap;
+    renderHistorySync(snap);
+    if (pendingModalAction?.type === 'CLEAR_ACCOUNT' && !isCurrentClearTarget(pendingModalAction, snap)) {
+      closeModal();
+      showFeedback('清空操作已取消，请重新核对目标账号。');
+    }
 
     if (els.overviewTitle) {
       els.overviewTitle.textContent = '近 30 天已记录的主动回复（含导入）';
@@ -448,6 +515,7 @@ export function createPopupController(options = {}) {
   }
 
   async function refresh() {
+    const seq = ++refreshSeq;
     const msg = { type: 'GET_POPUP_SNAPSHOT' };
     if (isValidDecimalId(userSelectedActorId)) {
       msg.preferredActorUserId = userSelectedActorId;
@@ -456,6 +524,9 @@ export function createPopupController(options = {}) {
       msg.fallbackActorUserId = confirmedViewedActorId;
     }
     const snap = await sendToBackground(msg);
+    if (seq !== refreshSeq) {
+      return snap;
+    }
     if (snap && snap.ok && userSelectedActorId) {
       const activeNow = isValidDecimalId(snap.activeTabActorUserId)
         ? snap.activeTabActorUserId
@@ -517,6 +588,15 @@ export function createPopupController(options = {}) {
   }
 
   function bindEvents() {
+    els.btnHistorySync?.addEventListener('click', async () => {
+      const job = currentSnapshot?.historySync;
+      els.btnHistorySync.disabled = true;
+      const res = await sendToBackground(job?.status === 'running'
+        ? { type: 'CANCEL_HISTORY_SYNC', jobId: job.id }
+        : { type: 'START_HISTORY_SYNC', actorUserId: currentSnapshot?.selectedAccount?.actorUserId });
+      if (!res?.ok) showFeedback(res?.message || '同步未启动，请重试。');
+      await refresh();
+    });
     if (els.collectionToggle) {
       els.collectionToggle.addEventListener('change', async () => {
         await setEnabled(els.collectionToggle.checked);
@@ -531,6 +611,7 @@ export function createPopupController(options = {}) {
 
     if (els.accountSelect) {
       els.accountSelect.addEventListener('change', async () => {
+        refreshSeq += 1;
         const val = els.accountSelect.value;
         const selectedId = isValidDecimalId(val) ? val : null;
         const activeAtSelect =
@@ -716,6 +797,10 @@ export function createPopupController(options = {}) {
         }
 
         if (action.type === 'CLEAR_ACCOUNT') {
+          const latest = await refresh();
+          if (action !== pendingModalAction || !isCurrentClearTarget(action, latest)) {
+            return;
+          }
           const res = await sendToBackground({
             type: 'CLEAR_ACCOUNT',
             actorUserId: action.actorUserId,
@@ -756,6 +841,25 @@ export function createPopupController(options = {}) {
   return Object.freeze({
     async init() {
       bindEvents();
+      const sessionChanges = options.sessionChanges || globalThis.chrome?.storage?.session?.onChanged;
+      sessionChanges?.addListener((changes) => {
+        if (changes.sparklink_history_sync) return refresh();
+        const change = changes.sparklink_doc_bindings;
+        if (!change) {
+          return;
+        }
+        const previous = change.oldValue || {};
+        const current = change.newValue || {};
+        const tabs = new Set([...Object.keys(previous), ...Object.keys(current)]);
+        for (const id of tabs) {
+          if (
+            previous[id]?.documentId !== current[id]?.documentId ||
+            previous[id]?.bindingContext?.bindingId !== current[id]?.bindingContext?.bindingId
+          ) {
+            return refresh();
+          }
+        }
+      });
       return refresh();
     },
     refresh

@@ -411,18 +411,17 @@ body {
   font-size: 11px;
   background: var(--bg-card);
   border: 1px solid var(--border-color);
-}
-
-.tier-pill-acquaintance {
   color: var(--text-secondary);
 }
 
-.tier-pill-active {
-  color: var(--brand-orange);
+.tier-pill .sparklink-fire-art {
+  width: 13px;
+  height: 13px;
+  margin-inline-end: 2px;
 }
 
-.tier-pill-deep {
-  color: var(--brand-deep);
+.tier-pill.sparklink-tier-deep {
+  color: var(--text-primary);
   font-weight: 700;
 }
 

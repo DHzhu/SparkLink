@@ -5644,6 +5644,7 @@ test('[P1] Post-pause resume never trusts window.__INITIAL_STATE__ ID delta alon
     let currentSwitcher = initialSwitcherEl;
     let currentViewerPayload = viewerAGraphql;
     let stateReads = 0;
+    let failHello = false;
 
     const fakeWin = {
       location: { origin: 'https://x.com', href: 'https://x.com/home' },
@@ -5719,7 +5720,13 @@ test('[P1] Post-pause resume never trusts window.__INITIAL_STATE__ ID delta alon
     const pageChrome = {
       runtime: {
         id: EXT_ID,
-        sendMessage: (msg) => bg.handleMessage(msg, sender),
+        sendMessage: (msg) => {
+          if (msg.type === 'HELLO' && failHello) {
+            failHello = false;
+            return Promise.reject(new Error('Worker temporarily unavailable'));
+          }
+          return bg.handleMessage(msg, sender);
+        },
         onMessage: {
           addListener: (fn) => runtimeListeners.add(fn),
           removeListener: (fn) => runtimeListeners.delete(fn)
@@ -5737,6 +5744,8 @@ test('[P1] Post-pause resume never trusts window.__INITIAL_STATE__ ID delta alon
       fakeWin,
       bridge,
       sender,
+      runtime: pageChrome.runtime,
+      failNextHello: () => { failHello = true; },
       setSwitcher: (el) => {
         currentSwitcher = el;
       },
@@ -5840,6 +5849,13 @@ test('[P1] Post-pause resume never trusts window.__INITIAL_STATE__ ID delta alon
   const snap402Resume = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
   assert.equal(snap402Resume.viewerStatus, 'unconfirmed');
 
+  for (const textContent of ['Editor (@second_account)', '@second_account, guest editor']) {
+    tab402.setSwitcher({ tagName: 'BUTTON', textContent });
+    tab402.fireVisibilityVisible();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(tab402.bridge.getBindingContext(), null, 'A display-name mention cannot confirm a cached viewer');
+  }
+
   // Now __INITIAL_STATE__ reflects A AND live switcher renders bidi/middle-dot `@sample_me·私密` -> visibility re-probe binds A!
   tab402.fakeWin.__INITIAL_STATE__ = structuredClone(viewerFixtures.ownProfileInitialState);
   tab402.setSwitcher({
@@ -5876,8 +5892,40 @@ test('[P1] Post-pause resume never trusts window.__INITIAL_STATE__ ID delta alon
     'Live switcher @sample_me after pause must confirm return to A even if A was superseded before pause'
   );
 
-  // Case D (BFCache pageshow persisted restore when tab binding was replaced while frozen):
+  // Freeze a Viewer message after MAIN parsed it but before the isolated world receives it.
+  const postMessage = tab402.fakeWin.postMessage;
+  let deliverFrozenEvidence;
+  tab402.fakeWin.postMessage = (data, origin) => {
+    if (data.type === 'VIEWER_EVIDENCE') {
+      deliverFrozenEvidence = () => postMessage(data, origin);
+    } else {
+      postMessage(data, origin);
+    }
+  };
+  tab402.setViewerPayload(viewerAGraphql);
+  await tab402.fakeWin.fetch('https://x.com/i/api/graphql/BeforeRestore402/Viewer');
+  await new Promise((resolve) => setImmediate(resolve));
+  tab402.fakeWin.postMessage = postMessage;
+  assert.equal(typeof deliverFrozenEvidence, 'function');
   tab402.setSwitcher(null);
+  tab402.failNextHello();
+  tab402.firePageShow(true);
+  assert.equal(tab402.bridge.getBindingContext(), null, 'Restore immediately invalidates the local binding');
+  await new Promise((resolve) => setImmediate(resolve));
+  tab402.fireVisibilityVisible();
+  await new Promise((resolve) => setImmediate(resolve));
+  const restored = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
+  assert.equal(restored.viewerStatus, 'unconfirmed', 'A retried handshake must revalidate the same cached document');
+  assert.equal(tab402.bridge.getBindingContext(), null);
+  deliverFrozenEvidence();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(tab402.bridge.getBindingContext(), null, 'A queued message from the frozen page cannot restore its binding');
+  tab402.setViewerPayload(viewerBGraphql);
+  await tab402.fakeWin.fetch('https://x.com/i/api/graphql/AfterRestore402/Viewer');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(tab402.bridge.getBindingContext()?.actorUserId, '9009009');
+
+  // Case D (BFCache pageshow persisted restore when tab binding was replaced while frozen):
   // Simulate intermediate document replacing tab 402's session entry while doc_402 was frozen in BFCache
   await bg.handleMessage(
     { type: 'HELLO' },
@@ -5893,6 +5941,31 @@ test('[P1] Post-pause resume never trusts window.__INITIAL_STATE__ ID delta alon
     null,
     'BFCache persisted restore without switcher @handle must require fresh verification rather than trusting frozen __INITIAL_STATE__'
   );
+
+  // A fresh Viewer can arrive before the restore handshake or queued cross-world notifications finish.
+  let resumeHello;
+  const helloGate = new Promise((resolve) => { resumeHello = resolve; });
+  const sendMessage = tab402.runtime.sendMessage;
+  tab402.runtime.sendMessage = async (msg) => {
+    if (msg.type === 'HELLO') await helloGate;
+    return sendMessage(msg);
+  };
+  let deliverReset;
+  tab402.fakeWin.postMessage = (data, origin) => {
+    if (data.type === 'REVOKE_BINDING' && data.bindingId === null) {
+      deliverReset = () => postMessage(data, origin);
+    } else {
+      postMessage(data, origin);
+    }
+  };
+  tab402.firePageShow(true);
+  await tab402.fakeWin.fetch('https://x.com/i/api/graphql/DuringRestore402/Viewer');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(tab402.bridge.getBindingContext(), null);
+  deliverReset?.();
+  resumeHello();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(tab402.bridge.getBindingContext()?.actorUserId, '9009009', 'The first fresh Viewer survives the handshake');
   tab402.bridge.destroy();
 });
 
@@ -6317,8 +6390,10 @@ test('[P2] Already-open Popup (both closed-and-reopened and never-closed) switch
 
   // Close Popup #1 and reopen Popup #2 while Tab 501 is STILL unconfirmed -> restores A ('1001001', 1 reply)
   const { doc: p2Doc, nodes: p2Nodes } = createPopupDomHarness();
+  let onSessionChange;
   const popup2 = createPopupController({
     document: p2Doc,
+    sessionChanges: { addListener(fn) { onSessionChange = fn; } },
     runtime: { sendMessage: (m) => bg.handleMessage(m, POPUP_SENDER) }
   });
   const snapP2Init = await popup2.init();
@@ -6332,6 +6407,9 @@ test('[P2] Already-open Popup (both closed-and-reopened and never-closed) switch
   assert.equal(p2Nodes.get('stat-total-replies').textContent, '1');
 
   // Now Tab 501 receives Viewer(B) ('9009009') while Popup #2 STAYS OPEN!
+  await p2Nodes.get('btn-clear-account').trigger('click');
+  assert.ok(p2Nodes.get('modal-body').textContent.includes('1001001'));
+  const previousBindings = sessionArea.peek().sparklink_doc_bindings;
   await bg.handleMessage(
     {
       type: 'BIND_VIEWER',
@@ -6341,13 +6419,16 @@ test('[P2] Already-open Popup (both closed-and-reopened and never-closed) switch
     tab501Sender
   );
 
-  // In the STILL-OPEN Popup #2, click "清理过期记录" -> MUST immediately switch to B ('9009009', 0 replies, 采集中)!
-  await p2Nodes.get('btn-cleanup').trigger('click');
+  assert.equal(typeof onSessionChange, 'function', 'An open Popup must subscribe to binding changes');
+  await onSessionChange({
+    sparklink_doc_bindings: { oldValue: previousBindings, newValue: sessionArea.peek().sparklink_doc_bindings }
+  });
+  assert.equal(p2Nodes.get('modal-overlay').hidden, true, 'A confirmation for the previous account must close');
   assert.equal(p2Nodes.get('viewer-status-badge').textContent, '采集中');
   assert.equal(
     p2Nodes.get('account-select').value,
     '9009009',
-    'Already-open reopened Popup must switch from manual Account A to newly bound Account B on Cleanup click'
+    'Already-open reopened Popup must switch to newly bound Account B without a click'
   );
   assert.equal(
     p2Nodes.get('stat-total-replies').textContent,
@@ -6447,11 +6528,30 @@ test('[P2] Already-open Popup (both closed-and-reopened and never-closed) switch
     '3003003',
     'Live account switch on bound tab (B -> C) must switch open Popup to newly bound Account C'
   );
+
+  p3Nodes.get('account-select').value = '1001001';
+  await p3Nodes.get('account-select').trigger('change');
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: false }, POPUP_SENDER);
+  await bg.handleMessage({ type: 'SET_COLLECTION_ENABLED', enabled: true }, POPUP_SENDER);
+  const resumed = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
+  await bg.handleMessage({
+    type: 'BIND_VIEWER',
+    captureSessionId: resumed.settings.captureSessionId,
+    viewer: { actorUserId: '3003003', handle: 'carol_third', displayName: 'Carol' }
+  }, tab502Sender);
+  await popup3.refresh();
+  assert.equal(p3Nodes.get('account-select').value, '3003003', 'New binding of the same actor ends the old manual choice');
+
+  p3Nodes.get('account-select').value = '1001001';
+  await p3Nodes.get('account-select').trigger('change');
+  await p3Nodes.get('btn-clear-account').trigger('click');
+  assert.ok(p3Nodes.get('modal-body').textContent.includes('1001001'));
+  await bg.handleMessage({ type: 'HELLO' }, { ...tab502Sender, documentId: 'doc_502_next' });
+  // Confirmation can land before the Popup receives the document-change notification.
+  await p3Nodes.get('btn-modal-confirm').trigger('click');
+  const savedA = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT', preferredActorUserId: '1001001' }, POPUP_SENDER);
+  assert.equal(savedA.selectedAccount?.summary.totalReplies, 1, 'Late confirmation must leave the previous account intact');
+  await popup3.refresh();
+  assert.equal(p3Nodes.get('account-select').value, '', 'A new unconfirmed document starts without a selection');
+  assert.equal(p3Nodes.get('btn-clear-account').disabled, true);
 });
-
-
-
-
-
-
-

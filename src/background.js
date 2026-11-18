@@ -5,6 +5,7 @@ import {
   isValidDecimalId
 } from './schema.js';
 import { createStorageController } from './storage.js';
+import { createHistorySync, describeHistorySync, matchesHistoryUrl } from './history-sync.js';
 
 const ALLOWED_X_ORIGINS = new Set(['https://x.com', 'https://twitter.com']);
 const MAX_TRACKED_TABS = 64;
@@ -12,6 +13,8 @@ const MAX_TRACKED_TABS = 64;
 const POPUP_ONLY_TYPES = new Set([
   'GET_POPUP_SNAPSHOT',
   'SET_POPUP_ACCOUNT',
+  'START_HISTORY_SYNC',
+  'CANCEL_HISTORY_SYNC',
   'SET_COLLECTION_ENABLED',
   'CLEANUP_EXPIRED',
   'EXPORT_BACKUP',
@@ -26,6 +29,10 @@ const CONTENT_SCRIPT_TYPES = new Set([
   'BIND_VIEWER',
   'REVOKE_VIEWER_BINDING',
   'SUBMIT_OBSERVED_BATCH',
+  'GET_HISTORY_SYNC_TASK',
+  'STOP_HISTORY_SYNC_TASK',
+  'ADVANCE_HISTORY_SYNC',
+  'SYNC_HISTORY_PAGE',
   'QUERY_TARGET_COUNTS',
   'REPORT_DIAGNOSTIC'
 ]);
@@ -82,6 +89,7 @@ export function createBackgroundService(chromeApi, options = {}) {
       ...options.storageOptions
     });
 
+  const history = createHistorySync(chromeApi, storage, nowFn);
   let bootPromise = null;
   let sessionTabsCache = null; // Map<string(tabId), TabSessionRecord>
   let sessionWriteTail = Promise.resolve();
@@ -266,8 +274,15 @@ export function createBackgroundService(chromeApi, options = {}) {
       tabKey: String(sender.tab.id),
       active: Boolean(sender.tab.active),
       documentId: typeof sender.documentId === 'string' && sender.documentId ? sender.documentId : null,
+      href: sender.url,
       origin: senderOrigin
     };
+  }
+
+  function scopedHistoryId(job, sender, existing) {
+    if (job?.status === 'running' && job.tabId === sender.tabId) return job.id;
+    // Retain the filter for late responses from the manual document only.
+    return existing?.documentId === sender.documentId ? existing?.historySyncId || null : null;
   }
 
   function emptyDiagnostics() {
@@ -359,6 +374,7 @@ export function createBackgroundService(chromeApi, options = {}) {
     if (!ctrl.settings.collectionEnabled) {
       return {
         activeActorUserId: null,
+        allowLocalSelection: !fgEntry,
         manualSelectedActorUserId,
         lastConfirmedActorUserId,
         viewerStatus: 'paused',
@@ -369,6 +385,7 @@ export function createBackgroundService(chromeApi, options = {}) {
     if (!fgEntry) {
       return {
         activeActorUserId: null,
+        allowLocalSelection: true,
         manualSelectedActorUserId: null,
         lastConfirmedActorUserId: null,
         viewerStatus: 'no_x_tab',
@@ -408,13 +425,31 @@ export function createBackgroundService(chromeApi, options = {}) {
   }
 
   async function handlePopupMessage(msg) {
+    if (msg.type === 'START_HISTORY_SYNC' || msg.type === 'CANCEL_HISTORY_SYNC') {
+      return enqueueSessionOp(async () => {
+        const job = await history.read();
+        if (msg.type === 'CANCEL_HISTORY_SYNC') {
+          return job?.id === msg.jobId ? history.stop(job, 'cancelled') : { ok: false, code: 'STALE_JOB' };
+        }
+        if (job?.status === 'running') return { ok: true, job: describeHistorySync(job) };
+        const entry = await resolveForegroundTabEntry();
+        const binding = entry?.bindingContext;
+        if (!binding || msg.actorUserId !== binding.actorUserId ||
+            !bindingMatchesState(binding, await storage.getControlState())) {
+          return { ok: false, message: '请在已开启采集的 X 页面确认当前账号后再同步。' };
+        }
+        const snap = await storage.getPopupSnapshot(binding.actorUserId);
+        return history.start(binding, snap.selectedAccount?.handle);
+      });
+    }
     if (msg.type === 'GET_POPUP_SNAPSHOT') {
       const ctx = await resolveActivePopupContext();
       const canHonorPreferred =
         isValidDecimalId(msg.preferredActorUserId) &&
         (msg.preferredWhenActiveActorId === undefined ||
-          !ctx.activeActorUserId ||
-          ctx.activeActorUserId === msg.preferredWhenActiveActorId);
+          ctx.allowLocalSelection ||
+          (ctx.manualSelectedActorUserId === msg.preferredActorUserId &&
+            (!ctx.activeActorUserId || ctx.activeActorUserId === msg.preferredWhenActiveActorId)));
       let preferredId = null;
       if (canHonorPreferred) {
         preferredId = msg.preferredActorUserId;
@@ -422,7 +457,7 @@ export function createBackgroundService(chromeApi, options = {}) {
         preferredId = ctx.activeActorUserId;
       } else if (ctx.manualSelectedActorUserId) {
         preferredId = ctx.manualSelectedActorUserId;
-      } else if (isValidDecimalId(msg.fallbackActorUserId)) {
+      } else if (ctx.allowLocalSelection && isValidDecimalId(msg.fallbackActorUserId)) {
         preferredId = msg.fallbackActorUserId;
       } else if (ctx.lastConfirmedActorUserId) {
         preferredId = ctx.lastConfirmedActorUserId;
@@ -435,6 +470,8 @@ export function createBackgroundService(chromeApi, options = {}) {
       }
       return {
         ...snap,
+        historySync: describeHistorySync(await history.read()),
+        historyNextStart: await history.nextStart(),
         activeTabActorUserId: ctx.activeActorUserId,
         manualTabActorUserId: ctx.manualSelectedActorUserId,
         confirmedTabActorUserId: ctx.activeActorUserId || ctx.lastConfirmedActorUserId || null,
@@ -471,6 +508,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           return res;
         }
         if (!res.settings.collectionEnabled) {
+          await history.stop(await history.read(), 'paused');
           for (const entry of sessionTabsCache.values()) {
             entry.bindingContext = null;
             entry.diagnostics = null;
@@ -519,6 +557,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           return res;
         }
         const affectedTabIds = [];
+        if ((await history.read())?.actorUserId === actorId) await history.forget();
         for (const entry of sessionTabsCache.values()) {
           if (entry.lastConfirmedActorUserId === actorId) {
             entry.lastConfirmedActorUserId = null;
@@ -556,6 +595,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           return res;
         }
         const previousTabIds = Array.from(sessionTabsCache.values()).map((e) => e.tabId);
+        await history.forget();
         sessionTabsCache.clear();
         await persistSessionTabs();
         if (chromeApi.tabs && typeof chromeApi.tabs.sendMessage === 'function') {
@@ -581,6 +621,31 @@ export function createBackgroundService(chromeApi, options = {}) {
   }
 
   async function handleContentScriptMessage(msg, xSender) {
+    if (['GET_HISTORY_SYNC_TASK', 'ADVANCE_HISTORY_SYNC', 'STOP_HISTORY_SYNC_TASK', 'SYNC_HISTORY_PAGE'].includes(msg.type)) {
+      return enqueueSessionOp(async () => {
+        const job = await history.read();
+        const ownTab = job && job.tabId === xSender.tabId;
+        if (msg.type === 'GET_HISTORY_SYNC_TASK') {
+          return { ok: true, job: ownTab ? describeHistorySync(job) : null };
+        }
+        if (!ownTab || msg.jobId !== job.id) return { ok: false, code: 'STALE_JOB' };
+        const entry = sessionTabsCache.get(xSender.tabKey);
+        if (!entry || entry.documentId !== xSender.documentId) return { ok: false, code: 'STALE_DOCUMENT' };
+        if (msg.type === 'STOP_HISTORY_SYNC_TASK') {
+          const reasons = ['account_changed', 'navigation', 'stalled', 'timeout', 'rate_limited', 'verification', 'unavailable', 'unrecognized', 'first_page', 'search_stalled'];
+          return reasons.includes(msg.reason) ? history.stop(job, msg.reason, msg.retryAt) : { ok: false, code: 'INVALID_ARGS' };
+        }
+        if (!bindingEquals(entry.bindingContext, msg.bindingContext) || !history.matches(job, entry.bindingContext)) {
+          return { ok: false, code: 'STALE_BINDING' };
+        }
+        if (!matchesHistoryUrl(job, xSender.href)) return { ok: false, code: 'STALE_DOCUMENT' };
+        if (msg.type === 'ADVANCE_HISTORY_SYNC') return history.advance(job, msg.action);
+        const merged = await history.mergePage(job, msg, entry.bindingContext);
+        if (merged.added > 0) notifyTabs((e) => e.bindingContext?.actorUserId === job.actorUserId,
+          { type: 'REVISION_UPDATED', revision: merged.revision });
+        return merged;
+      });
+    }
     if (msg.type === 'HELLO') {
       return enqueueSessionOp(async () => {
         const ctrl = await storage.getControlState();
@@ -588,15 +653,46 @@ export function createBackgroundService(chromeApi, options = {}) {
           return ctrl;
         }
         const existing = sessionTabsCache.get(xSender.tabKey) || null;
+        const job = await history.read();
+        const historySyncId = scopedHistoryId(job, xSender, existing);
         let restoredBinding = null;
 
         if (
+          msg.revalidateViewer !== true &&
           existing &&
           existing.documentId === xSender.documentId &&
           existing.bindingContext &&
           bindingMatchesState(existing.bindingContext, ctrl)
         ) {
           restoredBinding = existing.bindingContext;
+        }
+
+        const isActiveSyncTab = Boolean(
+          msg.revalidateViewer !== true &&
+          job?.status === 'running' &&
+          job.tabId === xSender.tabId &&
+          matchesHistoryUrl(job, xSender.href) &&
+          ctrl.settings.collectionEnabled &&
+          ctrl.settings.captureSessionId === job.captureSessionId &&
+          ctrl.collectionGeneration === job.collectionGeneration &&
+          ctrl.accountGenerations?.[job.actorUserId] === job.accountGeneration
+        );
+        if (!restoredBinding && isActiveSyncTab) {
+          if (
+            existing?.bindingContext &&
+            existing.bindingContext.actorUserId === job.actorUserId &&
+            bindingMatchesState(existing.bindingContext, ctrl)
+          ) {
+            restoredBinding = existing.bindingContext;
+          } else {
+            restoredBinding = Object.freeze({
+              bindingId: generateBindingId(),
+              actorUserId: job.actorUserId,
+              captureSessionId: ctrl.settings.captureSessionId,
+              collectionGeneration: ctrl.collectionGeneration,
+              accountGeneration: ctrl.accountGenerations[job.actorUserId]
+            });
+          }
         }
 
         const sameDoc = Boolean(existing && existing.documentId === xSender.documentId);
@@ -615,6 +711,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           active: xSender.active,
           documentId: xSender.documentId,
           origin: xSender.origin,
+          historySyncId,
           bindingContext: restoredBinding,
           lastConfirmedActorUserId: preservedLastActorId,
           manualSelectedActorUserId: preservedManualActorId,
@@ -625,6 +722,10 @@ export function createBackgroundService(chromeApi, options = {}) {
 
         return {
           ok: true,
+          historySyncId,
+          historyScope: job?.status === 'running' && job.tabId === xSender.tabId && matchesHistoryUrl(job, xSender.href)
+            ? { id: job.id, actor: job.actorUserId, since: job.since, deadline: describeHistorySync(job).deadline, query: job.searchQuery || null }
+            : null,
           collectionEnabled: ctrl.settings.collectionEnabled,
           captureSessionId: ctrl.settings.captureSessionId,
           bindingContext: restoredBinding,
@@ -666,6 +767,11 @@ export function createBackgroundService(chromeApi, options = {}) {
         }
 
         const existing = sessionTabsCache.get(xSender.tabKey) || null;
+        const job = await history.read();
+        const historySyncId = scopedHistoryId(job, xSender, existing);
+        if (job?.tabId === xSender.tabId && job.actorUserId !== msg.viewer.actorUserId) {
+          await history.stop(job, 'account_changed');
+        }
         if (
           existing &&
           existing.documentId === xSender.documentId &&
@@ -681,6 +787,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           return {
             ok: true,
             bindingContext: existing.bindingContext,
+            historySyncId,
             revision: accRes.revision
           };
         }
@@ -698,6 +805,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           active: xSender.active,
           documentId: xSender.documentId,
           origin: xSender.origin,
+          historySyncId,
           bindingContext,
           lastConfirmedActorUserId: msg.viewer.actorUserId,
           manualSelectedActorUserId: null,
@@ -709,6 +817,7 @@ export function createBackgroundService(chromeApi, options = {}) {
         return {
           ok: true,
           bindingContext,
+          historySyncId,
           revision: accRes.revision
         };
       });
@@ -748,7 +857,8 @@ export function createBackgroundService(chromeApi, options = {}) {
 
         const mergeRes = await storage.mergeObservedBatch({
           bindingContext: sessionEntry.bindingContext,
-          events: msg.events,
+          events: sessionEntry.historySyncId && Array.isArray(msg.events)
+            ? msg.events.filter((event) => event?.source !== 'history') : msg.events,
           observedUsers: msg.observedUsers
         });
 
@@ -912,6 +1022,8 @@ export function createBackgroundService(chromeApi, options = {}) {
     chromeApi.tabs.onRemoved.addListener((tabId) => {
       enqueueSessionOp(async () => {
         const key = String(tabId);
+        const job = await history.read();
+        if (job?.tabId === tabId) await history.stop(job, 'closed');
         if (sessionTabsCache.has(key)) {
           sessionTabsCache.delete(key);
           await persistSessionTabs();

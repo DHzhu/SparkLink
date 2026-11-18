@@ -135,6 +135,8 @@ function createFakePopupDom() {
     'top20-list',
     'top20-empty',
     'btn-cleanup',
+    'btn-history-sync',
+    'history-sync-status',
     'btn-export',
     'btn-import',
     'file-import',
@@ -487,6 +489,23 @@ test('Popup HTML/CSS assets have zero remote resources and Popup UI covers activ
   assert.equal(byId.get('collection-toggle').checked, false);
 });
 
+test('An older Popup refresh cannot overwrite a newer binding snapshot', async () => {
+  const { doc, byId } = createFakePopupDom();
+  const requests = [];
+  const popup = createPopupController({
+    document: doc,
+    runtime: { sendMessage: () => new Promise((resolve) => requests.push(resolve)) }
+  });
+  const earlier = popup.refresh();
+  const later = popup.refresh();
+  const snapshot = { ok: true, settings: { collectionEnabled: true }, savedAccounts: [], selectedAccount: null };
+  requests[1]({ ...snapshot, viewerStatus: 'bound', activeTabActorUserId: '9009009' });
+  await later;
+  requests[0]({ ...snapshot, viewerStatus: 'unconfirmed' });
+  await earlier;
+  assert.equal(byId.get('viewer-status-badge').textContent, '采集中');
+});
+
 test('Popup handles >9 MiB file rejection, modal cancel, toggle switch, and anomaly/corrupted banners cleanly', async () => {
   assert.equal(createPopupController({ document: null, runtime: null }), null);
 
@@ -544,6 +563,10 @@ test('Popup handles >9 MiB file rejection, modal cancel, toggle switch, and anom
   const popup = createPopupController({ document: doc, runtime: mockRuntime, urlApi });
   await popup.init();
 
+  const deepPill = byId.get('top20-list').findAllByTag('span').find(node => node.className.includes('tier-pill'));
+  assert.equal(deepPill.textContent, '深度互动');
+  assert.ok(deepPill.parentNode.children.some(node => node !== deepPill && node.textContent === '55 次'));
+
   // Verify all 5 warning/error banners rendered simultaneously
   const bannerText = byId.get('status-banners').textContent;
   assert.ok(bannerText.includes('存储空间不足'));
@@ -592,3 +615,33 @@ test('Popup handles >9 MiB file rejection, modal cancel, toggle switch, and anom
   assert.ok(byId.get('status-banners').textContent.includes('保留旧快照'));
 });
 
+
+test('Manual history button starts, cancels and shows the persisted cooldown on reopening', async () => {
+  const { doc, byId } = createFakePopupDom();
+  const selectedAccount = { actorUserId: '42', handle: 'alice', summary: { top20: [] } };
+  const snap = { ok: true, viewerStatus: 'bound', activeTabActorUserId: '42', settings: { collectionEnabled: true },
+    selectedAccount, savedAccounts: [selectedAccount], historyNextStart: 0 };
+  const calls = [];
+  const runtime = { async sendMessage(msg) {
+    if (msg.type === 'GET_POPUP_SNAPSHOT') return snap;
+    calls.push(msg);
+    if (msg.type === 'START_HISTORY_SYNC') {
+      snap.historySync = { id: 'test', handle: 'alice', status: 'running', pages: 0, added: 0, duplicates: 0, deadline: Date.now() + 300000 };
+    } else {
+      Object.assign(snap.historySync, { status: 'cancelled', reason: 'cancelled' });
+      snap.historyNextStart = Date.now() + 900000;
+    }
+    return { ok: true };
+  } };
+  const ui = createPopupController({ document: doc, runtime });
+  await ui.init();
+  const button = byId.get('btn-history-sync');
+  assert.equal(button.disabled, false);
+  await button.trigger('click');
+  assert.equal(button.textContent, '停止同步');
+  await button.trigger('click');
+  assert.deepEqual(calls, [{ type: 'START_HISTORY_SYNC', actorUserId: '42' }, { type: 'CANCEL_HISTORY_SYNC', jobId: 'test' }]);
+  await ui.refresh();
+  assert.equal(button.disabled, true);
+  assert.match(byId.get('history-sync-status').textContent, /已停止.*后再次手动同步/);
+});

@@ -43,7 +43,7 @@
     },
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
-      "js": ["src/content.js"],
+      "js": ["src/content.js", "src/history-sync-page.js"],
       "css": ["src/styles.css"],
       "world": "ISOLATED",
       "run_at": "document_idle",

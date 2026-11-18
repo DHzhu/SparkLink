@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SparkLink - 星火链</title>
+  <link rel="stylesheet" href="../styles.css" />
   <link rel="stylesheet" href="./popup.css" />
 </head>
 <body>
@@ -77,6 +78,8 @@
 
       <section class="management-section">
         <h2 class="section-title">数据管理</h2>
+        <button type="button" id="btn-history-sync" class="btn btn-secondary btn-block" disabled>同步近 7 天回复</button>
+        <p id="history-sync-status" class="coverage-note" role="status"></p>
         <div class="mgmt-grid">
           <button type="button" id="btn-cleanup" class="btn btn-secondary">清理过期记录</button>
           <button type="button" id="btn-export" class="btn btn-secondary">导出全部备份</button>

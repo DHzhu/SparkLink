@@ -10,6 +10,7 @@
 
 - 扩展主显示图标（`icons/icon16.png`、`icons/icon32.png`、`icons/icon48.png`、`icons/icon128.png`）与 Popup 顶部品牌标志（`src/popup/popup.html`）同步更新为深空蓝底色的橙金火焰环图形，与页面互动徽章视觉保持一致。
 - 互动徽章改为同色橙焰，按 1–10、11–50、51 次及以上逐档变大。有蓝 V 时火焰围绕原标识，无蓝 V 时显示白心火焰。徽章只用火焰大小区分等级，排行榜次数单独显示。开启减少动态效果后火焰保持静止。
+- 备份导出切换为紧凑 JSON 序列化并引入 `O(1)` 用户 Handle 索引（`src/popup/popup.js`、`src/storage.js`），确保满载 20,000 条回复（约 5.92 MiB）导出的备份体积低于 9 MiB 导入上限且可快速往返恢复。
 
 ### 新增
 
@@ -25,10 +26,14 @@
   - 实现浅色/深色自适应 Popup 管理界面（`src/popup/`）并通过全部 34 项单元与端到端验收测试（整体行覆盖率 88.13%）。
 - 补齐 4 个尺寸确定性品牌 PNG 图标（`icons/icon16.png`、`icons/icon32.png`、`icons/icon48.png`、`icons/icon128.png`），并接入真实 Chromium 155 未打包扩展加载与 CDP 真实 DOM / 原生 `Request` 回归验收（`tests/remediation.test.js`，全量 65 项测试通过，整体行覆盖率 89.68%）。
 
-### 变更
-- 备份导出切换为紧凑 JSON 序列化并引入 `O(1)` 用户 Handle 索引（`src/popup/popup.js`、`src/storage.js`），确保满载 20,000 条回复（约 5.92 MiB）导出的备份体积低于 9 MiB 导入上限且可快速往返恢复。
-
 ### 修复
+
+- **[全仓审计]** 修复 5 项全仓边缘场景问题（`src/background.js`、`src/bridge.js`、`src/history-sync.js`、`src/history-sync-page.js`、`src/interceptor.js`、`src/styles.css`、`src/content.js`、`src/popup/popup.js`）：
+  - 同步标签页切换账号时先停止旧任务再清空 `historySyncId`，避免新绑定账号的被动回复补录被误拦截；
+  - `history.read()` 超时状态持久化并下发 `END_HISTORY_TRANSPORT`，`CLEAR_ACCOUNT` / `CLEAR_ALL` 完整清理同步传输层并重置 `sparklink_debug_logs` 调试开关；
+  - 桌面双栏布局下 `triggerScrollStep()` 优先滚动 `[data-testid="primaryColumn"]` 内的时间线单元格，跳过隐藏 `/with_replies` 链接，并在时间线中途滚动停滞满 45 秒时平滑回退至 UTC 按日搜索；
+  - 修正火焰环内切圆与外焰谷底自交缺口及深色背景白芯外溢，并将无蓝 V / 认证容器包裹下的独立互动徽章内联挂载于显示名同行；
+  - 捕获导入文件读取异常、仅在清空操作确认成功后重置面板账号选择状态，并同步多页按日搜索状态提示文案。
 
 - **[P0]** 移除 `src/interceptor.js` 中所有扩展自建/模板重放 GraphQL 请求、JS 包 `queryId` 扫描、`ct0` Cookie 读取、鉴权请求头记录及数组 `.join()` 拆分绕过代码，消除因缺失一次性 `x-client-transaction-id` 触发 HTTP 404 空响应导致时间线误判不兼容与按日搜索提前中断的问题，并强化静态安全审计规则（`src/interceptor.js`、`tests/p0-security-and-e2e.test.js`）。
 - **[P1]** 将七天同步专用标签页改为前台激活打开（`active: true`，无需新增 `tabs` 权限），并在 Popup 增加“同步期间请停留在该标签页”提示；`HISTORY_NEXT` 统一改为纯页面原生滚动翻页（`scrollScan`），在触发滚动前即消费并标记当前游标，消除重复翻页竞态并修复第二页空响应末尾判定与慢网宽限等待（`src/history-sync.js`、`src/interceptor.js`、`src/popup/popup.js`）。

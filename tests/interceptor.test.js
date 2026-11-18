@@ -1394,4 +1394,98 @@ test('Interceptor upgrades UserTimeline/UserPosts to replies_timeline on /with_r
   assert.equal(env.outboundMessages.filter((m) => m.data.historyPage).length, 1);
 });
 
+test('Interceptor parses POST JSON body variables for replies_timeline/SearchTimeline and excludes plain UserTweets on /with_replies', async () => {
+  const clock = Date.now();
+  const q = 'from:sample_me filter:replies since:2026-11-16 until:2026-11-17';
+  const repliesPayload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  delete repliesPayload.data.user.result.rest_id;
+  delete repliesPayload.data.user.result.legacy;
+  repliesPayload.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom-post-r',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'post-replies-cursor' }
+  });
+  const searchPayload = {
+    data: {
+      search_by_raw_query: {
+        search_timeline: {
+          timeline: structuredClone(timelineFixtures.ownRepliesTimelineMixed.response.data.user.result.timeline_v2.timeline)
+        }
+      }
+    }
+  };
+  searchPayload.data.search_by_raw_query.search_timeline.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom-post-s',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'post-search-cursor' }
+  });
+
+  const env = createMockEnvironment(async () => new Response(JSON.stringify(repliesPayload), { status: 200 }));
+  env.win.location.href = 'https://x.com/sample_me/with_replies';
+  env.win.document = {};
+  env.win.scrollTo = () => {};
+  installMainInterceptor(env.win, adapterApi);
+
+  const repliesScope = { id: 'job_post_1', actor: BINDING_A.actorUserId, since: clock - 86400000, deadline: clock + 300000, query: null };
+  env.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'BRIDGE_INIT',
+    nonce: 'nonce_post',
+    collectionEnabled: true,
+    captureSessionId: 10,
+    bindingContext: BINDING_A,
+    historyScope: repliesScope,
+    stateConfirmed: true,
+    observedPaused: false
+  });
+
+  // 1. Plain UserTweets (without includeReplies/withReplies) on /with_replies must stay author_mapping (0 historyPage)
+  await env.win.fetch('https://x.com/i/api/graphql/qIdUt/UserTweets?variables=%7B%22userId%22%3A%221001001%22%7D');
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(env.outboundMessages.filter((m) => m.data.historyPage).length, 0);
+
+  // 2. fetch POST UserTweets with includeReplies: true in JSON body emits historyPage
+  await env.win.fetch('https://x.com/i/api/graphql/qIdUt/UserTweets', {
+    method: 'POST',
+    body: JSON.stringify({ variables: { userId: '1001001', includeReplies: true } })
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(env.outboundMessages.filter((m) => m.data.historyPage).length, 1);
+
+  // 3. fetch POST UserTweetsAndReplies without URL query variables (owner resolved via body userId)
+  env.outboundMessages.length = 0;
+  await env.win.fetch('https://x.com/i/api/graphql/qIdPostR/UserTweetsAndReplies', {
+    method: 'POST',
+    body: JSON.stringify({ variables: { userId: '1001001' } })
+  });
+  await new Promise((r) => setTimeout(r, 15));
+  const postReplyPages = env.outboundMessages.filter((m) => m.data.historyPage);
+  assert.equal(postReplyPages.length, 1);
+  assert.equal(postReplyPages[0].data.historyPage.canPage, true);
+
+  // 4. XMLHttpRequest POST SearchTimeline with JSON body variables under matching search scope
+  const searchScope = { id: 'job_post_2', actor: BINDING_A.actorUserId, since: clock - 86400000, deadline: clock + 300000, query: q };
+  env.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'SYNC_STATE',
+    nonce: 'nonce_post',
+    collectionEnabled: true,
+    captureSessionId: 10,
+    bindingContext: BINDING_A,
+    historyScope: searchScope,
+    stateConfirmed: true,
+    observedPaused: false
+  });
+  env.win.location.href = `https://x.com/search?q=${encodeURIComponent(q)}&f=live&src=typed_query`;
+  env.outboundMessages.length = 0;
+  const xhr = new env.win.XMLHttpRequest();
+  xhr.open('POST', 'https://x.com/i/api/graphql/qIdPostS/SearchTimeline');
+  xhr.send(JSON.stringify({ variables: { rawQuery: q, product: 'Latest' } }));
+  xhr.dispatchLoad(200, searchPayload);
+  await new Promise((r) => setTimeout(r, 15));
+  const postSearchPages = env.outboundMessages.filter((m) => m.data.historyPage);
+  assert.equal(postSearchPages.length, 1);
+  assert.equal(postSearchPages[0].data.historyPage.searchQuery, q);
+  assert.equal(postSearchPages[0].data.historyPage.canPage, true);
+});
+
+
 

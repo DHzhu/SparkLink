@@ -1433,3 +1433,90 @@ test('Adapter matches versioned/renamed profile replies operations, POST request
   assert.ok(upgradedRes.historyPage);
 });
 
+test('matchWhitelistedRequest parses POST JSON body variables and rejects malformed/dangerous/oversized SearchTimeline POST bodies', () => {
+  const q = 'from:alice filter:replies since:2026-11-16 until:2026-11-17';
+
+  // 1. UserTweetsAndReplies POST body with variables object
+  const postReplies = matchWhitelistedRequest(
+    'https://x.com/i/api/graphql/qIdPost1/UserTweetsAndReplies',
+    'POST',
+    JSON.stringify({ variables: { userId: '1001001', count: 20 } })
+  );
+  assert.deepEqual(postReplies, {
+    operationName: 'UserTweetsAndReplies',
+    category: 'replies_timeline',
+    method: 'POST',
+    requestedUserId: '1001001'
+  });
+
+  // 2. UserTweets POST body with stringified variables & includeReplies: true
+  const postUserTweetsWithReplies = matchWhitelistedRequest(
+    'https://x.com/i/api/graphql/qIdPost2/UserTweets',
+    'POST',
+    JSON.stringify({ variables: JSON.stringify({ userId: '1001001', includeReplies: true }) })
+  );
+  assert.deepEqual(postUserTweetsWithReplies, {
+    operationName: 'UserTweets',
+    category: 'replies_timeline',
+    method: 'POST',
+    requestedUserId: '1001001'
+  });
+
+  // 3. SearchTimeline POST body with variables object + optional cursor
+  const postSearch = matchWhitelistedRequest(
+    'https://x.com/i/api/graphql/qIdPost3/SearchTimeline',
+    'POST',
+    JSON.stringify({
+      variables: { rawQuery: q, product: 'Latest', cursor: 'search-cursor-post' }
+    })
+  );
+  assert.deepEqual(postSearch, {
+    operationName: 'SearchTimeline',
+    category: 'manual_search',
+    method: 'POST',
+    searchQuery: q
+  });
+
+  // 4. Reject POST SearchTimeline when body missing, invalid JSON, wrong product, bad rawQuery, oversized, or dangerous keys
+  assert.equal(
+    matchWhitelistedRequest('https://x.com/i/api/graphql/qIdPost3/SearchTimeline', 'POST'),
+    null
+  );
+  assert.equal(
+    matchWhitelistedRequest('https://x.com/i/api/graphql/qIdPost3/SearchTimeline', 'POST', '{bad'),
+    null
+  );
+  assert.equal(
+    matchWhitelistedRequest(
+      'https://x.com/i/api/graphql/qIdPost3/SearchTimeline',
+      'POST',
+      JSON.stringify({ variables: { rawQuery: q, product: 'Top' } })
+    ),
+    null
+  );
+  assert.equal(
+    matchWhitelistedRequest(
+      'https://x.com/i/api/graphql/qIdPost3/SearchTimeline',
+      'POST',
+      JSON.stringify({ variables: { rawQuery: 'from:alice since:2026-11-16', product: 'Latest' } })
+    ),
+    null
+  );
+  assert.equal(
+    matchWhitelistedRequest(
+      'https://x.com/i/api/graphql/qIdPost3/SearchTimeline',
+      'POST',
+      '{"variables":{"__proto__":{"polluted":true},"rawQuery":"' + q + '","product":"Latest"}}'
+    ),
+    null
+  );
+  const oversized = JSON.stringify({
+    variables: { rawQuery: q, product: 'Latest', pad: 'x'.repeat(270000) }
+  });
+  assert.equal(
+    matchWhitelistedRequest('https://x.com/i/api/graphql/qIdPost3/SearchTimeline', 'POST', oversized),
+    null
+  );
+});
+
+

@@ -121,7 +121,7 @@
     return Math.trunc(ms);
   }
 
-  function matchWhitelistedRequest(urlString, method) {
+  function matchWhitelistedRequest(urlString, method, requestBodyText) {
     if (typeof urlString !== 'string' || typeof method !== 'string') {
       return null;
     }
@@ -156,8 +156,32 @@
       operationName === 'SearchTimeline'
     ) {
       try {
+        let vars = null;
         const raw = parsed.searchParams.get('variables');
-        const vars = raw && raw.length < 32768 && JSON.parse(raw);
+        if (raw && raw.length < 32768) {
+          const parsedUrlVars = JSON.parse(raw);
+          if (isPlainObject(parsedUrlVars) && !hasDangerousOwnKeys(parsedUrlVars)) {
+            vars = parsedUrlVars;
+          }
+        } else if (
+          normalizedMethod === 'POST' &&
+          typeof requestBodyText === 'string' &&
+          requestBodyText.length > 0 &&
+          requestBodyText.length <= 262144
+        ) {
+          const bodyObj = JSON.parse(requestBodyText);
+          if (isPlainObject(bodyObj) && !hasDangerousOwnKeys(bodyObj)) {
+            const rawVars = bodyObj.variables;
+            if (isPlainObject(rawVars)) {
+              vars = rawVars;
+            } else if (typeof rawVars === 'string' && rawVars.length > 0 && rawVars.length < 32768) {
+              const parsedBodyVars = JSON.parse(rawVars);
+              if (isPlainObject(parsedBodyVars) && !hasDangerousOwnKeys(parsedBodyVars)) {
+                vars = parsedBodyVars;
+              }
+            }
+          }
+        }
         const rawUid = vars?.userId ?? vars?.rest_id ?? vars?.id ?? vars?.user_id;
         const uid = typeof rawUid === 'number' ? String(rawUid) : rawUid;
         if (isValidDecimalId(uid)) match.requestedUserId = uid;
@@ -175,7 +199,8 @@
             vars?.cursor === undefined ||
             (typeof vars.cursor === 'string' && vars.cursor.length > 0 && vars.cursor.length <= 4096);
           if (
-            vars?.product !== 'Latest' ||
+            !vars ||
+            vars.product !== 'Latest' ||
             !validCursor ||
             typeof vars.rawQuery !== 'string' ||
             !/^from:[A-Za-z0-9_]{1,64} filter:replies since:\d{4}-\d{2}-\d{2}(?: until:\d{4}-\d{2}-\d{2})?$/.test(vars.rawQuery)

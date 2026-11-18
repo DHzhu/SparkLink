@@ -1317,7 +1317,7 @@
       }
     }
 
-    function evaluateCaptureEligibility(url, method) {
+    function evaluateCaptureEligibility(url, method, requestBodyText) {
       const activeState = state.collectionEnabled && state.captureSessionId !== null;
       const allowPreConfirm = Boolean(
         !state.stateConfirmed && !state.observedPaused && !state.hasPausedOnce
@@ -1325,7 +1325,7 @@
       if (!url || (!activeState && !allowPreConfirm)) {
         return null;
       }
-      let match = adapter.matchWhitelistedRequest(url, method);
+      let match = adapter.matchWhitelistedRequest(url, method, requestBodyText);
       let currentPath = '';
       try {
         currentPath = win.location?.href
@@ -1346,6 +1346,7 @@
       }
       if (
         match.category === 'author_mapping' &&
+        !/^UserTweets$/i.test(match.operationName) &&
         /^(?:User|Profile)[A-Za-z0-9_]*(?:Tweets|Posts|Timeline)[A-Za-z0-9_]*$/i.test(match.operationName) &&
         !/Highlight|Article|Media|Likes|SuperFollow/i.test(match.operationName) &&
         /\/with_replies\/?$/i.test(currentPath)
@@ -1394,7 +1395,14 @@
         let captured = null;
         try {
           const { url, method } = extractFetchUrlAndMethod(input, init);
-          const match = evaluateCaptureEligibility(url, method);
+          const syncBodyText =
+            init &&
+            typeof init === 'object' &&
+            typeof init.body === 'string' &&
+            utf8ByteLength(init.body) <= maxRequestBytes
+              ? init.body
+              : null;
+          const match = evaluateCaptureEligibility(url, method, syncBodyText);
           if (match) {
             const context = captureContext();
             let requestMeta = null;
@@ -1595,7 +1603,11 @@
           const meta = xhrMetaMap.get(this);
           if (meta) {
             meta.activeCapture = null;
-            const match = evaluateCaptureEligibility(meta.url, meta.method);
+            const syncBodyText =
+              typeof body === 'string' && utf8ByteLength(body) <= maxRequestBytes
+                ? body
+                : null;
+            const match = evaluateCaptureEligibility(meta.url, meta.method, syncBodyText);
             if (match) {
               let requestMeta = null;
               let skip = false;

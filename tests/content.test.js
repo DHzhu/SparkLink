@@ -846,3 +846,118 @@ test('Display-name mentions neither identify an author nor override a separate h
   for (const row of mentionRows) assert.ok(!row.querySelector('.sparklink-badge'), row.textContent);
   assert.equal(author.userNameBox.querySelector('.sparklink-badge')?.dataset.sparklinkUserId, '2001');
 });
+
+test('Audit regressions: flame-ring outer valleys strictly enclose inner cutout and white core, and standalone badges mount inline on the display-name row even inside column wrappers', async (t) => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const css = fs.readFileSync(path.join(process.cwd(), 'src', 'styles.css'), 'utf8');
+  const dMatch = css.match(/\.sparklink-fire-art\s*>\s*\.sparklink-fire-shape\s*\{[\s\S]*?d:\s*path\("([^"]+)"\)/);
+  assert.ok(dMatch, 'styles.css must define .sparklink-fire-shape path');
+  const fullPath = dMatch[1];
+  const subpaths = fullPath.split(/(?=M)/).map((s) => s.trim()).filter(Boolean);
+  assert.equal(subpaths.length, 2, 'Flame ring path must contain outer contour and inner circular cutout');
+
+  const arcMatch = subpaths[1].match(/^M\s*([\d.-]+)\s+([\d.-]+)\s+A\s*([\d.-]+)\s+([\d.-]+)\s+0\s+1\s+0\s+([\d.-]+)\s+([\d.-]+)/);
+  assert.ok(arcMatch, 'Inner cutout must be a 2-arc circle');
+  const xRight = Number(arcMatch[1]);
+  const cy = Number(arcMatch[2]);
+  const rCutout = Number(arcMatch[3]);
+  const xLeft = Number(arcMatch[5]);
+  const cx = (xRight + xLeft) / 2;
+
+  // Parse outer M x0 y0 C ... Z cubic Bezier contour and sample minimum radius from (cx, cy)
+  const tokens = subpaths[0].match(/[MCZ]|-?\d+(?:\.\d+)?/g) || [];
+  assert.equal(tokens[0], 'M');
+  let curX = Number(tokens[1]);
+  let curY = Number(tokens[2]);
+  let idx = 3;
+  let minOuterDist = Infinity;
+  while (idx < tokens.length && tokens[idx] !== 'Z') {
+    assert.equal(tokens[idx], 'C');
+    const x1 = Number(tokens[idx + 1]);
+    const y1 = Number(tokens[idx + 2]);
+    const x2 = Number(tokens[idx + 3]);
+    const y2 = Number(tokens[idx + 4]);
+    const x3 = Number(tokens[idx + 5]);
+    const y3 = Number(tokens[idx + 6]);
+    for (let step = 0; step <= 200; step += 1) {
+      const u = step / 200;
+      const mu = 1 - u;
+      const bx = mu * mu * mu * curX + 3 * mu * mu * u * x1 + 3 * mu * u * u * x2 + u * u * u * x3;
+      const by = mu * mu * mu * curY + 3 * mu * mu * u * y1 + 3 * mu * u * u * y2 + u * u * u * y3;
+      const dist = Math.hypot(bx - cx, by - cy);
+      if (dist < minOuterDist) minOuterDist = dist;
+    }
+    curX = x3;
+    curY = y3;
+    idx += 7;
+  }
+
+  // Native X checkmark stays inside ~5.38 around (12, 12); even at 0.88x tier scale cutout must stay clear
+  assert.ok(rCutout * 0.88 > 5.6, `Scaled cutout (${(rCutout * 0.88).toFixed(2)}) must keep X native checkmark clear`);
+  assert.ok(rCutout + 0.8 < minOuterDist, `Outer flame min radius (${minOuterDist.toFixed(2)}) must strictly exceed cutout (${rCutout}) without self-intersection`);
+
+  // Render unverified + column-wrapped cards and verify core radius and inline row placement
+  const { win, body, bridge } = createFakeDomAndBridge({ '2001': 18, '2002': 6 });
+  const styleMap = new WeakMap();
+  win.getComputedStyle = (node) => styleMap.get(node) || { display: '', flexDirection: '', fill: '' };
+
+  // 1. Standard two-row card (nameRow + handleRow): unverified badge must sit inside nameRow, NOT appended after handleRow
+  const standardUnverified = buildTweetCard({ handle: 'user_t2', displayName: 'Alice Unverified', verified: false });
+  const [stdNameRow, stdHandleRow] = standardUnverified.userNameBox.children;
+  body.appendChild(standardUnverified.article);
+
+  // 2. React Native Web column-wrapped card (both outer wrapper and <a> are flex-direction: column, inner row is inline-flex row with gold check)
+  const rnwArticle = new FakeElement('article');
+  rnwArticle.setAttribute('data-testid', 'tweet');
+  const rnwBox = new FakeElement('div');
+  rnwBox.setAttribute('data-testid', 'User-Name');
+  styleMap.set(rnwBox, { display: 'flex', flexDirection: 'column', fill: '' });
+  const rnwColWrap = new FakeElement('div');
+  styleMap.set(rnwColWrap, { display: 'flex', flexDirection: 'column', fill: '' });
+  const rnwLink = new FakeElement('a');
+  rnwLink.setAttribute('href', '/user_t1');
+  styleMap.set(rnwLink, { display: 'flex', flexDirection: 'column', fill: '' });
+  const rnwInlineRow = new FakeElement('div');
+  styleMap.set(rnwInlineRow, { display: 'inline-flex', flexDirection: 'row', fill: '' });
+  const rnwNameSpan = new FakeElement('span');
+  rnwNameSpan.textContent = 'Gold Org';
+  const rnwGoldSvg = new FakeElement('svg', 'http://www.w3.org/2000/svg');
+  rnwGoldSvg.setAttribute('data-testid', 'icon-verified');
+  const rnwGoldPath = new FakeElement('path', 'http://www.w3.org/2000/svg');
+  rnwGoldPath.setAttribute('fill', '#c8a400');
+  rnwGoldSvg.appendChild(rnwGoldPath);
+  rnwInlineRow.appendChild(rnwNameSpan);
+  rnwInlineRow.appendChild(rnwGoldSvg);
+  rnwLink.appendChild(rnwInlineRow);
+  rnwColWrap.appendChild(rnwLink);
+  const rnwHandleRow = new FakeElement('div');
+  const rnwHandleSpan = new FakeElement('span');
+  rnwHandleSpan.textContent = '@user_t1';
+  rnwHandleRow.appendChild(rnwHandleSpan);
+  rnwBox.appendChild(rnwColWrap);
+  rnwBox.appendChild(rnwHandleRow);
+  rnwArticle.appendChild(rnwBox);
+  body.appendChild(rnwArticle);
+
+  const controller = installContentBadges(win, bridge, { debounceMs: 1, frameBudgetMs: 1000 });
+  t.after(() => controller.destroy());
+  await waitForBadgeState(
+    () => standardUnverified.userNameBox.querySelector('.sparklink-badge') && rnwBox.querySelector('.sparklink-badge'),
+    'Both audit regression cards should render standalone flame badges'
+  );
+
+  const stdBadge = standardUnverified.userNameBox.querySelector('.sparklink-badge');
+  const coreCircle = stdBadge.querySelector('.sparklink-fire-core');
+  assert.ok(coreCircle);
+  const rCore = Number(coreCircle.getAttribute('r'));
+  assert.ok(rCore >= rCutout, `White core radius (${rCore}) must cover inner cutout (${rCutout})`);
+  assert.ok(rCore + 0.5 < minOuterDist, `White core radius (${rCore}) must stay inside outer flame valleys (${minOuterDist.toFixed(2)}) for dark mode`);
+
+  assert.equal(stdBadge.parentNode, stdNameRow, 'Unverified standalone badge must mount on display-name row, not after handleRow');
+  assert.equal(stdHandleRow.querySelector('.sparklink-badge'), null);
+
+  const rnwBadge = rnwBox.querySelector('.sparklink-badge');
+  assert.equal(rnwBadge.parentNode, rnwInlineRow, 'Gold-check badge inside column wrappers must mount inside the horizontal inline row');
+});
+

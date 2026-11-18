@@ -397,7 +397,7 @@
       core.setAttribute('class', 'sparklink-fire-core');
       core.setAttribute('cx', '12');
       core.setAttribute('cy', '12');
-      core.setAttribute('r', '9.5');
+      core.setAttribute('r', '8.2');
       svg.appendChild(core);
     }
     const plume = doc.createElementNS(SVG_NS, 'path');
@@ -439,28 +439,155 @@
     for (const art of Array.from(container.querySelectorAll('.sparklink-native-fire'))) art.remove();
   }
 
-  function insertBadgeIntoContainer(container, badge) {
+  function canPlaceInlineAfter(el, win) {
+    const parent = el && el.parentNode;
+    if (!parent || parent.nodeType !== 1 || typeof el.insertAdjacentElement !== 'function') {
+      return false;
+    }
+    const getStyle =
+      win && typeof win.getComputedStyle === 'function' ? (n) => win.getComputedStyle(n) : null;
+    if (!getStyle) {
+      return true;
+    }
+    const parentStyle = getStyle(parent);
+    const parentDisplay = (parentStyle && parentStyle.display) || '';
+    if (parentDisplay === 'flex' || parentDisplay === 'inline-flex') {
+      const dir = (parentStyle && parentStyle.flexDirection) || 'row';
+      return !dir.startsWith('column');
+    }
+    if (parentDisplay === 'grid' || parentDisplay === 'inline-grid') {
+      return false;
+    }
+    const elStyle = getStyle(el);
+    const elDisplay = (elStyle && elStyle.display) || '';
+    if (
+      elDisplay === 'block' ||
+      elDisplay === 'flex' ||
+      elDisplay === 'grid' ||
+      elDisplay === 'table'
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  function findDisplayNameAnchor(container) {
+    if (!container || typeof container.querySelectorAll !== 'function') {
+      return null;
+    }
+    const links = container.querySelectorAll('a[href^="/"]');
+    let fallback = null;
+    for (let i = 0; i < links.length; i += 1) {
+      const link = links[i];
+      if (isSparklinkNode(link)) continue;
+      const href = link.getAttribute('href') || '';
+      const match = PROFILE_HREF_RE.exec(href);
+      if (!match || RESERVED_PATHS.has(match[1].toLowerCase())) {
+        continue;
+      }
+      if (!fallback) {
+        fallback = link;
+      }
+      const text = (typeof link.textContent === 'string' ? link.textContent : '')
+        .replace(BIDI_FORMAT_RE, '')
+        .trim();
+      if (text && !text.startsWith('@')) {
+        return link;
+      }
+    }
+    return fallback;
+  }
+
+  function insertInsideInlineRow(hostEl, badge, win) {
+    if (!hostEl) {
+      return false;
+    }
+    const kids = hostEl.children;
+    if (kids && typeof kids.length === 'number') {
+      for (let i = kids.length - 1; i >= 0; i -= 1) {
+        const child = kids[i];
+        if (!child || isSparklinkNode(child)) continue;
+        const tag = typeof child.tagName === 'string' ? child.tagName.toUpperCase() : '';
+        if (tag === 'SVG' || child.namespaceURI === SVG_NS) {
+          if (tag === 'SVG' && canPlaceInlineAfter(child, win)) {
+            const inserted = child.insertAdjacentElement('afterend', badge);
+            if (inserted) return true;
+          }
+          continue;
+        }
+        if (canPlaceInlineAfter(child, win)) {
+          const inserted = child.insertAdjacentElement('afterend', badge);
+          if (inserted) return true;
+        }
+        if (insertInsideInlineRow(child, badge, win)) {
+          return true;
+        }
+      }
+    }
+    if (typeof hostEl.insertAdjacentElement === 'function') {
+      const inserted = hostEl.insertAdjacentElement('beforeend', badge);
+      if (inserted) return true;
+    }
+    return false;
+  }
+
+  function insertBadgeIntoContainer(container, badge, win) {
     const verifiedIcon = container.querySelector(VERIFIED_SELECTOR);
     if (verifiedIcon) {
       const enclosingLink =
         typeof verifiedIcon.closest === 'function'
           ? verifiedIcon.closest('a[href^="/"]')
           : null;
-      if (
-        enclosingLink &&
-        enclosingLink !== container &&
-        typeof enclosingLink.insertAdjacentElement === 'function'
-      ) {
+      if (enclosingLink && enclosingLink !== container && canPlaceInlineAfter(enclosingLink, win)) {
         const insertedAfterLink = enclosingLink.insertAdjacentElement('afterend', badge);
         if (insertedAfterLink) {
           return;
         }
       }
-      if (typeof verifiedIcon.insertAdjacentElement === 'function') {
+      const iconWrap =
+        verifiedIcon.parentNode &&
+        verifiedIcon.parentNode !== container &&
+        verifiedIcon.parentNode !== enclosingLink &&
+        canPlaceInlineAfter(verifiedIcon.parentNode, win)
+          ? verifiedIcon.parentNode
+          : null;
+      if (iconWrap) {
+        const insertedAfterWrap = iconWrap.insertAdjacentElement('afterend', badge);
+        if (insertedAfterWrap) {
+          return;
+        }
+      }
+      if (canPlaceInlineAfter(verifiedIcon, win)) {
         const insertedAfterIcon = verifiedIcon.insertAdjacentElement('afterend', badge);
         if (insertedAfterIcon) {
           return;
         }
+      }
+    }
+
+    const displayLink = findDisplayNameAnchor(container);
+    if (displayLink && displayLink !== container) {
+      if (canPlaceInlineAfter(displayLink, win)) {
+        const inserted = displayLink.insertAdjacentElement('afterend', badge);
+        if (inserted) {
+          return;
+        }
+      }
+      if (insertInsideInlineRow(displayLink, badge, win)) {
+        return;
+      }
+    }
+
+    const firstRow = container.children && container.children.length > 0 ? container.children[0] : null;
+    if (firstRow && !isSparklinkNode(firstRow)) {
+      if (canPlaceInlineAfter(firstRow, win)) {
+        const inserted = firstRow.insertAdjacentElement('afterend', badge);
+        if (inserted) {
+          return;
+        }
+      }
+      if (insertInsideInlineRow(firstRow, badge, win)) {
+        return;
       }
     }
 
@@ -670,7 +797,7 @@
         revision,
         blueCheck
       );
-      insertBadgeIntoContainer(container, nextBadge);
+      insertBadgeIntoContainer(container, nextBadge, targetWin);
       containerMeta.set(container, {
         userId,
         bindingId: bindingCtx.bindingId,

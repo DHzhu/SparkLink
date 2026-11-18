@@ -48,7 +48,7 @@ function createFlameSvg(doc) {
   core.setAttribute('class', 'sparklink-fire-core');
   core.setAttribute('cx', '12');
   core.setAttribute('cy', '12');
-  core.setAttribute('r', '9.5');
+  core.setAttribute('r', '8.2');
   svg.appendChild(core);
   const path = doc.createElementNS(SVG_NS, 'path');
   path.setAttribute('class', 'sparklink-fire-shape');
@@ -408,7 +408,7 @@ export function createPopupController(options = {}) {
     }
     const reasons = {
       rate_limited: 'X 已限流，同步已停止', verification: 'X 要求登录或验证，同步已停止', unavailable: 'X 暂时无法加载回复',
-      searched: '已查完各日期的首批搜索结果，可能有遗漏', search_stalled: '未读到当日搜索结果，无法判断当天是否有回复',
+      searched: '已按日期分段搜索近 7 天回复，可能有遗漏', search_stalled: '未读到当日搜索结果，无法判断当天是否有回复',
       first_page: '未读到回复列表第一页', end: '已读到列表末尾', boundary: '已读到 7 天边界', cancelled: '已停止',
       unrecognized: '部分回复无法识别', stalled: '页面未返回更多回复', timeout: '已达到本次读取时限',
       page_limit: '已达到本次读取上限，可能有遗漏', account_changed: '账号或采集会话已变化',
@@ -417,7 +417,7 @@ export function createPopupController(options = {}) {
     };
     const state = running ? '正在同步' : job.status === 'partial' ? '部分同步' : '同步结束';
     const progress = job.mode === 'search'
-      ? '正在搜索 ' + (job.searchQuery?.match(/since:(\d{4}-\d{2}-\d{2})/)?.[1] || '当日') + ' 的首批回复，同步期间请停留在该标签页'
+      ? '正在搜索 ' + (job.searchQuery?.match(/since:(\d{4}-\d{2}-\d{2})/)?.[1] || '当日') + ' 的回复，同步期间请停留在该标签页'
       : '正在读取本人回复列表，同步期间请停留在该标签页';
     const detail = running ? progress : reasons[job.reason] || '已停止';
     els.historyStatus.textContent = `@${job.handle} ${state} · ${detail}。已读取 ${job.pages} 页，新增 ${job.added} 条，重复 ${job.duplicates} 条。${cooldownText}`;
@@ -700,7 +700,13 @@ export function createPopupController(options = {}) {
           showFeedback('备份文件超过 9 MiB 上限，已拒绝导入');
           return;
         }
-        const rawText = await file.text();
+        let rawText;
+        try {
+          rawText = await file.text();
+        } catch (_err) {
+          showFeedback('读取备份文件失败，请确认文件可访问后重试');
+          return;
+        }
         const res = await sendToBackground({
           type: 'PREVIEW_IMPORT',
           rawText
@@ -831,6 +837,7 @@ export function createPopupController(options = {}) {
           if (res && res.ok) {
             if (userSelectedActorId === action.actorUserId) {
               userSelectedActorId = null;
+              userSelectedWhenActiveActorId = null;
             }
             if (confirmedViewedActorId === action.actorUserId) {
               confirmedViewedActorId = null;
@@ -846,9 +853,10 @@ export function createPopupController(options = {}) {
         if (action.type === 'CLEAR_ALL') {
           const res = await sendToBackground({ type: 'CLEAR_ALL' });
           closeModal();
-          userSelectedActorId = null;
-          confirmedViewedActorId = null;
           if (res && res.ok) {
+            userSelectedActorId = null;
+            userSelectedWhenActiveActorId = null;
+            confirmedViewedActorId = null;
             showFeedback('已清空全部数据并暂停采集');
           } else {
             showFeedback((res && res.message) || '清空全部数据失败');

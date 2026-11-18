@@ -666,3 +666,128 @@ test('Manual history button starts with foreground stay-on-tab guidance, toggles
   assert.equal(button.disabled, true);
   assert.match(byId.get('history-sync-status').textContent, /已停止.*后再次手动同步/);
 });
+
+test('Audit regressions: unreadable import file handling, preserved account selection on failed CLEAR_ALL, Top-20 core bounds, and multi-page search copy', async () => {
+  const { doc, byId } = createFakePopupDom();
+  const accA = {
+    actorUserId: '1001',
+    accountGeneration: 1,
+    handle: 'alice',
+    summary: {
+      totalReplies: 12,
+      activeTargetsCount: 1,
+      deepTargetsCount: 0,
+      latestReplyAt: NOW_MS - 1000,
+      top20: [
+        {
+          targetUserId: '9001',
+          handle: 'friend_one',
+          displayName: 'Friend One',
+          count: 12,
+          lastReplyAt: NOW_MS - 1000,
+          tierInfo: { tier: 'active', label: '高频互动', tooltip: '近30天已记录你回复TA 12 次（含导入）' }
+        }
+      ]
+    }
+  };
+  const accB = {
+    actorUserId: '2002',
+    accountGeneration: 1,
+    handle: 'bob',
+    summary: { totalReplies: 3, activeTargetsCount: 0, deepTargetsCount: 0, latestReplyAt: NOW_MS - 2000, top20: [] }
+  };
+
+  let clearAllShouldSucceed = false;
+  let historySync = {
+    id: 'job_s',
+    handle: 'alice',
+    status: 'running',
+    mode: 'search',
+    searchQuery: 'from:alice filter:replies since:2026-11-15 until:2026-11-16',
+    pages: 3,
+    added: 5,
+    duplicates: 1,
+    deadline: Date.now() + 240000
+  };
+  let previewCalled = false;
+  const snapshotCalls = [];
+
+  const runtime = {
+    async sendMessage(msg) {
+      if (msg.type === 'GET_POPUP_SNAPSHOT') {
+        snapshotCalls.push(msg);
+        const sel = msg.preferredActorUserId === '2002' ? accB : accA;
+        return {
+          ok: true,
+          debugLogsEnabled: false,
+          viewerStatus: 'bound',
+          activeTabActorUserId: '1001',
+          confirmedTabActorUserId: '1001',
+          settings: { collectionEnabled: true },
+          selectedAccount: sel,
+          savedAccounts: [accA, accB],
+          historySync,
+          historyNextStart: 0
+        };
+      }
+      if (msg.type === 'SET_POPUP_ACCOUNT') {
+        return { ok: true, saved: true, manualTabActorUserId: msg.actorUserId };
+      }
+      if (msg.type === 'PREVIEW_IMPORT') {
+        previewCalled = true;
+        return { ok: true };
+      }
+      if (msg.type === 'CLEAR_ALL') {
+        return clearAllShouldSucceed ? { ok: true } : { ok: false, message: '存储繁忙，清空失败' };
+      }
+      return { ok: true };
+    }
+  };
+
+  const ui = createPopupController({ document: doc, runtime });
+  await ui.init();
+
+  // 1. Top-20 tier pill flame core radius stays bounded inside outer flame valleys (< 8.5)
+  const pillCore = byId.get('top20-list').findAllByTag('circle').find((c) => c.getAttribute('class') === 'sparklink-fire-core');
+  assert.ok(pillCore);
+  assert.ok(Number(pillCore.getAttribute('r')) <= 8.5, 'Popup flame core radius must not bleed past outer valleys');
+
+  // 2. Running and completed search status strings reflect multi-page daily search (no stale "首批")
+  const runningSearchText = byId.get('history-sync-status').textContent;
+  assert.equal(runningSearchText.includes('2026-11-15'), true);
+  assert.equal(runningSearchText.includes('首批'), false);
+  historySync = { ...historySync, status: 'done', reason: 'searched' };
+  await ui.refresh();
+  const doneSearchText = byId.get('history-sync-status').textContent;
+  assert.equal(doneSearchText.includes('首批'), false);
+
+  // 3. Unreadable file in #file-import change handler catches rejection and shows deterministic feedback
+  byId.get('file-import').files = [
+    {
+      name: 'unreadable.json',
+      size: 128,
+      async text() {
+        throw new Error('NotReadableError: The requested file could not be read');
+      }
+    }
+  ];
+  await byId.get('file-import').trigger('change');
+  assert.equal(previewCalled, false);
+  assert.match(byId.get('action-feedback').textContent, /读取备份文件失败/);
+
+  // 4. Failed CLEAR_ALL preserves explicit account selection ('2002'), while successful CLEAR_ALL resets it
+  byId.get('account-select').value = '2002';
+  await byId.get('account-select').trigger('change');
+  assert.equal(snapshotCalls.at(-1).preferredActorUserId, '2002');
+
+  await byId.get('btn-clear-all').trigger('click');
+  await byId.get('btn-modal-confirm').trigger('click');
+  assert.match(byId.get('action-feedback').textContent, /存储繁忙/);
+  assert.equal(snapshotCalls.at(-1).preferredActorUserId, '2002', 'Failed CLEAR_ALL must not wipe userSelectedActorId');
+
+  clearAllShouldSucceed = true;
+  await byId.get('btn-clear-all').trigger('click');
+  await byId.get('btn-modal-confirm').trigger('click');
+  assert.equal(snapshotCalls.at(-1).preferredActorUserId ?? null, null, 'Successful CLEAR_ALL resets userSelectedActorId');
+});
+

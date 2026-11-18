@@ -112,6 +112,12 @@ class FakeElement {
     return child;
   }
 
+  prepend(child) {
+    if (child.parentNode) child.remove();
+    child.parentNode = this;
+    this.children.unshift(child);
+  }
+
   removeChild(child) {
     const idx = this.children.indexOf(child);
     if (idx !== -1) {
@@ -144,6 +150,7 @@ class FakeElement {
   }
 
   matches(selector) {
+    if (selector === 'path') return this.tagName === 'PATH';
     if (selector === '[data-testid="User-Name"]') {
       return this.getAttribute('data-testid') === 'User-Name';
     }
@@ -153,8 +160,8 @@ class FakeElement {
     if (selector === 'svg[data-testid="icon-verified"]') {
       return this.tagName === 'SVG' && this.getAttribute('data-testid') === 'icon-verified';
     }
-    if (selector === '.sparklink-badge') {
-      return this.classList.contains('sparklink-badge');
+    if (selector.startsWith('.')) {
+      return this.classList.contains(selector.slice(1));
     }
     if (selector === 'a[href*="/status/"]') {
       const href = this.getAttribute('href') || '';
@@ -218,6 +225,10 @@ function buildTweetCard({ handle, displayName, tweetId, verified = false }) {
   if (verified) {
     const verifiedSvg = new FakeElement('svg', 'http://www.w3.org/2000/svg');
     verifiedSvg.setAttribute('data-testid', 'icon-verified');
+    verifiedSvg.setAttribute('aria-label', 'Verified account');
+    const original = new FakeElement('path', 'http://www.w3.org/2000/svg');
+    original.setAttribute('fill', '#1d9bf0');
+    verifiedSvg.appendChild(original);
     profileLink.appendChild(verifiedSvg);
   }
   nameRow.appendChild(profileLink);
@@ -363,11 +374,19 @@ function createFakeDomAndBridge(countsMap) {
   return { win, doc, body, bridge };
 }
 
-test('Content badges render SVG tiers (0/5/25/55), respect verified layout, handle virtual-list node reuse A->B, drop stale bindings, and refresh expired counts within 60s', async () => {
+async function waitForBadgeState(predicate, description) {
+  const deadline = Date.now() + 2000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) assert.fail(description);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test('Content badges render SVG tiers (0/5/25/55), respect verified layout, handle virtual-list node reuse A->B, drop stale bindings, and refresh expired counts within 60s', async (t) => {
   const counts = {
     '2001': 5,  // acquaintance (1-10)
     '2002': 25, // active (11-50)
-    '2003': 55, // deep (>=51, shows count)
+    '2003': 55, // deep (>=51)
     '2004': 0   // none (not rendered)
   };
 
@@ -390,11 +409,24 @@ test('Content badges render SVG tiers (0/5/25/55), respect verified layout, hand
     windowRefreshMs: 40
   });
 
-  await new Promise((r) => setTimeout(r, 35));
+  t.after(() => controller.destroy());
+  await waitForBadgeState(
+    () => [card1, card2, card3].every((card) => card.userNameBox.querySelector('.sparklink-badge')),
+    'All three initial badge tiers should render'
+  );
 
   const badge1 = card1.userNameBox.querySelector('.sparklink-badge');
   const badge2 = card2.userNameBox.querySelector('.sparklink-badge');
   const badge3 = card3.userNameBox.querySelector('.sparklink-badge');
+
+  const native = card1.profileLink.querySelector('svg[data-testid="icon-verified"]');
+  const overlay = native.querySelector('.sparklink-native-fire');
+  assert.ok(overlay, 'Paint flames on the existing blue check');
+  assert.equal(overlay.getAttribute('aria-hidden'), 'true');
+  assert.equal(native.parentNode, card1.profileLink);
+  assert.equal(native.getAttribute('aria-label'), 'Verified account');
+  assert.equal(badge1.querySelector('.sparklink-fire-art'), null);
+  assert.ok(badge2.querySelector('.sparklink-fire-core'), 'Unverified authors have a blank white core');
 
   assert.ok(badge1);
   assert.equal(badge1.classList.contains('sparklink-tier-acquaintance'), true);
@@ -407,7 +439,8 @@ test('Content badges render SVG tiers (0/5/25/55), respect verified layout, hand
 
   assert.ok(badge3);
   assert.equal(badge3.classList.contains('sparklink-tier-deep'), true);
-  assert.equal(badge3.textContent, '55');
+  assert.equal(badge3.textContent, '');
+  assert.equal(badge3.getAttribute('aria-label'), '近30天已记录你回复TA 55 次（含导入）');
   assert.ok(badge3.querySelector('svg[data-testid="icon-verified"]') === null);
 
   // Zero count & unmapped handle must NOT render any badge
@@ -420,7 +453,7 @@ test('Content badges render SVG tiers (0/5/25/55), respect verified layout, hand
   card3.handleSpan.textContent = '@user_zero';
   win.triggerMutations([{ type: 'attributes', target: card3.profileLink }]);
 
-  await new Promise((r) => setTimeout(r, 35));
+  await waitForBadgeState(() => !card3.userNameBox.querySelector('.sparklink-badge'), 'Recycled zero-count row');
   // Old badge from user_t3 MUST be removed, and no duplicate inserted!
   assert.equal(card3.userNameBox.querySelectorAll('.sparklink-badge').length, 0);
 
@@ -430,7 +463,7 @@ test('Content badges render SVG tiers (0/5/25/55), respect verified layout, hand
   card3.handleSpan.textContent = '@user_t2';
   win.triggerMutations([{ type: 'attributes', target: card3.profileLink }]);
 
-  await new Promise((r) => setTimeout(r, 35));
+  await waitForBadgeState(() => card3.userNameBox.querySelector('.sparklink-tier-active'), 'Recycled active row');
   const recycledBadges = card3.userNameBox.querySelectorAll('.sparklink-badge');
   assert.equal(recycledBadges.length, 1);
   assert.equal(recycledBadges[0].classList.contains('sparklink-tier-active'), true);
@@ -440,7 +473,10 @@ test('Content badges render SVG tiers (0/5/25/55), respect verified layout, hand
   counts['2002'] = 8;
   counts['2001'] = 0;
 
-  await new Promise((r) => setTimeout(r, 65));
+  await waitForBadgeState(
+    () => !card1.userNameBox.querySelector('.sparklink-badge') && card2.userNameBox.querySelector('.sparklink-tier-acquaintance'),
+    'Expired counts should remove or downgrade the affected badges'
+  );
   assert.equal(card1.userNameBox.querySelector('.sparklink-badge'), null);
   assert.equal(
     card2.userNameBox.querySelector('.sparklink-badge').classList.contains('sparklink-tier-acquaintance'),
@@ -451,18 +487,46 @@ test('Content badges render SVG tiers (0/5/25/55), respect verified layout, hand
   bridge.setBinding(null, 99);
   bridge.emitEvent({ type: 'BINDING_REVOKED', bindingId: 'bind_1' });
   assert.equal(body.querySelectorAll('.sparklink-badge').length, 0);
-
-  controller.destroy();
+  assert.equal(body.querySelectorAll('.sparklink-native-fire').length, 0);
 });
 
-test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-mutation ignore, chunked frame slicing, and stale async query discard', async () => {
+test('The same author can gain, replace and lose a blue check at the same count', async (t) => {
+  const { win, bridge, body } = createFakeDomAndBridge({ '2001': 25 });
+  const row = buildTweetCard({ handle: 'user_t1', displayName: 'Author', verified: true });
+  body.appendChild(row.article);
+  const native = row.profileLink.querySelector('svg[data-testid="icon-verified"]');
+  const paint = native.children[0];
+  const controller = installContentBadges(win, bridge, { debounceMs: 1 });
+  t.after(() => controller.destroy());
+  await waitForBadgeState(() => native.querySelector('.sparklink-native-fire'), 'Initial blue check');
+
+  paint.setAttribute('fill', '#c8a400');
+  win.triggerMutations([{ type: 'attributes', attributeName: 'fill', target: paint }]);
+  await waitForBadgeState(() => row.userNameBox.querySelector('.sparklink-fire-core'), 'Gold check uses standalone flames');
+  assert.equal(native.querySelector('.sparklink-native-fire'), null);
+  const replacement = new FakeElement('svg', 'http://www.w3.org/2000/svg');
+  replacement.setAttribute('data-testid', 'icon-verified');
+  replacement.setAttribute('fill', '#1d9bf0');
+  native.remove();
+  row.profileLink.appendChild(replacement);
+  win.triggerMutations([{ type: 'childList', target: row.profileLink, addedNodes: [replacement], removedNodes: [native] }]);
+  await waitForBadgeState(() => replacement.querySelector('.sparklink-native-fire'), 'Moved back to a blue check');
+  assert.equal(row.userNameBox.querySelector('.sparklink-fire-core'), null);
+  replacement.remove();
+  win.triggerMutations([{ type: 'childList', target: row.profileLink, addedNodes: [], removedNodes: [replacement] }]);
+  await waitForBadgeState(() => row.userNameBox.querySelector('.sparklink-fire-core'), 'Blue check removed');
+  assert.equal(replacement.querySelector('.sparklink-native-fire'), null);
+  assert.equal(row.userNameBox.querySelectorAll('.sparklink-badge').length, 1);
+});
+
+test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-mutation ignore, chunked frame slicing, and stale async query discard', async (t) => {
   assert.equal(getTierMeta(0).key, 'none');
   assert.equal(getTierMeta(1).key, 'acquaintance');
   assert.equal(getTierMeta(10).key, 'acquaintance');
   assert.equal(getTierMeta(11).key, 'active');
   assert.equal(getTierMeta(50).key, 'active');
   assert.equal(getTierMeta(51).key, 'deep');
-  assert.equal(getTierMeta(51).showCount, true);
+  assert.equal(getTierMeta(51).showCount, false);
 
   const counts = {
     '2001': 10,
@@ -485,6 +549,7 @@ test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-muta
     }
   });
   assert.equal(installContentBadges(win, bridge), controller);
+  t.after(() => controller.destroy());
 
   // Conflicting card: profile link says user_t1, @handle span says @user_t2 -> must NOT render badge
   const conflictCard = buildTweetCard({ handle: 'user_t1', displayName: 'Conflict' });
@@ -512,7 +577,10 @@ test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-muta
     }
   ]);
 
-  await new Promise((r) => setTimeout(r, 40));
+  await waitForBadgeState(
+    () => reservedLinkCard.userNameBox.querySelector('.sparklink-badge') && selfCard.userNameBox.querySelector('.sparklink-badge'),
+    'Both cards should finish rendering across separate frames'
+  );
 
   assert.equal(conflictCard.userNameBox.querySelector('.sparklink-badge'), null);
   assert.equal(
@@ -522,7 +590,7 @@ test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-muta
   const badge51 = selfCard.userNameBox.querySelector('.sparklink-badge');
   assert.ok(badge51);
   assert.equal(badge51.classList.contains('sparklink-tier-deep'), true);
-  assert.equal(badge51.textContent, '51');
+  assert.equal(badge51.textContent, '');
 
   // Self-mutation (only .sparklink-badge added/removed) is ignored cleanly
   win.triggerMutations([
@@ -538,17 +606,18 @@ test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-muta
   counts['2003'] = 50; // downgrade 51 -> 50 (active, no count text)
   bridge.emitEvent({ type: 'MAPPINGS_UPDATED' });
   bridge.emitEvent({ type: 'REVISION_UPDATED', revision: 2 });
-  await new Promise((r) => setTimeout(r, 35));
+  await waitForBadgeState(() => selfCard.userNameBox.querySelector('.sparklink-tier-active'), 'Tier downgrade after revision');
   assert.equal(
     selfCard.userNameBox.querySelector('.sparklink-badge').classList.contains('sparklink-tier-active'),
     true
   );
   assert.equal(selfCard.userNameBox.querySelector('.sparklink-badge').textContent, '');
 
+  counts['2003'] = 5;
   doc.visibilityState = 'visible';
   win.triggerDocEvent('visibilitychange');
   controller.refreshNow();
-  await new Promise((r) => setTimeout(r, 30));
+  await waitForBadgeState(() => selfCard.userNameBox.querySelector('.sparklink-tier-acquaintance'), 'Visible document refresh');
 
   // Stale async queryCounts response arriving after account switch A -> B must be discarded!
   let resolveSlowQuery;
@@ -568,7 +637,7 @@ test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-muta
     10
   );
   bridge.emitEvent({ type: 'BINDING_READY' });
-  await new Promise((r) => setTimeout(r, 15));
+  await waitForBadgeState(() => Boolean(resolveSlowQuery), 'Slow query should have started');
 
   // Switch to unbound / different account BEFORE slow query resolves
   bridge.setBinding(null, 11);
@@ -579,7 +648,7 @@ test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-muta
     revision: 10,
     bindingId: 'bind_slow_A'
   });
-  await new Promise((r) => setTimeout(r, 25));
+  await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(body.querySelectorAll('.sparklink-badge').length, 0);
 
@@ -587,7 +656,7 @@ test('Tier boundaries (0/1/10/11/50/51), conflicting/reserved handles, self-muta
   controller.destroy(); // idempotent
 });
 
-test('[P2] Coalesced author inline runs with middle-dot timestamps, bidi isolates, segmented handles, email display names, glued handles, and overlong tokens', async () => {
+test('[P2] Coalesced author inline runs with middle-dot timestamps, bidi isolates, segmented handles, email display names, glued handles, and overlong tokens', async (t) => {
   const counts = {
     '3001': 12, // sample_friend -> active
     '3002': 4 // sample_me -> acquaintance
@@ -604,6 +673,8 @@ test('[P2] Coalesced author inline runs with middle-dot timestamps, bidi isolate
     frameBudgetMs: 50,
     windowRefreshMs: 60000
   });
+
+  t.after(() => controller.destroy());
 
   function makeAuthorBox() {
     const article = new FakeElement('article');
@@ -714,7 +785,10 @@ test('[P2] Coalesced author inline runs with middle-dot timestamps, bidi isolate
   overlongBox.appendChild(metaRow9);
 
   controller.refreshNow();
-  await new Promise((r) => setTimeout(r, 45));
+  await waitForBadgeState(
+    () => [linklessSpans, linklessSingle, emailDisplay].every((box) => box.querySelector('.sparklink-badge')),
+    'Each unambiguous author row should render its badge'
+  );
 
   assert.equal(
     conflictSpaced.querySelector('.sparklink-badge'),
@@ -742,8 +816,33 @@ test('[P2] Coalesced author inline runs with middle-dot timestamps, bidi isolate
   );
   assert.equal(gluedConflict.querySelector('.sparklink-badge'), null);
   assert.equal(overlongBox.querySelector('.sparklink-badge'), null);
-
-  controller.destroy();
 });
 
+test('Display-name mentions neither identify an author nor override a separate handle field', async (t) => {
+  const { win, body, bridge } = createFakeDomAndBridge({ '2001': 5 });
+  const mentionRows = [
+    ['Editor (@user_t1)'],
+    ['@user_t1, guest editor'],
+    ['Editor (', '@user_t1', ')']
+  ].map((pieces) => {
+    const row = new FakeElement('div');
+    row.setAttribute('data-testid', 'User-Name');
+    for (const text of pieces) {
+      const span = new FakeElement('span');
+      span.textContent = text;
+      row.appendChild(span);
+    }
+    body.appendChild(row);
+    return row;
+  });
+  const author = buildTweetCard({ handle: 'user_t1', displayName: 'Editor at @newsroom' });
+  body.appendChild(author.article);
+  const control = buildTweetCard({ handle: 'user_t1', displayName: 'Editor' });
+  body.appendChild(control.article);
 
+  const controller = installContentBadges(win, bridge, { debounceMs: 1, frameBudgetMs: 1000 });
+  t.after(() => controller.destroy());
+  await waitForBadgeState(() => control.userNameBox.querySelector('.sparklink-badge'), 'Control author should render');
+  for (const row of mentionRows) assert.ok(!row.querySelector('.sparklink-badge'), row.textContent);
+  assert.equal(author.userNameBox.querySelector('.sparklink-badge')?.dataset.sparklinkUserId, '2001');
+});

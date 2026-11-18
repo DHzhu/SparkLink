@@ -52,7 +52,7 @@ export function getBadgeTier(count) {
     tier: 'deep',
     label: '深度互动',
     render: true,
-    showCount: true,
+    showCount: false,
     tooltip: formatBadgeTooltip(safeCount)
   };
 }

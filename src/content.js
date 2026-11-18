@@ -2,8 +2,8 @@
   'use strict';
 
   const SVG_NS = 'http://www.w3.org/2000/svg';
-  const FLAME_PATH_D =
-    'M8.6 1.2c.3 2.1-.6 3.5-1.8 4.8-1.1 1.2-2.1 2.4-2.1 4.2 0 2.3 1.8 4.1 4.1 4.1 2.6 0 4.5-2.1 4.5-4.8 0-2.6-1.6-4.7-3.1-6.1-.2 1.1-.8 1.9-1.6 2.4.3-1.4.4-2.9 0-4.6z';
+  const VERIFIED_SELECTOR = 'svg[data-testid="icon-verified"]';
+  const BLUE_CHECK_PAINTS = new Set(['rgb(29,155,240)', '#1d9bf0', 'rgb(29,161,242)', '#1da1f2']);
 
   const DEFAULT_DEBOUNCE_MS = 150;
   const DEFAULT_FRAME_BUDGET_MS = 8;
@@ -31,6 +31,8 @@
 
   const PROFILE_HREF_RE = /^\/([A-Za-z0-9_]{1,64})\/?$/;
   const STATUS_HREF_RE = /^\/([A-Za-z0-9_]{1,64})\/status\/([1-9][0-9]{0,31})(?:[/?#]|$)/;
+  // A username field may include punctuation, another handle, or a timestamp after the handle.
+  const HANDLE_FIELD_RE = /^[\s\p{P}]*@[A-Za-z0-9_]+(?![A-Za-z0-9_])[\s\p{P}]*(?:$|[@·•‧・]|\d+[smhdw]\s*$)/u;
   const BIDI_FORMAT_RE = /[‎‏‪-‮⁦-⁩]/g;
   const INLINE_CONTINUATION_TAGS = new Set([
     'SPAN',
@@ -85,7 +87,7 @@
     return {
       key: 'deep',
       className: 'sparklink-tier-deep',
-      showCount: true,
+      showCount: false,
       ariaLabel
     };
   }
@@ -97,7 +99,8 @@
     if (node.classList && node.classList.contains('sparklink-badge')) {
       return true;
     }
-    if (typeof node.closest === 'function' && node.closest('.sparklink-badge')) {
+    if (typeof node.closest === 'function' &&
+        (node.closest('.sparklink-badge') || node.closest('.sparklink-native-fire'))) {
       return true;
     }
     return false;
@@ -133,7 +136,7 @@
       if (
         splitLeadingAt &&
         current.length > 0 &&
-        !/\s$/.test(current) &&
+        !/[\s\p{Ps}\p{Pi}]$/u.test(current) &&
         piece.charCodeAt(0) === 64
       ) {
         flush();
@@ -215,6 +218,9 @@
       return true;
     }
     const clean = raw.replace(BIDI_FORMAT_RE, '');
+    if (!HANDLE_FIELD_RE.test(clean)) {
+      return true;
+    }
     const len = clean.length;
     let idx = 0;
     let prevTokenWasHandle = false;
@@ -369,9 +375,40 @@
     return tweetUserId || handleUserId || null;
   }
 
-  function createBadgeElement(doc, count, tier, userId, bindingId, revision) {
+  function findBlueCheck(container, win) {
+    const icon = container.querySelector(VERIFIED_SELECTOR);
+    if (!icon) return null;
+    const nativePaths = Array.from(icon.querySelectorAll('path')).filter((path) => !isSparklinkNode(path));
+    for (const node of nativePaths.length ? nativePaths : [icon]) {
+      const paint = win.getComputedStyle?.(node).fill || node.getAttribute('fill') || '';
+      if (BLUE_CHECK_PAINTS.has(paint.toLowerCase().replace(/\s/g, ''))) return icon;
+    }
+    return null;
+  }
+
+  function createFireArt(doc, tier, onCheck) {
+    const svg = doc.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('class', `sparklink-fire-art ${tier.className}${onCheck ? ' sparklink-native-fire' : ''}`);
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('focusable', 'false');
+    if (!onCheck) {
+      const core = doc.createElementNS(SVG_NS, 'circle');
+      core.setAttribute('class', 'sparklink-fire-core');
+      core.setAttribute('cx', '12');
+      core.setAttribute('cy', '12');
+      core.setAttribute('r', '9.5');
+      svg.appendChild(core);
+    }
+    const plume = doc.createElementNS(SVG_NS, 'path');
+    plume.setAttribute('class', 'sparklink-fire-shape');
+    svg.appendChild(plume);
+    return svg;
+  }
+
+  function createBadgeElement(doc, count, tier, userId, bindingId, revision, blueCheck) {
     const badge = doc.createElement('span');
-    badge.className = `sparklink-badge ${tier.className}`;
+    badge.className = `sparklink-badge ${tier.className}${blueCheck ? ' sparklink-badge-on-check' : ''}`;
     badge.setAttribute('role', 'img');
     badge.setAttribute('aria-label', tier.ariaLabel);
     badge.setAttribute('title', tier.ariaLabel);
@@ -381,25 +418,11 @@
     badge.dataset.sparklinkTier = tier.key;
     badge.dataset.sparklinkCount = String(count);
 
-    const svg = doc.createElementNS(SVG_NS, 'svg');
-    svg.setAttribute('viewBox', '0 0 16 16');
-    svg.setAttribute('width', '14');
-    svg.setAttribute('height', '14');
-    svg.setAttribute('aria-hidden', 'true');
-    svg.setAttribute('focusable', 'false');
-    svg.setAttribute('class', 'sparklink-flame-icon');
-
-    const path = doc.createElementNS(SVG_NS, 'path');
-    path.setAttribute('d', FLAME_PATH_D);
-    path.setAttribute('fill', 'currentColor');
-    svg.appendChild(path);
-    badge.appendChild(svg);
-
-    if (tier.showCount) {
-      const countSpan = doc.createElement('span');
-      countSpan.className = 'sparklink-badge-count';
-      countSpan.textContent = String(count);
-      badge.appendChild(countSpan);
+    const art = createFireArt(doc, tier, Boolean(blueCheck));
+    if (blueCheck) {
+      blueCheck.prepend(art);
+    } else {
+      badge.appendChild(art);
     }
 
     return badge;
@@ -413,10 +436,11 @@
     for (let i = 0; i < existing.length; i += 1) {
       existing[i].remove();
     }
+    for (const art of Array.from(container.querySelectorAll('.sparklink-native-fire'))) art.remove();
   }
 
   function insertBadgeIntoContainer(container, badge) {
-    const verifiedIcon = container.querySelector('svg[data-testid="icon-verified"]');
+    const verifiedIcon = container.querySelector(VERIFIED_SELECTOR);
     if (verifiedIcon) {
       const enclosingLink =
         typeof verifiedIcon.closest === 'function'
@@ -511,10 +535,7 @@
     }
 
     function clearAllBadges() {
-      const allBadges = doc.querySelectorAll('.sparklink-badge');
-      for (let i = 0; i < allBadges.length; i += 1) {
-        allBadges[i].remove();
-      }
+      removeContainerBadges(doc);
     }
 
     function collectFromSubtree(node) {
@@ -614,10 +635,14 @@
         return;
       }
 
+      const blueCheck = findBlueCheck(container, targetWin);
       const existingBadges = container.querySelectorAll('.sparklink-badge');
       if (existingBadges.length === 1) {
         const currentBadge = existingBadges[0];
+        const overlay = container.querySelector('.sparklink-native-fire');
         if (
+          currentBadge.classList.contains('sparklink-badge-on-check') === Boolean(blueCheck) &&
+          (overlay?.parentNode || null) === blueCheck &&
           currentBadge.dataset.sparklinkUserId === userId &&
           currentBadge.dataset.sparklinkBindingId === bindingCtx.bindingId &&
           currentBadge.dataset.sparklinkTier === tier.key &&
@@ -642,7 +667,8 @@
         tier,
         userId,
         bindingCtx.bindingId,
-        revision
+        revision,
+        blueCheck
       );
       insertBadgeIntoContainer(container, nextBadge);
       containerMeta.set(container, {
@@ -797,11 +823,22 @@
         if (!rec || isSparklinkNode(rec.target)) {
           continue;
         }
+        if (rec.type === 'attributes' && rec.attributeName && rec.attributeName !== 'href' &&
+            !rec.target.closest?.('[data-testid="User-Name"]')) continue;
         if (rec.type === 'childList') {
           const onlyOurs =
             isOnlySparklinkNodes(rec.addedNodes) && isOnlySparklinkNodes(rec.removedNodes);
           if (onlyOurs) {
+            if (rec.removedNodes?.length && rec.target.matches?.(VERIFIED_SELECTOR)) {
+              collectFromSubtree(rec.target);
+              hasRelevantChange = true;
+            }
             continue;
+          }
+          for (const node of Array.from(rec.removedNodes || [])) {
+            if (node.nodeType === 1 && (!node.isConnected || !node.closest?.('[data-testid="User-Name"]'))) {
+              removeContainerBadges(node);
+            }
           }
           if (rec.addedNodes) {
             for (let j = 0; j < rec.addedNodes.length; j += 1) {
@@ -828,7 +865,7 @@
         childList: true,
         subtree: true,
         attributes: true,
-        attributeFilter: ['href']
+        attributeFilter: ['href', 'data-testid', 'fill', 'color', 'class', 'style']
       });
     }
 

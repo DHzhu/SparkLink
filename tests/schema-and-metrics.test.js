@@ -280,7 +280,7 @@ test('Metrics enforce exact 30x24h rolling boundaries, badge tiers (0/1/10/11/50
   assert.equal(getBadgeTier(11).tier, 'active');
   assert.equal(getBadgeTier(50).tier, 'active');
   assert.equal(getBadgeTier(51).tier, 'deep');
-  assert.equal(getBadgeTier(51).showCount, true);
+  assert.equal(getBadgeTier(51).showCount, false);
   assert.equal(getBadgeTier(51).tooltip, '近30天已记录你回复TA 51 次（含导入）');
 
   const replies = {};

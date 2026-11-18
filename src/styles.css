@@ -1,51 +1,77 @@
-/* SparkLink - 星火链 Content Badge Styles (MV3 Light/Dark Compatible, Zero Continuous Animation) */
+/* The native check and all three flame sizes share the same center. */
+.sparklink-tier-acquaintance { --sparklink-fire-scale: 0.88; }
+.sparklink-tier-active { --sparklink-fire-scale: 1.03; }
+.sparklink-tier-deep { --sparklink-fire-scale: 1.20; }
 
 .sparklink-badge {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  margin-left: 4px;
-  padding: 0 2px;
+  gap: 4px;
+  margin-inline-start: 4px;
+  padding-inline: 2px;
   vertical-align: middle;
-  line-height: 1;
-  font-size: 12px;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font: 600 12px/1 system-ui, sans-serif;
+  color: inherit;
   user-select: none;
   flex-shrink: 0;
-  pointer-events: auto;
 }
 
-.sparklink-flame-icon {
-  width: 14px;
-  height: 14px;
+.sparklink-fire-art {
   display: inline-block;
+  width: 16px;
+  height: 16px;
+  overflow: visible;
   flex-shrink: 0;
+  pointer-events: none;
 }
 
-.sparklink-badge-count {
-  font-variant-numeric: tabular-nums;
-  line-height: 1;
+svg[data-testid="icon-verified"]:has(> .sparklink-native-fire) {
+  overflow: visible;
 }
 
-.sparklink-tier-acquaintance {
-  color: #536471;
-  opacity: 0.45;
+svg.sparklink-native-fire {
+  width: 100%;
+  height: 100%;
 }
 
-@media (prefers-color-scheme: dark) {
-  .sparklink-tier-acquaintance {
-    color: #8b98a5;
-    opacity: 0.45;
+.sparklink-fire-art > .sparklink-fire-core,
+.sparklink-fire-art > .sparklink-fire-shape {
+  transform-origin: 50% 50%;
+  transform-box: view-box;
+  transform: scale(var(--sparklink-fire-scale, 1));
+}
+
+.sparklink-fire-art > .sparklink-fire-core {
+  fill: #fff;
+}
+
+.sparklink-fire-art > .sparklink-fire-shape {
+  /* The cutout also keeps a transparent check cut into X's native SVG clear. */
+  d: path("M12 24 C5.1 24 0.1 20.4 -0.8 14.8 C-1.4 11.9 0 10.2 -1.6 6.5 C1 7.5 2.2 9 2.9 10.7 C2.6 6.5 4.1 4.8 2.8 0.7 C5.5 1.8 7.2 4 7.8 6.2 C7.7 2.2 11.7 0 10.9 -5.1 C14.5 -2.9 15.8 0.4 15.5 3.5 C17.5 1.9 18.3 0.1 18.3 -2.4 C21.4 0.7 21 4 20.2 7.2 C22.5 6 23.6 4.5 24.1 2.9 C25.3 6.3 23.4 9.5 23.5 11.3 C24.9 10.8 25.6 9.8 26.2 8.8 C26.9 15.7 23.3 24 12 24 Z M20.4 12 A8.4 8.4 0 1 0 3.6 12 A8.4 8.4 0 1 0 20.4 12 Z");
+  fill: #ff7a00;
+  fill-rule: evenodd;
+}
+
+.sparklink-badge-on-check {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  svg[data-testid="icon-verified"]:hover > .sparklink-native-fire > .sparklink-fire-shape,
+  .sparklink-badge:hover .sparklink-fire-shape,
+  .tier-pill:hover .sparklink-fire-shape {
+    animation: sparklink-fire-flicker 480ms ease-in-out 1;
   }
 }
 
-.sparklink-tier-active {
-  color: #ff7a00;
-  opacity: 1;
-}
-
-.sparklink-tier-deep {
-  color: #ff2e00;
-  font-weight: 700;
-  opacity: 1;
+@keyframes sparklink-fire-flicker {
+  35% { rotate: -3deg; scale: 0.98 1.06; }
+  70% { rotate: 2deg; scale: 1.02 0.99; }
 }

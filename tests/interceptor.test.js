@@ -162,6 +162,9 @@ function createMockEnvironment(fetchImpl) {
     postMessage(data, targetOrigin) {
       outboundMessages.push({ data, targetOrigin });
     },
+    restoreFromCache() {
+      for (const fn of listeners.get('pageshow') || []) fn({ persisted: true });
+    },
     dispatchBridgeMessage(data, origin = 'https://x.com', source = win) {
       const set = listeners.get('message');
       if (set) {
@@ -269,6 +272,39 @@ test('Pause-then-resume during in-flight request discards late response from old
     outboundMessages.filter((m) => m.data.type === 'OBSERVED_EVENTS').length,
     0
   );
+});
+
+test('Viewer requests started before BFCache restoration cannot confirm the restored document', async () => {
+  let finishFetch;
+  const { win, FakeXHR, outboundMessages } = createMockEnvironment(() =>
+    new Promise((resolve) => { finishFetch = resolve; })
+  );
+  delete win.__INITIAL_STATE__;
+  installMainInterceptor(win, adapterApi);
+  win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1', type: 'BRIDGE_INIT', nonce: 'cache-restore',
+    collectionEnabled: true, captureSessionId: 1, bindingContext: null
+  });
+  const url = 'https://x.com/i/api/graphql/viewerTest/Viewer';
+  const pending = win.fetch(url);
+  const xhr = new FakeXHR();
+  xhr.open('GET', url);
+  xhr.send();
+  const payload = viewerFixtures.viewerGraphqlLegacy;
+  const response = createStreamingResponse(JSON.stringify(payload));
+  win.restoreFromCache();
+  xhr.dispatchLoad(200, payload, 'json');
+  finishFetch(response.res);
+  await pending;
+  await new Promise((resolve) => setImmediate(resolve));
+  const viewerMessages = () => outboundMessages.filter(({ data }) => data.type === 'VIEWER_EVIDENCE');
+  assert.equal(response.getCloneCalled(), 0);
+  assert.equal(viewerMessages().length, 0);
+
+  xhr.open('GET', url);
+  xhr.send();
+  xhr.dispatchLoad(200, payload, 'json');
+  assert.equal(viewerMessages().at(-1)?.data.viewer.actorUserId, '9009009');
 });
 
 test('Active bound interceptor captures fetch & reused XHR across responseTypes, enforces 4-clone concurrency, 2 MiB size limit, and 2s timeout', async () => {
@@ -547,4 +583,348 @@ test('Defensive & mapping branches: Request/URL inputs, Viewer GraphQL, AUTHOR_M
     nonce: 'nonce_def_1'
   });
   assert.ok(outboundMessages.filter((m) => m.data.type === 'VIEWER_EVIDENCE').length >= 2);
+});
+
+test('Manual stop signals preserve native responses for HTTP limits, authentication and GraphQL errors', async () => {
+  const { win, outboundMessages } = createMockEnvironment(() => Promise.resolve(
+    new Response('{}', { status: 429, headers: { 'Retry-After': '7200' } })
+  ));
+  installMainInterceptor(win, adapterApi);
+  win.dispatchBridgeMessage({ protocol: 'SPARKLINK_BRIDGE_V1', type: 'BRIDGE_INIT', nonce: 'history_nonce',
+    collectionEnabled: true, captureSessionId: 10, bindingContext: BINDING_A });
+  const url = timelineFixtures.ownRepliesTimelineMixed.requestUrl;
+  const before = Date.now();
+  const response = await win.fetch(url);
+  assert.equal(response.status, 429);
+  assert.equal(await response.text(), '{}');
+  const xhr = new win.XMLHttpRequest();
+  const reset = Math.ceil(before / 1000) + 10800;
+  xhr.getResponseHeader = (name) => name === 'x-rate-limit-reset' ? String(reset) : null;
+  for (const [status, errors] of [[403, []], [200, [{ code: 88 }]], [200, [{ code: 326 }]], [503, []]]) {
+    xhr.open('GET', url);
+    xhr.send();
+    xhr.dispatchLoad(status, { errors }, 'json');
+  }
+  const signals = outboundMessages.filter(m => m.data.type === 'HISTORY_STOP').map(m => m.data);
+  assert.deepEqual(signals.map(m => m.reason), ['rate_limited', 'verification', 'rate_limited', 'verification', 'unavailable']);
+  assert.ok(signals[0].retryAt >= before + 7200000);
+  assert.equal(signals[2].retryAt, reset * 1000);
+  assert.ok(signals.every(m => m.captureSessionId === 10));
+});
+
+test('An authorized cursor grant reuses only the observed own replies GET and drops duplicate grants and redirects', async (t) => {
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  const requests = [];
+  const payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  const entries = payload.data.user.result.timeline_v2.timeline.instructions.find(i => Array.isArray(i.entries)).entries;
+  for (const entry of entries) if (entry.content?.cursorType === 'Bottom') entry.content.value = 'page-two';
+  if (!entries.some(e => e.content?.cursorType === 'Bottom')) {
+    entries.push({ entryId: 'cursor-bottom', content: { cursorType: 'Bottom', value: 'page-two' } });
+  }
+  const { win, outboundMessages } = createMockEnvironment(async (input, init) => {
+    requests.push({ input, init });
+    return new Response(JSON.stringify(payload));
+  });
+  const msg = (type, extra) => win.dispatchBridgeMessage({ type, protocol: 'SPARKLINK_BRIDGE_V1', nonce: 'history_cursor', ...extra });
+  const state = { collectionEnabled: true, captureSessionId: BINDING_A.captureSessionId, bindingContext: BINDING_A,
+    historyScope: { id: 'job', actor: BINDING_A.actorUserId, deadline: clock + 300000, query: null } };
+  installMainInterceptor(win, adapterApi);
+  msg('BRIDGE_INIT', state);
+  const grant = { jobId: 'job', bindingId: BINDING_A.bindingId };
+  const url = timelineFixtures.ownRepliesTimelineMixed.requestUrl;
+  const pages = () => outboundMessages.filter(m => m.data.historyPage);
+  const waitPage = async (num) => {
+    for (let i = 0; i < 100 && pages().length < num; ++i) await new Promise(r => setTimeout(r, 2));
+    assert.equal(pages().length, num);
+  };
+  await win.fetch(url);
+  await waitPage(1);
+  assert.equal(pages()[0].data.historyPage.canPage, true);
+  msg('HISTORY_NEXT', grant);
+  assert.equal(requests.length, 1);
+  clock += 12000;
+  msg('HISTORY_NEXT', { ...grant, jobId: 'stale' });
+  msg('HISTORY_NEXT', grant);
+  msg('HISTORY_NEXT', grant);
+  await waitPage(2);
+  assert.equal(requests.length, 2);
+  const request = requests[1].input;
+  const next = new URL(request.url);
+  assert.equal(next.origin + next.pathname, url.split('?')[0]);
+  assert.deepEqual(JSON.parse(next.searchParams.get('variables')), { ...JSON.parse(new URL(url).searchParams.get('variables')), cursor: 'page-two' });
+  assert.equal(request.redirect, 'error');
+  assert.equal(pages()[1].data.historyPage.canPage, false);
+  assert.ok(pages().every(m => !JSON.stringify(m).includes('page-two')));
+  msg('SYNC_STATE', { ...state, historyScope: null });
+  clock += 12000;
+  msg('HISTORY_NEXT', grant);
+  assert.equal(requests.length, 2);
+});
+
+test('Daily search received before document binding waits for that viewer; ordinary searches are never cloned', async () => {
+  const query = 'from:sample_me filter:replies since:2026-11-16 until:2026-11-17';
+  const url = 'https://x.com/i/api/graphql/Fixture/SearchTimeline?variables=' + encodeURIComponent(JSON.stringify({rawQuery: query, product: 'Latest'}));
+  const timeline = timelineFixtures.ownRepliesTimelineMixed.response.data.user.result.timeline_v2.timeline;
+  const payload = JSON.stringify({ data: { search_by_raw_query: { search_timeline: { timeline } } } });
+  const { win, outboundMessages } = createMockEnvironment(async () => new Response(payload));
+  win.location.href = 'https://x.com/search?' + new URLSearchParams({q: query, f: 'live'});
+  installMainInterceptor(win, adapterApi);
+  const sync = (type, extra) => win.dispatchBridgeMessage({ protocol: 'SPARKLINK_BRIDGE_V1', nonce:'query_test',
+    collectionEnabled: true, captureSessionId: 10, type, ...extra });
+  sync('BRIDGE_INIT', {bindingContext: BINDING_A});
+  const pages = () => outboundMessages.filter(m => m.data.historyPage);
+  await win.fetch(url);
+  await new Promise(r => setImmediate(r));
+  assert.equal(pages().length, 0);
+  const historyScope = { id: 'j', actor: BINDING_A.actorUserId, query, deadline: Date.now()+300000 };
+  sync('SYNC_STATE', { bindingContext: null, historyScope });
+  await win.fetch(url);
+  await new Promise(r => setTimeout(r, 10));
+  assert.equal(pages().length, 0);
+  sync('SYNC_STATE', { bindingContext: BINDING_A, historyScope });
+  assert.equal(pages().length, 1);
+  assert.equal(pages()[0].data.historyPage.searchQuery, query);
+});
+
+test('XHR with custom headers (including x-client-transaction-id) supports timeline and search cursor pagination, and buffers pre-binding timeline', async (t) => {
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  const fetchRequests = [];
+  const query = 'from:sample_me filter:replies since:2026-11-16 until:2026-11-17';
+  const searchPayload = {
+    data: {
+      search_by_raw_query: {
+        search_timeline: {
+          timeline: {
+            instructions: [
+              {
+                type: 'TimelineAddEntries',
+                entries: [
+                  timelineFixtures.ownRepliesTimelineMixed.response.data.user.result.timeline_v2.timeline.instructions[0].entries[1],
+                  { entryId: 'cursor-bottom-s2', content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'search-p2' } }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }
+  };
+  const replyPayload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  const replyEntries = replyPayload.data.user.result.timeline_v2.timeline.instructions[0].entries;
+  for (const e of replyEntries) if (e.content?.cursorType === 'Bottom') e.content.value = 'xhr-cursor-2';
+  if (!replyEntries.some(e => e.content?.cursorType === 'Bottom')) {
+    replyEntries.push({ entryId: 'cursor-bottom', content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'xhr-cursor-2' } });
+  }
+
+  const { win, FakeXHR, outboundMessages } = createMockEnvironment(async (input) => {
+    fetchRequests.push(input);
+    return new Response(JSON.stringify(
+      String(input.url).includes('SearchTimeline') ? searchPayload : replyPayload
+    ));
+  });
+  FakeXHR.prototype.setRequestHeader = function (name, value) {
+    this._headers = this._headers || [];
+    this._headers.push([name, value]);
+  };
+  win.location.href = 'https://x.com/sample_me/with_replies';
+  installMainInterceptor(win, adapterApi);
+  const sync = (type, extra) => win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1', nonce: 'xhr_cursor', collectionEnabled: true, captureSessionId: 10, type, ...extra
+  });
+  const replyScope = { id: 'job1', actor: BINDING_A.actorUserId, deadline: clock + 300000, query: null };
+  sync('BRIDGE_INIT', { bindingContext: null, historyScope: null });
+
+  // Pre-binding XHR with custom headers & x-client-transaction-id
+  const xhr = new FakeXHR();
+  xhr.withCredentials = true;
+  xhr.open('GET', timelineFixtures.ownRepliesTimelineMixed.requestUrl);
+  xhr.setRequestHeader('x-client-transaction-id', 'tx_abc_123');
+  xhr.setRequestHeader('x-twitter-active-user', 'yes');
+  xhr.send();
+  xhr.dispatchLoad(200, replyPayload, 'json');
+
+  // Binding + scope arrive afterward -> pendingTimeline and pendingTemplate promote cleanly
+  sync('SYNC_STATE', { bindingContext: BINDING_A, historyScope: replyScope });
+  const pages = () => outboundMessages.filter(m => m.data.historyPage);
+  assert.equal(pages().length, 1);
+  assert.equal(pages()[0].data.historyPage.canPage, true);
+
+  clock += 12000;
+  sync('HISTORY_NEXT', { jobId: 'job1', bindingId: BINDING_A.bindingId });
+  for (let i = 0; i < 100 && pages().length < 2; ++i) await new Promise(r => setTimeout(r, 2));
+  assert.equal(pages().length, 2);
+  assert.equal(fetchRequests[0].headers.get('x-twitter-active-user'), 'yes');
+  assert.equal(fetchRequests[0].headers.get('x-client-transaction-id'), null);
+
+  // Search mode XHR pagination
+  win.location.href = 'https://x.com/search?' + new URLSearchParams({ q: query, f: 'live' });
+  const searchScope = { id: 'job1', actor: BINDING_A.actorUserId, deadline: clock + 300000, query };
+  sync('SYNC_STATE', { bindingContext: BINDING_A, historyScope: searchScope });
+  const searchUrl = 'https://x.com/i/api/graphql/Fix/SearchTimeline?variables=' +
+    encodeURIComponent(JSON.stringify({ rawQuery: query, product: 'Latest' }));
+  xhr.open('GET', searchUrl);
+  xhr.setRequestHeader('x-client-transaction-id', 'tx_search_1');
+  xhr.send();
+  xhr.dispatchLoad(200, searchPayload, 'json');
+  assert.equal(pages().length, 3);
+  assert.equal(pages()[2].data.historyPage.canPage, true);
+
+  clock += 12000;
+  sync('HISTORY_NEXT', { jobId: 'job1', bindingId: BINDING_A.bindingId });
+  for (let i = 0; i < 100 && pages().length < 4; ++i) await new Promise(r => setTimeout(r, 2));
+  assert.equal(pages().length, 4);
+  const nextSearchUrl = new URL(fetchRequests[1].url);
+  assert.equal(JSON.parse(nextSearchUrl.searchParams.get('variables')).cursor, 'search-p2');
+});
+
+test('Direct timeline bootstrap discovers queryId from client-web scripts, self-heals missing features, and ends timeline cleanly without false search fallback', async (t) => {
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  const fetchCalls = [];
+  const page1Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  page1Payload.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom-1',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'direct-p2' }
+  });
+  const page2Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+
+  let qidVersion = 'staleQid1';
+  const { win, outboundMessages } = createMockEnvironment(async (input) => {
+    const reqUrl = typeof input === 'string' ? input : input.url;
+    fetchCalls.push({ url: reqUrl, headers: input.headers || null });
+    if (reqUrl.includes('client-web/main.')) {
+      return new Response(
+        `blah;queryId:"${qidVersion}",operationName:"UserTweetsAndReplies",operationType:"query",metadata:{featureSwitches:["view_counts_everywhere_api_enabled"],fieldToggles:["withArticlePlainText"]};blah`,
+        { status: 200 }
+      );
+    }
+    if (reqUrl.includes('staleQid1/UserTweetsAndReplies')) {
+      qidVersion = 'freshQid2';
+      return new Response('{}', { status: 404 });
+    }
+    if (reqUrl.includes('freshQid2/UserTweetsAndReplies')) {
+      const vars = JSON.parse(new URL(reqUrl).searchParams.get('variables'));
+      const feats = JSON.parse(new URL(reqUrl).searchParams.get('features') || '{}');
+      if (!feats.rweb_extra_required_flag) {
+        return new Response(
+          JSON.stringify({ errors: [{ message: 'The following features cannot be null: rweb_extra_required_flag' }] }),
+          { status: 400 }
+        );
+      }
+      return new Response(JSON.stringify(vars.cursor ? page2Payload : page1Payload), { status: 200 });
+    }
+    return new Response('{}', { status: 404 });
+  });
+  win.location.href = 'https://x.com/sample_me';
+  win.document = {
+    documentElement: { lang: 'zh-cn' },
+    scripts: [{ src: 'https://abs.twimg.com/responsive-web/client-web/main.123.js' }],
+    querySelectorAll: () => []
+  };
+  installMainInterceptor(win, adapterApi);
+  const sync = (type, extra) => win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1', nonce: 'direct_boot', collectionEnabled: true, captureSessionId: 10, type, ...extra
+  });
+  const scope = { id: 'job_direct', actor: BINDING_A.actorUserId, since: clock - 7 * 86400000, deadline: clock + 300000, query: null };
+  sync('BRIDGE_INIT', { bindingContext: BINDING_A, historyScope: scope });
+
+  const pages = () => outboundMessages.filter(m => m.data.historyPage);
+  for (let i = 0; i < 150 && pages().length < 1; ++i) await new Promise(r => setTimeout(r, 10));
+  assert.equal(pages().length, 1);
+  assert.equal(pages()[0].data.historyPage.canPage, true);
+  assert.equal(pages()[0].data.historyPage.ended, false);
+
+  clock += 12000;
+  sync('HISTORY_NEXT', { jobId: 'job_direct', bindingId: BINDING_A.bindingId });
+  for (let i = 0; i < 100 && pages().length < 2; ++i) await new Promise(r => setTimeout(r, 5));
+  assert.equal(pages().length, 2);
+  assert.equal(pages()[1].data.historyPage.canPage, false);
+  assert.equal(pages()[1].data.historyPage.ended, true);
+});
+
+test('Failed direct bootstrap (HTTP 403/404) never emits unrecognized stop, and HISTORY_NEXT uses scrollScan to capture native pagination first', async (t) => {
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  const page1Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  page1Payload.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom-1',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'scroll-p2' }
+  });
+  const page2Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+
+  let nativeFetches = 0;
+  const scrollTargets = [];
+  const { win, outboundMessages } = createMockEnvironment(async (input) => {
+    const reqUrl = typeof input === 'string' ? input : input.url;
+    if (reqUrl.includes('client-web/main.')) {
+      return new Response('queryId:"bootQid",operationName:"UserTweetsAndReplies"', { status: 200 });
+    }
+    if (reqUrl.includes('bootQid/UserTweetsAndReplies')) {
+      return new Response('{}', { status: 403 });
+    }
+    nativeFetches += 1;
+    return new Response(JSON.stringify(page2Payload), { status: 200 });
+  });
+
+  win.location.href = 'https://x.com/sample_me';
+  const se = { scrollTop: 0, scrollHeight: 3000 };
+  win.document = {
+    documentElement: se,
+    scrollingElement: se,
+    scripts: [{ src: 'https://abs.twimg.com/responsive-web/client-web/main.abc.js' }],
+    querySelector(sel) {
+      return sel.includes('cellInnerDiv') ? { scrollIntoView() {} } : null;
+    },
+    querySelectorAll() {
+      return [{ scrollIntoView() {} }];
+    }
+  };
+  let scrolledTrigger = false;
+  win.scrollTo = (_x, y) => {
+    scrollTargets.push(y);
+    se.scrollTop = y;
+    if (!scrolledTrigger && nativeFetches === 0 && outboundMessages.some((m) => m.data.historyPage)) {
+      scrolledTrigger = true;
+      const p2Url = timelineFixtures.ownRepliesTimelineMixed.requestUrl.replace(
+        encodeURIComponent('{}'),
+        encodeURIComponent(JSON.stringify({ userId: BINDING_A.actorUserId, cursor: 'scroll-p2' }))
+      );
+      queueMicrotask(() => { win.fetch(p2Url); });
+    }
+  };
+
+  installMainInterceptor(win, adapterApi);
+  const sync = (type, extra) => win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1', nonce: 'scroll_scan_nonce', collectionEnabled: true, captureSessionId: 10, type, ...extra
+  });
+  const scope = { id: 'job_scroll', actor: BINDING_A.actorUserId, since: clock - 7 * 86400000, deadline: clock + 300000, query: null };
+  sync('BRIDGE_INIT', { bindingContext: BINDING_A, historyScope: scope });
+
+  // Wait past bootstrap timer (350ms): 403 on synthetic bootstrap must NOT trigger HISTORY_STOP
+  await new Promise((r) => setTimeout(r, 420));
+  assert.equal(outboundMessages.filter((m) => m.data.type === 'HISTORY_STOP').length, 0);
+
+  // Navigate to /with_replies -> X loads Page 1 natively
+  win.location.href = 'https://x.com/sample_me/with_replies';
+  const origFetch = win.fetch;
+  // Simulate X firing Page 1 via XHR or fetch with real page1Payload
+  const xhr = new win.XMLHttpRequest();
+  xhr.open('GET', timelineFixtures.ownRepliesTimelineMixed.requestUrl);
+  xhr.send();
+  xhr.dispatchLoad(200, page1Payload, 'json');
+
+  const pages = () => outboundMessages.filter((m) => m.data.historyPage);
+  assert.equal(pages().length, 1);
+  assert.equal(pages()[0].data.historyPage.canPage, true);
+
+  // Advance 12s and send HISTORY_NEXT -> must scroll and capture X's native page 2 fetch
+  clock += 12000;
+  sync('HISTORY_NEXT', { jobId: 'job_scroll', bindingId: BINDING_A.bindingId });
+  for (let i = 0; i < 100 && pages().length < 2; ++i) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(scrollTargets.length >= 1);
+  assert.equal(pages().length, 2);
+  assert.equal(pages()[1].data.historyPage.ended, true);
+  assert.equal(typeof origFetch, 'function');
 });

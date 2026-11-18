@@ -62,6 +62,9 @@ function createBridgeMockEnv(runtimeHandler) {
     postMessage(data, targetOrigin) {
       mainInbound.push({ data, targetOrigin });
     },
+    restoreFromCache() {
+      for (const fn of winListeners.get('pageshow') || []) fn({ persisted: true });
+    },
     emitFromMain(data, origin = 'https://x.com', source = win) {
       const set = winListeners.get('message');
       if (set) {
@@ -98,6 +101,37 @@ function createBridgeMockEnv(runtimeHandler) {
 
   return { win, chromeObj, mainInbound, runtimeCalls };
 }
+
+test('A failed BFCache handshake retries without user input and ordinary worker wakeups can restore bindings', { timeout: 2000 }, async (t) => {
+  const helloFlags = [];
+  let storedBinding = BINDING_A1;
+  const { win, chromeObj } = createBridgeMockEnv((msg) => {
+    assert.equal(msg.type, 'HELLO');
+    helloFlags.push(msg.revalidateViewer);
+    if (helloFlags.length === 2) throw new Error('Worker temporarily unavailable');
+    if (msg.revalidateViewer) storedBinding = null;
+    return { ok: true, collectionEnabled: true, captureSessionId: 1, bindingContext: storedBinding };
+  });
+  const bridge = installIsolatedBridge(win, chromeObj, { retryDelayMs: 1 });
+  t.after(() => bridge.destroy());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(bridge.getBindingContext()?.bindingId, BINDING_A1.bindingId);
+
+  const revalidated = new Promise((resolve) => bridge.subscribe((event) => {
+    if (event.type === 'BINDING_REQUIRED') resolve();
+  }));
+  win.restoreFromCache();
+  assert.equal(bridge.getBindingContext(), null);
+  await revalidated;
+  assert.deepEqual(helloFlags, [false, true, true]);
+
+  // A later worker wakeup has a newly verified binding for this document.
+  storedBinding = BINDING_B1;
+  chromeObj.emitFromBackground({ type: 'STATE_CHANGED', collectionEnabled: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(helloFlags.at(-1), false);
+  assert.equal(bridge.getBindingContext()?.bindingId, BINDING_B1.bindingId);
+});
 
 test('Bridge performs handshake, HELLO -> BIND_VIEWER lifecycle, rejects malicious postMessages, and handles A -> B -> A account switching', async () => {
   let bindSeq = 0;

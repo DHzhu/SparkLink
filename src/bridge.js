@@ -13,6 +13,7 @@
     'VIEWER_EVIDENCE',
     'OBSERVED_EVENTS',
     'AUTHOR_MAPPINGS',
+    'HISTORY_STOP',
     'DIAGNOSTIC'
   ]);
 
@@ -37,7 +38,7 @@
 
   function hasDangerousOwnKeys(value, depth) {
     const currentDepth = typeof depth === 'number' ? depth : 0;
-    if (currentDepth > 24) {
+    if (currentDepth > 128) {
       return true;
     }
     if (value === null || typeof value !== 'object') {
@@ -296,6 +297,11 @@
       mainReady: false,
       backendStateConfirmed: false,
       observedPausedFromBackend: false,
+      pendingViewerRevalidation: false,
+      historySyncId: null,
+      historyScope: null,
+      historyStop: null,
+      documentEpoch: 0,
       collectionEnabled: false,
       captureSessionId: null,
       bindingContext: null,
@@ -334,6 +340,7 @@
           protocol: PROTOCOL,
           type,
           nonce: channelNonce,
+          documentEpoch: state.documentEpoch,
           ...payload
         },
         origin
@@ -345,6 +352,7 @@
         collectionEnabled: state.collectionEnabled,
         captureSessionId: state.captureSessionId,
         bindingContext: state.bindingContext,
+        historyScope: state.historyScope,
         stateConfirmed: state.backendStateConfirmed,
         observedPaused: state.observedPausedFromBackend
       });
@@ -355,6 +363,7 @@
         collectionEnabled: state.collectionEnabled,
         captureSessionId: state.captureSessionId,
         bindingContext: state.bindingContext,
+        historyScope: state.historyScope,
         stateConfirmed: state.backendStateConfirmed,
         observedPaused: state.observedPausedFromBackend
       });
@@ -487,7 +496,10 @@
       }
       pendingAuxiliaryMeta = null;
 
-      postToMain('REVOKE_BINDING', { bindingId: revokedId });
+      // MAIN resets on pageshow itself. A second reset could erase a fresh Viewer during the handshake.
+      if (!state.pendingViewerRevalidation) {
+        postToMain('REVOKE_BINDING', { bindingId: revokedId });
+      }
       notifySubscribers({
         type: 'BINDING_REVOKED',
         bindingId: revokedId
@@ -501,11 +513,20 @@
       }
     }
 
-    async function performHello() {
+    function logSync(...args) {
+      try {
+        if (win.console && typeof win.console.info === 'function') {
+          win.console.info('[SparkLink Sync/Bridge]', ...args);
+        }
+      } catch {}
+    }
+
+    async function performHello(retriesLeft = maxRetries) {
       const attemptSeq = ++state.bindAttemptSeq;
       const res = await sendRuntimeMessageSafe({
         type: 'HELLO',
-        origin
+        origin,
+        revalidateViewer: state.pendingViewerRevalidation
       });
       if (!state.destroyed && isPlainObject(res) && res.ok) {
         state.backendStateConfirmed = true;
@@ -517,7 +538,23 @@
         return;
       }
       if (!isPlainObject(res) || !res.ok) {
+        if (state.pendingViewerRevalidation && res?.transient && retriesLeft > 0) {
+          setTimeout(() => {
+            if (!state.destroyed && attemptSeq === state.bindAttemptSeq) performHello(retriesLeft - 1);
+          }, retryDelayMs);
+        }
         return;
+      }
+      state.pendingViewerRevalidation = false;
+      state.historyScope = res.historyScope || null;
+      state.historySyncId = res.historySyncId || null;
+      if (state.historyScope || state.historySyncId) {
+        logSync('HELLO scope updated', {
+          historySyncId: state.historySyncId,
+          scopeQuery: state.historyScope?.query || null,
+          hasBinding: isValidBindingContext(res.bindingContext),
+          actor: res.bindingContext?.actorUserId || state.historyScope?.actor || null
+        });
       }
 
       if (Number.isInteger(res.revision) && res.revision >= 0) {
@@ -574,7 +611,7 @@
     }
 
     async function handleViewerEvidence(captureSessionId, rawViewer) {
-      if (!state.collectionEnabled || state.captureSessionId === null) {
+      if (state.pendingViewerRevalidation || !state.collectionEnabled || state.captureSessionId === null) {
         return;
       }
       if (captureSessionId !== state.captureSessionId) {
@@ -626,6 +663,7 @@
         collectionGeneration: res.bindingContext.collectionGeneration,
         accountGeneration: res.bindingContext.accountGeneration
       });
+      state.historySyncId = res.historySyncId || null;
       state.bindingContext = nextBinding;
       syncMainState();
       notifySubscribers({
@@ -753,6 +791,22 @@
       }
     }
 
+    async function submitHistoryPage(payload) {
+      for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+        if (state.destroyed || state.historySyncId !== payload.jobId ||
+            !bindingEquals(state.bindingContext, payload.bindingContext)) return;
+        const res = await sendRuntimeMessageSafe(payload);
+        if (!res?.transient) {
+          if (res?.ok) {
+            notifySubscribers({ type: 'HISTORY_PAGE_SYNCED', jobId: payload.jobId, revision: state.revision });
+          }
+          return;
+        }
+        if (attempt < maxRetries) await sleep(retryDelayMs);
+      }
+      await sendRuntimeMessageSafe({ type: 'STOP_HISTORY_SYNC_TASK', jobId: payload.jobId, reason: 'stalled' });
+    }
+
     function enqueueObservedPayload(data) {
       if (!state.collectionEnabled || !state.bindingContext) {
         return;
@@ -776,14 +830,45 @@
 
       const rawEvents = Array.isArray(data.events) ? data.events : [];
       const cleanEvents = [];
+      const historyEvents = [];
       for (let i = 0; i < rawEvents.length; i += 1) {
         const clean = sanitizeObservedEvent(
           rawEvents[i],
           state.bindingContext.actorUserId
         );
-        if (clean) {
+        if (clean && state.historySyncId && clean.source === 'history') {
+          historyEvents.push(clean);
+        } else if (clean) {
           cleanEvents.push(clean);
         }
+      }
+      if (state.historySyncId && data.historyBackfillAnomaly && !isPlainObject(data.historyPage)) {
+        logSync('stopping job due to historyBackfillAnomaly without historyPage', {
+          jobId: state.historySyncId,
+          anomalies: data.anomalies
+        });
+        sendRuntimeMessageSafe({ type: 'STOP_HISTORY_SYNC_TASK', jobId: state.historySyncId, reason: 'unrecognized' });
+      }
+      if (state.historySyncId && isPlainObject(data.historyPage)) {
+        logSync('forwarding SYNC_HISTORY_PAGE', {
+          jobId: state.historySyncId,
+          events: historyEvents.length,
+          canPage: data.historyPage?.canPage === true,
+          ended: data.historyPage?.ended === true,
+          searchQuery: data.historyPage?.searchQuery || null
+        });
+        submitHistoryPage({
+          type: 'SYNC_HISTORY_PAGE', jobId: state.historySyncId, pageId: generateNonce(),
+          bindingContext: state.bindingContext, events: historyEvents,
+          partial: Boolean(data.partialUnrecognized || data.historyBackfillAnomaly),
+          historyPage: {
+            newestAt: data.historyPage?.newestAt ?? null,
+            pageKey: data.historyPage?.pageKey ?? null,
+            ended: data.historyPage?.ended === true,
+            canPage: data.historyPage?.canPage === true,
+            searchQuery: data.historyPage?.searchQuery || null
+          }
+        });
       }
 
       pruneExpiredQueueItems();
@@ -854,7 +939,11 @@
         return;
       }
       const data = event.data;
-      if (!isPlainObject(data) || data.protocol !== PROTOCOL) {
+      if (
+        !isPlainObject(data) ||
+        data.protocol !== PROTOCOL ||
+        (data.documentEpoch ?? 0) !== state.documentEpoch
+      ) {
         return;
       }
       if (hasDangerousOwnKeys(data, 0)) {
@@ -880,6 +969,20 @@
 
       if (data.type === 'VIEWER_EVIDENCE') {
         handleViewerEvidence(data.captureSessionId, data.viewer);
+        return;
+      }
+
+      if (data.type === 'HISTORY_STOP') {
+        if (state.historySyncId && state.collectionEnabled && data.captureSessionId === state.captureSessionId) {
+          logSync('received HISTORY_STOP from MAIN', { jobId: state.historySyncId, reason: data.reason, retryAt: data.retryAt || null });
+          if (['rate_limited', 'verification', 'unavailable'].includes(data.reason)) {
+            state.historyStop = { jobId: state.historySyncId, reason: data.reason,
+              retryAt: Number.isSafeInteger(data.retryAt) ? data.retryAt : null };
+            sendRuntimeMessageSafe({ type: 'STOP_HISTORY_SYNC_TASK', ...state.historyStop });
+          } else if (data.reason === 'unrecognized') {
+            sendRuntimeMessageSafe({ type: 'STOP_HISTORY_SYNC_TASK', jobId: state.historySyncId, reason: 'unrecognized' });
+          }
+        }
         return;
       }
 
@@ -924,6 +1027,12 @@
         return;
       }
 
+      if (msg.type === 'END_HISTORY_TRANSPORT' && msg.jobId === state.historySyncId) {
+        state.historyScope = null;
+        syncMainState();
+        notifySubscribers({ type: 'HISTORY_SYNC_ENDED', jobId: msg.jobId });
+        return;
+      }
       if (msg.type === 'STATE_CHANGED') {
         if (msg.collectionEnabled === false) {
           state.backendStateConfirmed = true;
@@ -966,6 +1075,10 @@
     win.addEventListener('message', onWindowMessage);
     win.addEventListener('pageshow', (ev) => {
       if (ev && ev.persisted) {
+        // Both worlds advance before queued messages from the frozen document can be delivered.
+        state.documentEpoch += 1;
+        state.pendingViewerRevalidation = true;
+        revokeLocalBinding(null, false);
         performHello();
       }
     });
@@ -1009,6 +1122,15 @@
         return () => {
           subscribers.delete(fn);
         };
+      },
+      requestHistoryNext(jobId) {
+        if (state.collectionEnabled && state.bindingContext && state.historySyncId === jobId) {
+          logSync('posting HISTORY_NEXT to MAIN', { jobId });
+          postToMain('HISTORY_NEXT', { jobId, bindingId: state.bindingContext.bindingId });
+        }
+      },
+      getHistoryStop(jobId) {
+        return state.historyStop?.jobId === jobId ? state.historyStop : null;
       },
       getBindingContext() {
         return state.bindingContext;

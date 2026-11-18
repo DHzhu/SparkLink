@@ -137,6 +137,7 @@ function createFakePopupDom() {
     'btn-cleanup',
     'btn-history-sync',
     'history-sync-status',
+    'debug-logs-toggle',
     'btn-export',
     'btn-import',
     'file-import',
@@ -616,17 +617,24 @@ test('Popup handles >9 MiB file rejection, modal cancel, toggle switch, and anom
 });
 
 
-test('Manual history button starts, cancels and shows the persisted cooldown on reopening', async () => {
+test('Manual history button starts with foreground stay-on-tab guidance, toggles debug logs default-off, cancels, and shows cooldown', async () => {
+  const popupHtml = fs.readFileSync(path.join(process.cwd(), 'src', 'popup', 'popup.html'), 'utf8');
+  assert.ok(popupHtml.includes('id="debug-logs-toggle"'), 'popup.html must contain #debug-logs-toggle');
+
   const { doc, byId } = createFakePopupDom();
   const selectedAccount = { actorUserId: '42', handle: 'alice', summary: { top20: [] } };
-  const snap = { ok: true, viewerStatus: 'bound', activeTabActorUserId: '42', settings: { collectionEnabled: true },
+  const snap = { ok: true, debugLogsEnabled: false, viewerStatus: 'bound', activeTabActorUserId: '42', settings: { collectionEnabled: true },
     selectedAccount, savedAccounts: [selectedAccount], historyNextStart: 0 };
   const calls = [];
   const runtime = { async sendMessage(msg) {
     if (msg.type === 'GET_POPUP_SNAPSHOT') return snap;
     calls.push(msg);
+    if (msg.type === 'SET_DEBUG_LOGS') {
+      snap.debugLogsEnabled = Boolean(msg.enabled);
+      return { ok: true, debugLogsEnabled: snap.debugLogsEnabled };
+    }
     if (msg.type === 'START_HISTORY_SYNC') {
-      snap.historySync = { id: 'test', handle: 'alice', status: 'running', pages: 0, added: 0, duplicates: 0, deadline: Date.now() + 300000 };
+      snap.historySync = { id: 'test', handle: 'alice', status: 'running', mode: 'timeline', pages: 0, added: 0, duplicates: 0, deadline: Date.now() + 300000 };
     } else {
       Object.assign(snap.historySync, { status: 'cancelled', reason: 'cancelled' });
       snap.historyNextStart = Date.now() + 900000;
@@ -635,12 +643,25 @@ test('Manual history button starts, cancels and shows the persisted cooldown on 
   } };
   const ui = createPopupController({ document: doc, runtime });
   await ui.init();
+  const debugToggle = byId.get('debug-logs-toggle');
+  assert.equal(debugToggle.checked, false);
+  debugToggle.checked = true;
+  await debugToggle.trigger('change');
+  assert.equal(snap.debugLogsEnabled, true);
+  assert.equal(debugToggle.checked, true);
+
   const button = byId.get('btn-history-sync');
   assert.equal(button.disabled, false);
+  assert.match(byId.get('history-sync-status').textContent, /同步期间请停留在该标签页/);
   await button.trigger('click');
   assert.equal(button.textContent, '停止同步');
+  assert.match(byId.get('history-sync-status').textContent, /同步期间请停留在该标签页/);
   await button.trigger('click');
-  assert.deepEqual(calls, [{ type: 'START_HISTORY_SYNC', actorUserId: '42' }, { type: 'CANCEL_HISTORY_SYNC', jobId: 'test' }]);
+  assert.deepEqual(calls, [
+    { type: 'SET_DEBUG_LOGS', enabled: true },
+    { type: 'START_HISTORY_SYNC', actorUserId: '42' },
+    { type: 'CANCEL_HISTORY_SYNC', jobId: 'test' }
+  ]);
   await ui.refresh();
   assert.equal(button.disabled, true);
   assert.match(byId.get('history-sync-status').textContent, /已停止.*后再次手动同步/);

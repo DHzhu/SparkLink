@@ -1,6 +1,7 @@
 import { isPlainObject, isValidDecimalId, sanitizeHandle } from './schema.js';
 
 export const HISTORY_SYNC_KEY = 'sparklink_history_sync';
+export const DEBUG_LOGS_KEY = 'sparklink_debug_logs';
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_RUNTIME_MS = 5 * 60 * 1000;
 const MAX_PAGES = 8;
@@ -39,8 +40,10 @@ export function describeHistorySync(job) {
 // The background service serializes job mutations with binding and storage writes.
 export function createHistorySync(chromeApi, storage, now) {
   const area = chromeApi.storage.session;
-  function logSync(...args) {
+  async function logSync(...args) {
     try {
+      const raw = await chromeApi.storage?.local?.get?.(DEBUG_LOGS_KEY);
+      if (!raw || raw[DEBUG_LOGS_KEY] !== true) return;
       if (typeof console !== 'undefined' && typeof console.info === 'function') {
         console.info('[SparkLink Sync/Worker]', ...args);
       }
@@ -73,7 +76,7 @@ export function createHistorySync(chromeApi, storage, now) {
     if (until < allowedAt) return { ok: false, code: 'COOLDOWN', message: '同步处于冷却期，请在提示的时间后手动启动。' };
     let tab;
     try {
-      tab = await chromeApi.tabs.create({ url: 'about:blank', active: false });
+      tab = await chromeApi.tabs.create({ url: 'about:blank', active: true });
     } catch {
       return { ok: false, message: '浏览器未能打开同步标签页。' };
     }
@@ -89,7 +92,7 @@ export function createHistorySync(chromeApi, storage, now) {
       await save(job);
       await chromeApi.storage.local.set({ [COOLDOWN_KEY]: until + START_INTERVAL_MS });
       await chromeApi.tabs.update(tab.id, { url: 'https://x.com/' + handle });
-      logSync('start job', { id: job.id, tabId: tab.id, handle, since: new Date(job.since).toISOString(), until: new Date(job.until).toISOString() });
+      await logSync('start job', { id: job.id, tabId: tab.id, handle, since: new Date(job.since).toISOString(), until: new Date(job.until).toISOString() });
     } catch {
       await chromeApi.tabs.remove?.(tab.id).catch(() => {});
       await save({ ...job, status: 'partial', reason: 'navigation' });
@@ -99,7 +102,7 @@ export function createHistorySync(chromeApi, storage, now) {
   }
   async function stop(job, reason, retryAt) {
     if (job?.status === 'running') {
-      logSync('stop signal', { id: job.id, mode: job.mode, reason, retryAt: retryAt || null, pages: job.pages, added: job.added });
+      await logSync('stop signal', { id: job.id, mode: job.mode, reason, retryAt: retryAt || null, pages: job.pages, added: job.added });
       if (reason === 'unrecognized' && job.mode === 'timeline') {
         await save({ ...job, hasNext: false, missingTimeline: true, partial: true });
         return { ok: true };
@@ -126,7 +129,7 @@ export function createHistorySync(chromeApi, storage, now) {
       if (job.mode !== 'timeline' || job.pages > 0 || job.navigatedReplies) return { ok: true };
       const next = { ...job, navigatedReplies: true, actionAt: time };
       await save(next);
-      logSync('advance -> replies', { id: job.id, url: 'https://x.com/' + job.handle + '/with_replies' });
+      await logSync('advance -> replies', { id: job.id, url: 'https://x.com/' + job.handle + '/with_replies' });
       try {
         await chromeApi.tabs.update(job.tabId, { url: 'https://x.com/' + job.handle + '/with_replies' });
       } catch { return stop(next, 'navigation'); }
@@ -138,13 +141,13 @@ export function createHistorySync(chromeApi, storage, now) {
         if ((job.searchAttempts || 0) >= MAX_SEARCH_PAGES) return stop(job, 'page_limit');
         if (!job.hasNext || job.requestedAfterPage === job.pages) return { ok: true };
         await save({ ...job, requestedAfterPage: job.pages, actionAt: time, searchAttempts: (job.searchAttempts || 0) + 1 });
-        logSync('advance -> next (search)', { id: job.id, pages: job.pages, searchAttempts: (job.searchAttempts || 0) + 1 });
+        await logSync('advance -> next (search)', { id: job.id, pages: job.pages, searchAttempts: (job.searchAttempts || 0) + 1 });
         return { ok: true, next: true };
       }
       if ((job.attempts || 0) >= MAX_PAGES) return stop(job, 'page_limit');
       if (!job.hasNext || job.requestedAfterPage === job.pages) return { ok: true };
       await save({ ...job, requestedAfterPage: job.pages, actionAt: time, attempts: (job.attempts || 0) + 1 });
-      logSync('advance -> next (timeline)', { id: job.id, pages: job.pages, attempts: (job.attempts || 0) + 1 });
+      await logSync('advance -> next (timeline)', { id: job.id, pages: job.pages, attempts: (job.attempts || 0) + 1 });
       return { ok: true, next: true };
     }
     if ((job.searchAttempts || 0) >= MAX_SEARCH_PAGES) return stop(job, 'page_limit');
@@ -156,7 +159,7 @@ export function createHistorySync(chromeApi, storage, now) {
     const next = { ...job, mode: 'search', day, searchQuery: query, dayRead: false, hasNext: false,
       requestedAfterPage: null, actionAt: time, searchAttempts: (job.searchAttempts || 0) + 1 };
     await save(next);
-    logSync('advance -> search', { id: job.id, prevMode: job.mode, pages: job.pages, missingTimeline: Boolean(job.missingTimeline), query });
+    await logSync('advance -> search', { id: job.id, prevMode: job.mode, pages: job.pages, missingTimeline: Boolean(job.missingTimeline), query });
     try {
       const url = new URL('https://x.com/search');
       url.search = new URLSearchParams({ q: query, f: 'live', src: 'typed_query' }).toString();
@@ -210,7 +213,7 @@ export function createHistorySync(chromeApi, storage, now) {
       next.reason = 'page_limit';
     }
     await save(next);
-    logSync('mergePage', {
+    await logSync('mergePage', {
       mode: job.mode,
       pages: next.pages,
       rawEvents: msg.events.length,

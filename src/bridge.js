@@ -295,6 +295,7 @@
 
     const state = {
       mainReady: false,
+      debugLogsEnabled: false,
       backendStateConfirmed: false,
       observedPausedFromBackend: false,
       pendingViewerRevalidation: false,
@@ -349,6 +350,7 @@
 
     function sendBridgeInitToMain() {
       postToMain('BRIDGE_INIT', {
+        debugLogsEnabled: state.debugLogsEnabled,
         collectionEnabled: state.collectionEnabled,
         captureSessionId: state.captureSessionId,
         bindingContext: state.bindingContext,
@@ -360,6 +362,7 @@
 
     function syncMainState() {
       postToMain('SYNC_STATE', {
+        debugLogsEnabled: state.debugLogsEnabled,
         collectionEnabled: state.collectionEnabled,
         captureSessionId: state.captureSessionId,
         bindingContext: state.bindingContext,
@@ -514,6 +517,9 @@
     }
 
     function logSync(...args) {
+      if (!state.debugLogsEnabled) {
+        return;
+      }
       try {
         if (win.console && typeof win.console.info === 'function') {
           win.console.info('[SparkLink Sync/Bridge]', ...args);
@@ -546,6 +552,7 @@
         return;
       }
       state.pendingViewerRevalidation = false;
+      state.debugLogsEnabled = Boolean(res.debugLogsEnabled);
       state.historyScope = res.historyScope || null;
       state.historySyncId = res.historySyncId || null;
       if (state.historyScope || state.historySyncId) {
@@ -1033,7 +1040,15 @@
         notifySubscribers({ type: 'HISTORY_SYNC_ENDED', jobId: msg.jobId });
         return;
       }
+      if (msg.type === 'DEBUG_LOGS_CHANGED') {
+        state.debugLogsEnabled = Boolean(msg.debugLogsEnabled);
+        syncMainState();
+        return;
+      }
       if (msg.type === 'STATE_CHANGED') {
+        if (typeof msg.debugLogsEnabled === 'boolean') {
+          state.debugLogsEnabled = msg.debugLogsEnabled;
+        }
         if (msg.collectionEnabled === false) {
           state.backendStateConfirmed = true;
           state.observedPausedFromBackend = true;
@@ -1140,6 +1155,9 @@
       },
       isCollectionEnabled() {
         return state.collectionEnabled;
+      },
+      isDebugLogsEnabled() {
+        return state.debugLogsEnabled;
       },
       getPendingQueueSize() {
         return pendingQueue.length;

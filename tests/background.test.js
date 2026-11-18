@@ -384,4 +384,19 @@ test('Background handles Popup export/preview/commit import, cleanup, Clear All,
   chromeMock.closeTab(55);
   await new Promise((r) => setTimeout(r, 15));
   assert.equal(sessionArea.peek().sparklink_doc_bindings['55'], undefined);
+
+  // Debug logs flag defaults to false, toggles via SET_DEBUG_LOGS, propagates to HELLO/GET_POPUP_SNAPSHOT, and broadcasts DEBUG_LOGS_CHANGED
+  const snapDefaultDbg = await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER);
+  assert.equal(snapDefaultDbg.debugLogsEnabled, false);
+  const tab66 = makeXSender(66, 'doc_66', 0, 'https://x.com');
+  const helloDefaultDbg = await bg.handleMessage({ type: 'HELLO' }, tab66);
+  assert.equal(helloDefaultDbg.debugLogsEnabled, false);
+
+  const setDbgRes = await bg.handleMessage({ type: 'SET_DEBUG_LOGS', enabled: true }, POPUP_SENDER);
+  assert.equal(setDbgRes.ok, true);
+  assert.equal(setDbgRes.debugLogsEnabled, true);
+  assert.ok(chromeMock.tabMessages.some((m) => m.tabId === 66 && m.msg.type === 'DEBUG_LOGS_CHANGED' && m.msg.debugLogsEnabled === true));
+  assert.equal((await bg.handleMessage({ type: 'GET_POPUP_SNAPSHOT' }, POPUP_SENDER)).debugLogsEnabled, true);
+  assert.equal((await bg.handleMessage({ type: 'HELLO' }, tab66)).debugLogsEnabled, true);
+  assert.equal((await bg.handleMessage({ type: 'GET_HISTORY_SYNC_TASK' }, tab66)).debugLogsEnabled, true);
 });

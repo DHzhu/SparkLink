@@ -9,13 +9,15 @@
     const customTimers = Boolean(options.setTimeoutFn);
     let timer, stopped = false, ticking = false, resync = false, unsub = null;
     let clicked = false, clickedAt = 0, repliesRequested = false, enteredReplies = false, navigating = false;
+    let debugLogsEnabled = false;
     let lastLogKey = '';
     function logSync(key, ...args) {
+      if (!debugLogsEnabled) return;
       if (key && key === lastLogKey) return;
       if (key) lastLogKey = key;
       try {
         if (win.console && typeof win.console.info === 'function') {
-          console.info('[SparkLink Sync/Page]', ...args);
+          win.console.info('[SparkLink Sync/Page]', ...args);
         }
       } catch {}
     }
@@ -73,9 +75,14 @@
       let nextDelay = 1500;
       try {
         const res = await send({ type: 'GET_HISTORY_SYNC_TASK' });
+        const bridge = win.__sparklinkIsolatedBridge;
+        if (typeof res?.debugLogsEnabled === 'boolean') {
+          debugLogsEnabled = res.debugLogsEnabled;
+        } else if (bridge && typeof bridge.isDebugLogsEnabled === 'function') {
+          debugLogsEnabled = Boolean(bridge.isDebugLogsEnabled());
+        }
         const job = res?.job;
         if (stopped || !res?.ok || job?.status !== 'running') return destroy();
-        const bridge = win.__sparklinkIsolatedBridge;
         ensureBridgeSubscription(bridge);
         const binding = bridge?.getBindingContext();
         const stop = (reason, retryAt) => {

@@ -5,7 +5,7 @@ import {
   isValidDecimalId
 } from './schema.js';
 import { createStorageController } from './storage.js';
-import { createHistorySync, describeHistorySync, matchesHistoryUrl } from './history-sync.js';
+import { DEBUG_LOGS_KEY, createHistorySync, describeHistorySync, matchesHistoryUrl } from './history-sync.js';
 
 const ALLOWED_X_ORIGINS = new Set(['https://x.com', 'https://twitter.com']);
 const MAX_TRACKED_TABS = 64;
@@ -16,6 +16,7 @@ const POPUP_ONLY_TYPES = new Set([
   'START_HISTORY_SYNC',
   'CANCEL_HISTORY_SYNC',
   'SET_COLLECTION_ENABLED',
+  'SET_DEBUG_LOGS',
   'CLEANUP_EXPIRED',
   'EXPORT_BACKUP',
   'PREVIEW_IMPORT',
@@ -424,6 +425,15 @@ export function createBackgroundService(chromeApi, options = {}) {
     };
   }
 
+  async function getDebugLogsEnabled() {
+    try {
+      const raw = await chromeApi.storage.local.get(DEBUG_LOGS_KEY);
+      return Boolean(raw && raw[DEBUG_LOGS_KEY] === true);
+    } catch (_err) {
+      return false;
+    }
+  }
+
   async function handlePopupMessage(msg) {
     if (msg.type === 'START_HISTORY_SYNC' || msg.type === 'CANCEL_HISTORY_SYNC') {
       return enqueueSessionOp(async () => {
@@ -470,6 +480,7 @@ export function createBackgroundService(chromeApi, options = {}) {
       }
       return {
         ...snap,
+        debugLogsEnabled: await getDebugLogsEnabled(),
         historySync: describeHistorySync(await history.read()),
         historyNextStart: await history.nextStart(),
         activeTabActorUserId: ctx.activeActorUserId,
@@ -478,6 +489,22 @@ export function createBackgroundService(chromeApi, options = {}) {
         viewerStatus: ctx.viewerStatus,
         diagnostics: ctx.diagnostics
       };
+    }
+
+    if (msg.type === 'SET_DEBUG_LOGS') {
+      return enqueueSessionOp(async () => {
+        const nextDebug = Boolean(msg.enabled);
+        try {
+          await chromeApi.storage.local.set({ [DEBUG_LOGS_KEY]: nextDebug });
+        } catch (_err) {
+          return { ok: false, code: 'STORAGE_FAILURE', message: '无法保存调试日志开关状态' };
+        }
+        notifyTabs(null, {
+          type: 'DEBUG_LOGS_CHANGED',
+          debugLogsEnabled: nextDebug
+        });
+        return { ok: true, debugLogsEnabled: nextDebug };
+      });
     }
 
     if (msg.type === 'SET_POPUP_ACCOUNT') {
@@ -603,6 +630,7 @@ export function createBackgroundService(chromeApi, options = {}) {
             try {
               const p = chromeApi.tabs.sendMessage(tabId, {
                 type: 'STATE_CHANGED',
+                debugLogsEnabled: false,
                 collectionEnabled: false,
                 captureSessionId: null,
                 revision: res.revision
@@ -626,7 +654,11 @@ export function createBackgroundService(chromeApi, options = {}) {
         const job = await history.read();
         const ownTab = job && job.tabId === xSender.tabId;
         if (msg.type === 'GET_HISTORY_SYNC_TASK') {
-          return { ok: true, job: ownTab ? describeHistorySync(job) : null };
+          return {
+            ok: true,
+            debugLogsEnabled: await getDebugLogsEnabled(),
+            job: ownTab ? describeHistorySync(job) : null
+          };
         }
         if (!ownTab || msg.jobId !== job.id) return { ok: false, code: 'STALE_JOB' };
         const entry = sessionTabsCache.get(xSender.tabKey);
@@ -722,6 +754,7 @@ export function createBackgroundService(chromeApi, options = {}) {
 
         return {
           ok: true,
+          debugLogsEnabled: await getDebugLogsEnabled(),
           historySyncId,
           historyScope: job?.status === 'running' && job.tabId === xSender.tabId && matchesHistoryUrl(job, xSender.href)
             ? { id: job.id, actor: job.actorUserId, since: job.since, deadline: describeHistorySync(job).deadline, query: job.searchQuery || null }

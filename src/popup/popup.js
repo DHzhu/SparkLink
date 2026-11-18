@@ -85,6 +85,7 @@ export function createPopupController(options = {}) {
     btnCleanup: doc.getElementById('btn-cleanup'),
     btnHistorySync: doc.getElementById('btn-history-sync'),
     historyStatus: doc.getElementById('history-sync-status'),
+    debugLogsToggle: doc.getElementById('debug-logs-toggle'),
     btnExport: doc.getElementById('btn-export'),
     btnImport: doc.getElementById('btn-import'),
     fileImport: doc.getElementById('file-import'),
@@ -402,7 +403,7 @@ export function createPopupController(options = {}) {
     els.btnHistorySync.disabled = !running && (!canStart || cooling);
     els.btnHistorySync.textContent = running ? '停止同步' : '同步近 7 天回复';
     if (!job) {
-      els.historyStatus.textContent = (canStart ? '将在后台分页读取本人回复。可以关闭弹窗。' : '开启采集并选中当前 X 页的账号后可同步。') + cooldownText;
+      els.historyStatus.textContent = (canStart ? '将打开并切换到同步标签页读取本人回复，同步期间请停留在该标签页。' : '开启采集并选中当前 X 页的账号后可同步。') + cooldownText;
       return;
     }
     const reasons = {
@@ -416,8 +417,8 @@ export function createPopupController(options = {}) {
     };
     const state = running ? '正在同步' : job.status === 'partial' ? '部分同步' : '同步结束';
     const progress = job.mode === 'search'
-      ? '正在后台搜索 ' + (job.searchQuery?.match(/since:(\d{4}-\d{2}-\d{2})/)?.[1] || '当日') + ' 的首批回复'
-      : '正在后台读取本人回复列表';
+      ? '正在搜索 ' + (job.searchQuery?.match(/since:(\d{4}-\d{2}-\d{2})/)?.[1] || '当日') + ' 的首批回复，同步期间请停留在该标签页'
+      : '正在读取本人回复列表，同步期间请停留在该标签页';
     const detail = running ? progress : reasons[job.reason] || '已停止';
     els.historyStatus.textContent = `@${job.handle} ${state} · ${detail}。已读取 ${job.pages} 页，新增 ${job.added} 条，重复 ${job.duplicates} 条。${cooldownText}`;
     if (running) {
@@ -447,6 +448,7 @@ export function createPopupController(options = {}) {
 
     if (!snap || !snap.ok) {
       if (els.collectionToggle) els.collectionToggle.checked = false;
+      if (els.debugLogsToggle) els.debugLogsToggle.checked = false;
       if (els.activationBanner) els.activationBanner.hidden = true;
       if (els.btnClearAccount) els.btnClearAccount.disabled = true;
       return;
@@ -455,6 +457,9 @@ export function createPopupController(options = {}) {
     const enabled = Boolean(snap.settings.collectionEnabled);
     if (els.collectionToggle) {
       els.collectionToggle.checked = enabled;
+    }
+    if (els.debugLogsToggle) {
+      els.debugLogsToggle.checked = Boolean(snap.debugLogsEnabled);
     }
     if (els.activationBanner) {
       els.activationBanner.hidden = enabled;
@@ -600,6 +605,22 @@ export function createPopupController(options = {}) {
     if (els.collectionToggle) {
       els.collectionToggle.addEventListener('change', async () => {
         await setEnabled(els.collectionToggle.checked);
+      });
+    }
+
+    if (els.debugLogsToggle) {
+      els.debugLogsToggle.addEventListener('change', async () => {
+        const nextDebug = Boolean(els.debugLogsToggle.checked);
+        const res = await sendToBackground({
+          type: 'SET_DEBUG_LOGS',
+          enabled: nextDebug
+        });
+        if (!res || !res.ok) {
+          showFeedback((res && res.message) || '切换调试日志失败');
+        } else {
+          showFeedback(nextDebug ? '已开启同步调试日志' : '已关闭同步调试日志');
+        }
+        await refresh();
       });
     }
 

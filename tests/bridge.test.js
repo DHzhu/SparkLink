@@ -541,3 +541,44 @@ test('Bridge covers AUTHOR_MAPPINGS rename eviction, queryCounts, runtime broadc
   unsubscribe();
   bridge.destroy();
 });
+
+test('Bridge keeps [SparkLink Sync/Bridge] silent by default and propagates debugLogsEnabled across HELLO and DEBUG_LOGS_CHANGED', async () => {
+  let helloDebug = false;
+  const bridgeLogs = [];
+  const { win, chromeObj, mainInbound } = createBridgeMockEnv(async (msg) => {
+    if (msg.type === 'HELLO') {
+      return {
+        ok: true,
+        debugLogsEnabled: helloDebug,
+        historySyncId: 'job_dbg_1',
+        historyScope: { id: 'job_dbg_1', actor: '1001001', since: 1000, deadline: 9999999999999, query: null },
+        collectionEnabled: true,
+        captureSessionId: 1,
+        bindingContext: BINDING_A1,
+        bindRequired: false,
+        revision: 1
+      };
+    }
+    return { ok: true };
+  });
+  win.console = {
+    info(...args) {
+      if (String(args[0] || '').includes('[SparkLink Sync/Bridge]')) {
+        bridgeLogs.push(args);
+      }
+    }
+  };
+  const bridge = installIsolatedBridge(win, chromeObj, { retryDelayMs: 5 });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(bridge.isDebugLogsEnabled(), false);
+  assert.equal(bridgeLogs.length, 0);
+  assert.equal(mainInbound.at(-1).data.debugLogsEnabled, false);
+
+  chromeObj.emitFromBackground({ type: 'DEBUG_LOGS_CHANGED', debugLogsEnabled: true });
+  assert.equal(bridge.isDebugLogsEnabled(), true);
+  assert.equal(mainInbound.at(-1).data.type, 'SYNC_STATE');
+  assert.equal(mainInbound.at(-1).data.debugLogsEnabled, true);
+  bridge.requestHistoryNext('job_dbg_1');
+  assert.ok(bridgeLogs.length > 0);
+  bridge.destroy();
+});

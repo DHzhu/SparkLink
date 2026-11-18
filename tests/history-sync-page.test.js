@@ -353,3 +353,30 @@ test('Clicking native Replies link on profile with missingTimeline never jumps d
   const advances = () => f.env.runtimeMessages.filter((m) => m.type === 'ADVANCE_HISTORY_SYNC');
   assert.equal(advances().filter((m) => m.action === 'search').length, 0);
 });
+
+test('Sync page logs are completely silent by default and emit [SparkLink Sync/Page] only when debugLogsEnabled is true', async () => {
+  const pageLogs = [];
+  let debugFlag = false;
+  const timers = createFakeTimerHarness();
+  const job = makeJob({ mode: 'timeline', actionAt: timers.nowFn(), pageAt: timers.nowFn(), deadline: timers.nowFn() + 300000 });
+  const env = createMockPageEnv({
+    url: 'https://x.com/Alice',
+    taskHandler: async () => ({ ok: true, job, debugLogsEnabled: debugFlag })
+  });
+  env.win.console = {
+    info(...args) {
+      if (String(args[0] || '').includes('[SparkLink Sync/Page]')) {
+        pageLogs.push(args);
+      }
+    }
+  };
+  const page = installHistorySyncPage(env.win, env.chromeObj, timers);
+  await page.ready;
+  await timers.advanceBy(12000);
+  assert.equal(pageLogs.length, 0);
+
+  debugFlag = true;
+  await timers.advanceBy(1500);
+  assert.ok(pageLogs.length > 0);
+  page.destroy();
+});

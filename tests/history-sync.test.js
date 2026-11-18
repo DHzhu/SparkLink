@@ -108,26 +108,37 @@ test('Two distinct old pages are required for the seven-day boundary; the eighth
   }
 });
 
-test('Background pagination grants one cursor per page and navigates one inactive tab across UTC day boundaries', async () => {
-  const { createHistorySync, matchesHistoryUrl } = await import('../src/history-sync.js');
+test('Foreground pagination grants one cursor per page, opens an active sync tab, and navigates across UTC day boundaries while keeping Worker logs silent by default', async (t) => {
+  const { createHistorySync, matchesHistoryUrl, DEBUG_LOGS_KEY } = await import('../src/history-sync.js');
   let clock = Date.UTC(2026, 0, 2, 1);
   const urls = [];
-  const api = { storage: { local: area(), session: area() }, tabs: {
-    async create(options) { assert.equal(options.active, false); return { id: 17 }; },
+  const workerLogs = [];
+  t.mock.method(console, 'info', (...args) => {
+    if (String(args[0] || '').includes('[SparkLink Sync/Worker]')) {
+      workerLogs.push(args);
+    }
+  });
+  const localArea = area();
+  const api = { storage: { local: localArea, session: area() }, tabs: {
+    async create(options) { assert.equal(options.active, true); return { id: 17 }; },
     async update(tab, options) { assert.equal(tab, 17); urls.push(options.url); }
   } };
   const sync = createHistorySync(api, { mergeObservedBatch: async () => ({ ok: true, added: 0, duplicates: 0 }) }, () => clock);
   const binding = { actorUserId: '17', captureSessionId: 1, accountGeneration: 1, collectionGeneration: 1 };
   await sync.start(binding, 'sam');
+  assert.equal(workerLogs.length, 0);
   const merge = async (id, meta) => {
     const job = await sync.read();
     return sync.mergePage(job, { jobId: job.id, pageId: id, events: [], historyPage: meta }, binding);
   };
   await merge('first', { canPage: true });
+  assert.equal(workerLogs.length, 0);
+  await localArea.set({ [DEBUG_LOGS_KEY]: true });
   clock += 11999;
   assert.equal((await sync.advance(await sync.read(), 'next')).next, undefined);
   clock++;
   assert.equal((await sync.advance(await sync.read(), 'next')).next, true);
+  assert.ok(workerLogs.length > 0);
   clock += 12000;
   assert.equal((await sync.advance(await sync.read(), 'next')).next, undefined);
   await merge('second', { canPage: false });

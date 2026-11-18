@@ -652,7 +652,8 @@ test('Manual history button starts with foreground stay-on-tab guidance, toggles
 
   const button = byId.get('btn-history-sync');
   assert.equal(button.disabled, false);
-  assert.match(byId.get('history-sync-status').textContent, /同步期间请停留在该标签页/);
+  assert.equal(button.textContent, '同步最近数据');
+  assert.match(byId.get('history-sync-status').textContent, /最多 1000 条或近 7 天.*同步期间请停留在该标签页/);
   await button.trigger('click');
   assert.equal(button.textContent, '停止同步');
   assert.match(byId.get('history-sync-status').textContent, /同步期间请停留在该标签页/);
@@ -664,7 +665,12 @@ test('Manual history button starts with foreground stay-on-tab guidance, toggles
   ]);
   await ui.refresh();
   assert.equal(button.disabled, true);
+  assert.equal(button.textContent, '同步最近数据');
   assert.match(byId.get('history-sync-status').textContent, /已停止.*后再次手动同步/);
+
+  Object.assign(snap.historySync, { status: 'done', reason: 'item_limit', pages: 50, added: 1000, duplicates: 0 });
+  await ui.refresh();
+  assert.match(byId.get('history-sync-status').textContent, /已读满最近 1000 条回复/);
 });
 
 test('Audit regressions: unreadable import file handling, preserved account selection on failed CLEAR_ALL, Top-20 core bounds, and multi-page search copy', async () => {

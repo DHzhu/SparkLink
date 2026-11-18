@@ -401,15 +401,15 @@ export function createPopupController(options = {}) {
       syncDeadlineTimer.unref?.();
     }
     els.btnHistorySync.disabled = !running && (!canStart || cooling);
-    els.btnHistorySync.textContent = running ? '停止同步' : '同步近 7 天回复';
+    els.btnHistorySync.textContent = running ? '停止同步' : '同步最近数据';
     if (!job) {
-      els.historyStatus.textContent = (canStart ? '将打开并切换到同步标签页读取本人回复，同步期间请停留在该标签页。' : '开启采集并选中当前 X 页的账号后可同步。') + cooldownText;
+      els.historyStatus.textContent = (canStart ? '将打开并切换到同步标签页读取本人最近回复（最多 1000 条或近 7 天），同步期间请停留在该标签页。' : '开启采集并选中当前 X 页的账号后可同步。') + cooldownText;
       return;
     }
     const reasons = {
       rate_limited: 'X 已限流，同步已停止', verification: 'X 要求登录或验证，同步已停止', unavailable: 'X 暂时无法加载回复',
       searched: '已按日期分段搜索近 7 天回复，可能有遗漏', search_stalled: '未读到当日搜索结果，无法判断当天是否有回复',
-      first_page: '未读到回复列表第一页', end: '已读到列表末尾', boundary: '已读到 7 天边界', cancelled: '已停止',
+      first_page: '未读到回复列表第一页', end: '已读到列表末尾', boundary: '已读到 7 天边界', item_limit: '已读满最近 1000 条回复', cancelled: '已停止',
       unrecognized: '部分回复无法识别', stalled: '页面未返回更多回复', timeout: '已达到本次读取时限',
       page_limit: '已达到本次读取上限，可能有遗漏', account_changed: '账号或采集会话已变化',
       navigation: '页面已离开或无法打开回复页', closed: '同步标签页已关闭',

@@ -459,7 +459,7 @@
         binding.bindingId !== data.bindingId ||
         binding.actorUserId !== scope.actor ||
         usedCursors.has(cursor) ||
-        usedCursors.size >= 32 ||
+        usedCursors.size >= 120 ||
         nowAtStart - lastFetchAt < 12000 ||
         !canScrollDocument()
       ) {

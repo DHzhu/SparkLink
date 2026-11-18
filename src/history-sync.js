@@ -3,9 +3,11 @@ import { isPlainObject, isValidDecimalId, sanitizeHandle } from './schema.js';
 export const HISTORY_SYNC_KEY = 'sparklink_history_sync';
 export const DEBUG_LOGS_KEY = 'sparklink_debug_logs';
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_RUNTIME_MS = 5 * 60 * 1000;
-const MAX_PAGES = 8;
-const MAX_SEARCH_PAGES = 32;
+const MAX_RUNTIME_MS = 20 * 60 * 1000;
+const MAX_IDLE_RUNTIME_MS = 5 * 60 * 1000;
+export const MAX_PAGES = 80;
+export const MAX_ITEMS = 1000;
+const MAX_SEARCH_PAGES = 80;
 const DAY_MS = 86400000;
 const PACE_MS = 12000;
 const utcDay = (ms) => Math.floor(ms / DAY_MS) * DAY_MS;
@@ -58,8 +60,11 @@ export function createHistorySync(chromeApi, storage, now) {
   }
   async function read() {
     const job = (await area.get(HISTORY_SYNC_KEY))[HISTORY_SYNC_KEY] || null;
-    if (job?.status === 'running' && now() - job.until >= MAX_RUNTIME_MS) {
-      return save({ ...job, status: 'partial', reason: 'timeout' });
+    if (job?.status === 'running') {
+      const lastActiveAt = Math.max(job.until, job.pageAt || job.until, job.actionAt || job.until);
+      if (now() - lastActiveAt >= MAX_IDLE_RUNTIME_MS || now() - job.until >= MAX_RUNTIME_MS) {
+        return save({ ...job, status: 'partial', reason: 'timeout' });
+      }
     }
     return job;
   }
@@ -184,9 +189,14 @@ export function createHistorySync(chromeApi, storage, now) {
       if (msg.historyPage.searchQuery !== job.searchQuery) return { ok: false, code: 'STALE_DAY' };
       if (job.dayRead) return { ok: true };
     } else if (msg.historyPage.searchQuery) return { ok: false, code: 'STALE_DAY' };
-    const events = msg.events.filter((event) => event?.source === 'history' &&
+    const inWindowEvents = msg.events.filter((event) => event?.source === 'history' &&
       event.actorUserId === job.actorUserId && Number.isSafeInteger(event.createdAt) &&
       event.createdAt >= job.since && event.createdAt <= job.until);
+    const remainingItems = Math.max(0, MAX_ITEMS - (job.added + job.duplicates));
+    const events = inWindowEvents
+      .slice()
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, remainingItems);
     const merged = await storage.mergeObservedBatch({ bindingContext: binding, events, observedUsers: [] });
     if (!merged.ok) {
       await stop(job, 'storage');
@@ -197,17 +207,22 @@ export function createHistorySync(chromeApi, storage, now) {
       isValidDecimalId(pageKey) ? pageKey : null;
     const crossedBoundary = oldKey && job.previousOldKey && oldKey !== job.previousOldKey;
     const crossedWindowInSearch = Number.isSafeInteger(newestAt) && newestAt > 0 && newestAt < job.since;
-    const canContinueDay = job.mode === 'search' && msg.historyPage.canPage === true &&
+    const totalItems = job.added + merged.added + job.duplicates + merged.duplicates;
+    const reachedItemLimit = totalItems >= MAX_ITEMS;
+    const canContinueDay = !reachedItemLimit && job.mode === 'search' && msg.historyPage.canPage === true &&
       ended !== true && !crossedWindowInSearch;
     const unrecognized = Boolean(job.unrecognized || job.missingTimeline || msg.partial === true || merged.conflicts > 0);
     const partial = Boolean(job.partial || unrecognized);
     const nextSearchPages = (job.searchPages || 0) + (job.mode === 'search' ? 1 : 0);
     const next = {
       ...job, pages: job.pages + 1, searchPages: nextSearchPages, added: job.added + merged.added, duplicates: job.duplicates + merged.duplicates,
-      pageAt: now(), hasNext: job.mode === 'search' ? canContinueDay : msg.historyPage.canPage === true,
-      dayRead: job.mode === 'search' && !canContinueDay, previousOldKey: oldKey, partial, unrecognized, receipts: [...job.receipts, msg.pageId]
+      pageAt: now(), hasNext: reachedItemLimit ? false : (job.mode === 'search' ? canContinueDay : msg.historyPage.canPage === true),
+      dayRead: job.mode === 'search' && !reachedItemLimit && !canContinueDay, previousOldKey: oldKey, partial, unrecognized, receipts: [...job.receipts, msg.pageId]
     };
-    if (job.mode === 'search' && next.dayRead && job.day <= utcDay(job.since)) {
+    if (reachedItemLimit) {
+      next.status = partial ? 'partial' : 'done';
+      next.reason = partial ? 'unrecognized' : 'item_limit';
+    } else if (job.mode === 'search' && next.dayRead && job.day <= utcDay(job.since)) {
       next.status = partial ? 'partial' : 'done';
       next.reason = unrecognized ? 'unrecognized' : 'searched';
     } else if (job.mode !== 'search' && (ended === true || crossedBoundary)) {

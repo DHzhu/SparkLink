@@ -88,15 +88,15 @@ test('Manual history uses only the confirmed job tab, exact seven-day bounds, de
   assert.equal((await call('GET_POPUP_SNAPSHOT')).historySync.status, 'cancelled');
 });
 
-test('Two distinct old pages are required for the seven-day boundary; the eighth page ends a partial run', async () => {
-  const { createHistorySync } = await import('../src/history-sync.js');
+test('Two distinct old pages are required for the seven-day boundary; reaching MAX_PAGES ends a partial run', async () => {
+  const { createHistorySync, MAX_PAGES } = await import('../src/history-sync.js');
   for (const reason of ['boundary', 'page_limit']) {
     const api = { storage: { local: area(), session: area() },
       tabs: { create: async () => ({ id: 7 }), update: async () => {} } };
     const service = createHistorySync(api, { mergeObservedBatch: async () => ({ ok: true, added: 0, duplicates: 0 }) }, () => now);
     const binding = { actorUserId: '4', captureSessionId: 1, accountGeneration: 1, collectionGeneration: 1 };
     const { job } = await service.start(binding, 'alice');
-    const keys = reason === 'boundary' ? ['2', '2', '1'] : Array(8).fill('2');
+    const keys = reason === 'boundary' ? ['2', '2', '1'] : Array(MAX_PAGES).fill('2');
     for (let index = 0; index < keys.length; index++) {
       const current = await service.read();
       assert.equal(current.status, 'running');
@@ -357,5 +357,79 @@ test('Audit regressions: BIND_VIEWER account switch clears historySyncId, read()
   assert.equal(afterClearAllSnap.debugLogsEnabled, false);
   // Rate-limit cooldown timestamp remains preserved across CLEAR_ALL
   assert.ok(afterClearAllSnap.historyNextStart > 0);
+});
+
+test('History sync stops cleanly with reason item_limit once MAX_ITEMS (1000) newest 7-day replies are collected', async () => {
+  const { createHistorySync, MAX_ITEMS } = await import('../src/history-sync.js');
+  const mergedBatches = [];
+  const api = {
+    storage: { local: area(), session: area() },
+    tabs: { create: async () => ({ id: 31 }), update: async () => {} }
+  };
+  const sync = createHistorySync(
+    api,
+    {
+      async mergeObservedBatch(batch) {
+        mergedBatches.push(batch.events.map((e) => e.replyTweetId));
+        return { ok: true, added: batch.events.length, duplicates: 0, conflicts: 0 };
+      }
+    },
+    () => now
+  );
+  const binding = { actorUserId: '101', captureSessionId: 1, accountGeneration: 1, collectionGeneration: 1 };
+  const { job } = await sync.start(binding, 'alice');
+
+  const makeEvents = (startSeq, count, baseTs) =>
+    Array.from({ length: count }, (_, i) => ({
+      actorUserId: '101',
+      targetUserId: '202',
+      parentTweetId: '303',
+      replyTweetId: String(startSeq + i),
+      source: 'history',
+      createdAt: baseTs + i * 1000,
+      observedAt: now
+    }));
+
+  // 4 pages x 240 items = 960 items
+  for (let p = 0; p < 4; p += 1) {
+    const current = await sync.read();
+    await sync.mergePage(
+      current,
+      {
+        jobId: job.id,
+        pageId: 'p_' + p,
+        events: makeEvents(1000 + p * 1000, 240, now - (p + 1) * 300000),
+        historyPage: { newestAt: now - p * 300000, pageKey: String(1000 + p * 1000), canPage: true, ended: false }
+      },
+      binding
+    );
+    const mid = await sync.read();
+    assert.equal(mid.status, 'running');
+    assert.equal(mid.hasNext, true);
+  }
+
+  // Final page has 60 items, should slice to newest 40 items to reach MAX_ITEMS (1000) and mark done
+  const beforeFinal = await sync.read();
+  assert.equal(beforeFinal.added, 960);
+  await sync.mergePage(
+    beforeFinal,
+    {
+      jobId: job.id,
+      pageId: 'p_final',
+      events: makeEvents(5000, 60, now - 2000000),
+      historyPage: { newestAt: now - 2000000, pageKey: '5000', canPage: true, ended: false }
+    },
+    binding
+  );
+
+  const doneJob = await sync.read();
+  assert.equal(doneJob.added, MAX_ITEMS);
+  assert.equal(doneJob.status, 'done');
+  assert.equal(doneJob.reason, 'item_limit');
+  assert.equal(doneJob.hasNext, false);
+  assert.equal(mergedBatches.at(-1).length, 40);
+  // Newest items kept first when slicing
+  assert.equal(mergedBatches.at(-1)[0], '5059');
+  assert.equal(mergedBatches.at(-1).at(-1), '5020');
 });
 

@@ -252,3 +252,104 @@ test('HELLO on the active sync tab restores binding immediately across /with_rep
   assert.equal(hello.bindingContext.actorUserId, '101');
   assert.equal(hello.historyScope.actor, '101');
 });
+
+test('Audit regressions: BIND_VIEWER account switch clears historySyncId, read() persists timeout with END_HISTORY_TRANSPORT, and CLEAR_ACCOUNT / CLEAR_ALL tear down active sync and reset debugLogsEnabled', async () => {
+  let clock = now;
+  let activeId = 1;
+  let nextId = 20;
+  const tabMessages = [];
+  const localArea = area();
+  const sessionArea = area();
+  const api = {
+    storage: { local: localArea, session: sessionArea },
+    runtime: { id: 'ext', getURL: (p) => 'chrome-extension://ext/' + p },
+    tabs: {
+      async query() { return [{ id: activeId }]; },
+      async sendMessage(tabId, msg) { tabMessages.push({ tabId, msg }); return { ok: true, alive: true }; },
+      async create() { activeId = ++nextId; return { id: activeId }; },
+      async update() {}
+    }
+  };
+  const bg = createBackgroundService(api, { nowFn: () => clock });
+  const call = (type, args = {}, from = popup) => bg.handleMessage({ type, ...args }, from);
+
+  await call('SET_COLLECTION_ENABLED', { enabled: true });
+  await call('SET_DEBUG_LOGS', { enabled: true });
+  await call('BIND_VIEWER', { captureSessionId: 1, viewer: { actorUserId: '101', handle: 'alice' } }, sender(1));
+
+  // 1. Account switch on sync tab stops job first and does NOT leak alice's historySyncId onto bob
+  const started1 = await call('START_HISTORY_SYNC', { actorUserId: '101' });
+  const syncTab1 = activeId;
+  await call('HELLO', { origin: 'https://x.com' }, sender(syncTab1));
+  const bobBind = await call(
+    'BIND_VIEWER',
+    { captureSessionId: 1, viewer: { actorUserId: '102', handle: 'bob' } },
+    sender(syncTab1)
+  );
+  assert.equal(bobBind.ok, true);
+  assert.equal(bobBind.historySyncId, null);
+
+  // Passive history event for bob (10 days old, within 30d window) on that tab must NOT be dropped
+  const bobOldPassiveReply = {
+    actorUserId: '102',
+    targetUserId: '303',
+    parentTweetId: '404',
+    replyTweetId: '9001',
+    source: 'history',
+    createdAt: clock - 10 * day,
+    observedAt: clock
+  };
+  const batchRes = await call(
+    'SUBMIT_OBSERVED_BATCH',
+    { bindingContext: bobBind.bindingContext, events: [bobOldPassiveReply], observedUsers: [] },
+    sender(syncTab1)
+  );
+  assert.equal(batchRes.ok, true);
+  assert.equal(batchRes.added, 1);
+  assert.equal((await call('GET_POPUP_SNAPSHOT')).historySync.reason, 'account_changed');
+
+  // 2. Timeout in read() persists status='partial', reason='timeout' into session storage and notifies sync tab
+  clock += 16 * 60000;
+  activeId = 1;
+  await call('BIND_VIEWER', { captureSessionId: 1, viewer: { actorUserId: '101', handle: 'alice' } }, sender(1));
+  const started2 = await call('START_HISTORY_SYNC', { actorUserId: '101' });
+  const syncTab2 = activeId;
+  assert.ok(started2.job?.id);
+  tabMessages.length = 0;
+  clock += 5 * 60000 + 1;
+  const timedOutSnap = await call('GET_POPUP_SNAPSHOT');
+  assert.equal(timedOutSnap.historySync.status, 'partial');
+  assert.equal(timedOutSnap.historySync.reason, 'timeout');
+  const rawStoredAfterTimeout = (await sessionArea.get('sparklink_history_sync')).sparklink_history_sync;
+  assert.equal(rawStoredAfterTimeout.status, 'partial');
+  assert.equal(rawStoredAfterTimeout.reason, 'timeout');
+  assert.equal(
+    tabMessages.some((m) => m.tabId === syncTab2 && m.msg?.type === 'END_HISTORY_TRANSPORT' && m.msg.jobId === started2.job.id),
+    true
+  );
+
+  // 3. CLEAR_ACCOUNT while sync is running notifies END_HISTORY_TRANSPORT; CLEAR_ALL resets debugLogsEnabled in storage
+  clock += 16 * 60000;
+  activeId = 1;
+  await call('BIND_VIEWER', { captureSessionId: 1, viewer: { actorUserId: '101', handle: 'alice' } }, sender(1));
+  const started3 = await call('START_HISTORY_SYNC', { actorUserId: '101' });
+  const syncTab3 = activeId;
+  tabMessages.length = 0;
+  const aliceSnap = await call('GET_POPUP_SNAPSHOT', { preferredActorUserId: '101' });
+  const aliceAcc = aliceSnap.savedAccounts.find((a) => a.actorUserId === '101');
+  const clearAccRes = await call('CLEAR_ACCOUNT', { actorUserId: '101', accountGeneration: aliceAcc.accountGeneration });
+  assert.equal(clearAccRes.ok, true);
+  assert.equal(
+    tabMessages.some((m) => m.tabId === syncTab3 && m.msg?.type === 'END_HISTORY_TRANSPORT' && m.msg.jobId === started3.job.id),
+    true
+  );
+
+  assert.equal((await call('GET_POPUP_SNAPSHOT')).debugLogsEnabled, true);
+  const clearAllRes = await call('CLEAR_ALL');
+  assert.equal(clearAllRes.ok, true);
+  const afterClearAllSnap = await call('GET_POPUP_SNAPSHOT');
+  assert.equal(afterClearAllSnap.debugLogsEnabled, false);
+  // Rate-limit cooldown timestamp remains preserved across CLEAR_ALL
+  assert.ok(afterClearAllSnap.historyNextStart > 0);
+});
+

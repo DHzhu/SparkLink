@@ -59,7 +59,7 @@ export function createHistorySync(chromeApi, storage, now) {
   async function read() {
     const job = (await area.get(HISTORY_SYNC_KEY))[HISTORY_SYNC_KEY] || null;
     if (job?.status === 'running' && now() - job.until >= MAX_RUNTIME_MS) {
-      return { ...job, status: 'partial', reason: 'timeout' };
+      return save({ ...job, status: 'partial', reason: 'timeout' });
     }
     return job;
   }
@@ -152,11 +152,16 @@ export function createHistorySync(chromeApi, storage, now) {
     }
     if ((job.searchAttempts || 0) >= MAX_SEARCH_PAGES) return stop(job, 'page_limit');
     if (action !== 'search' || (job.mode === 'search' && (!job.dayRead || job.hasNext))) return { ok: true };
-    if (job.mode === 'timeline' && (job.hasNext ||
-        (!job.pages && !job.missingTimeline && time - job.until < 45000))) return { ok: true };
+    if (job.mode === 'timeline') {
+      const lastProgressAt = Math.max(job.actionAt || job.until, job.pageAt || job.until);
+      if (job.hasNext && time - lastProgressAt < 45000) return { ok: true };
+      if (!job.hasNext && !job.pages && !job.missingTimeline && time - job.until < 45000) return { ok: true };
+    }
+    const stalledOnTimeline = Boolean(job.timelineStalled || (job.mode === 'timeline' && job.hasNext));
     const day = job.mode === 'search' ? job.day - DAY_MS : utcDay(job.until);
     const query = queryForDay(job.handle, day);
     const next = { ...job, mode: 'search', day, searchQuery: query, dayRead: false, hasNext: false,
+      partial: Boolean(job.partial || stalledOnTimeline), timelineStalled: stalledOnTimeline,
       requestedAfterPage: null, actionAt: time, searchAttempts: (job.searchAttempts || 0) + 1 };
     await save(next);
     await logSync('advance -> search', { id: job.id, prevMode: job.mode, pages: job.pages, missingTimeline: Boolean(job.missingTimeline), query });
@@ -194,16 +199,17 @@ export function createHistorySync(chromeApi, storage, now) {
     const crossedWindowInSearch = Number.isSafeInteger(newestAt) && newestAt > 0 && newestAt < job.since;
     const canContinueDay = job.mode === 'search' && msg.historyPage.canPage === true &&
       ended !== true && !crossedWindowInSearch;
-    const partial = job.partial || msg.partial === true || merged.conflicts > 0;
+    const unrecognized = Boolean(job.unrecognized || job.missingTimeline || msg.partial === true || merged.conflicts > 0);
+    const partial = Boolean(job.partial || unrecognized);
     const nextSearchPages = (job.searchPages || 0) + (job.mode === 'search' ? 1 : 0);
     const next = {
       ...job, pages: job.pages + 1, searchPages: nextSearchPages, added: job.added + merged.added, duplicates: job.duplicates + merged.duplicates,
       pageAt: now(), hasNext: job.mode === 'search' ? canContinueDay : msg.historyPage.canPage === true,
-      dayRead: job.mode === 'search' && !canContinueDay, previousOldKey: oldKey, partial, receipts: [...job.receipts, msg.pageId]
+      dayRead: job.mode === 'search' && !canContinueDay, previousOldKey: oldKey, partial, unrecognized, receipts: [...job.receipts, msg.pageId]
     };
     if (job.mode === 'search' && next.dayRead && job.day <= utcDay(job.since)) {
       next.status = partial ? 'partial' : 'done';
-      next.reason = partial ? 'unrecognized' : 'searched';
+      next.reason = unrecognized ? 'unrecognized' : 'searched';
     } else if (job.mode !== 'search' && (ended === true || crossedBoundary)) {
       next.status = partial ? 'partial' : 'done';
       next.reason = partial ? 'unrecognized' : ended === true ? 'end' : 'boundary';
@@ -230,5 +236,17 @@ export function createHistorySync(chromeApi, storage, now) {
     });
     return merged;
   }
-  return { read, start, stop, matches, advance, nextStart, mergePage, forget: () => save(null) };
+  async function forget() {
+    const current = (await area.get(HISTORY_SYNC_KEY))[HISTORY_SYNC_KEY] || null;
+    await save(null);
+    if (current?.status === 'running') {
+      chromeApi.tabs?.sendMessage?.(current.tabId, {
+        type: 'END_HISTORY_TRANSPORT',
+        jobId: current.id,
+        clearSyncId: true
+      })?.catch(() => {});
+    }
+    return null;
+  }
+  return { read, start, stop, matches, advance, nextStart, mergePage, forget };
 }

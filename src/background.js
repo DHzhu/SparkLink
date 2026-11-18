@@ -280,10 +280,22 @@ export function createBackgroundService(chromeApi, options = {}) {
     };
   }
 
-  function scopedHistoryId(job, sender, existing) {
-    if (job?.status === 'running' && job.tabId === sender.tabId) return job.id;
-    // Retain the filter for late responses from the manual document only.
-    return existing?.documentId === sender.documentId ? existing?.historySyncId || null : null;
+  function scopedHistoryId(job, sender, existing, actorUserId = null) {
+    if (job?.status === 'running' && job.tabId === sender.tabId) {
+      return !actorUserId || job.actorUserId === actorUserId ? job.id : null;
+    }
+    // Retain the filter for late responses from the manual document of the same viewer only.
+    if (existing?.documentId !== sender.documentId || !existing?.historySyncId) {
+      return null;
+    }
+    const existingActorId = existing.bindingContext?.actorUserId || existing.lastConfirmedActorUserId || null;
+    if (actorUserId && existingActorId && existingActorId !== actorUserId) {
+      return null;
+    }
+    if (actorUserId && job && existing.historySyncId === job.id && job.actorUserId !== actorUserId) {
+      return null;
+    }
+    return existing.historySyncId;
   }
 
   function emptyDiagnostics() {
@@ -584,8 +596,13 @@ export function createBackgroundService(chromeApi, options = {}) {
           return res;
         }
         const affectedTabIds = [];
-        if ((await history.read())?.actorUserId === actorId) await history.forget();
+        const activeJob = await history.read();
+        const clearedJobId = activeJob?.actorUserId === actorId ? activeJob.id : null;
+        if (clearedJobId) await history.forget();
         for (const entry of sessionTabsCache.values()) {
+          if (clearedJobId && entry.historySyncId === clearedJobId) {
+            entry.historySyncId = null;
+          }
           if (entry.lastConfirmedActorUserId === actorId) {
             entry.lastConfirmedActorUserId = null;
           }
@@ -594,6 +611,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           }
           if (entry.bindingContext && entry.bindingContext.actorUserId === actorId) {
             const oldBindingId = entry.bindingContext.bindingId;
+            entry.historySyncId = null;
             entry.bindingContext = null;
             entry.diagnostics = null;
             affectedTabIds.push({ tabId: entry.tabId, bindingId: oldBindingId });
@@ -622,6 +640,11 @@ export function createBackgroundService(chromeApi, options = {}) {
           return res;
         }
         const previousTabIds = Array.from(sessionTabsCache.values()).map((e) => e.tabId);
+        try {
+          await chromeApi.storage.local.set({ [DEBUG_LOGS_KEY]: false });
+        } catch (_err) {
+          // Best-effort reset of debug log toggle
+        }
         await history.forget();
         sessionTabsCache.clear();
         await persistSessionTabs();
@@ -800,11 +823,12 @@ export function createBackgroundService(chromeApi, options = {}) {
         }
 
         const existing = sessionTabsCache.get(xSender.tabKey) || null;
-        const job = await history.read();
-        const historySyncId = scopedHistoryId(job, xSender, existing);
+        let job = await history.read();
         if (job?.tabId === xSender.tabId && job.actorUserId !== msg.viewer.actorUserId) {
           await history.stop(job, 'account_changed');
+          job = await history.read();
         }
+        const historySyncId = scopedHistoryId(job, xSender, existing, msg.viewer.actorUserId);
         if (
           existing &&
           existing.documentId === xSender.documentId &&
@@ -814,6 +838,7 @@ export function createBackgroundService(chromeApi, options = {}) {
         ) {
           syncExclusiveActiveTab(xSender.tabKey, xSender.active);
           existing.active = xSender.active;
+          existing.historySyncId = historySyncId;
           existing.lastConfirmedActorUserId = msg.viewer.actorUserId;
           existing.updatedAt = nowFn();
           await persistSessionTabs();

@@ -29,7 +29,7 @@ function createFakeTimerHarness(startMs = 1_700_000_000_000) {
     timers.delete(id);
   }
 
-  async function flushMicrotasks(rounds = 8) {
+  async function flushMicrotasks(rounds = 24) {
     for (let i = 0; i < rounds; i += 1) {
       await Promise.resolve();
     }
@@ -380,3 +380,85 @@ test('Sync page logs are completely silent by default and emit [SparkLink Sync/P
   assert.ok(pageLogs.length > 0);
   page.destroy();
 });
+
+test('Sync page skips hidden / aria-hidden Replies anchors and falls back to UTC daily search when mid-timeline scroll stalls after 45s', async () => {
+  const { createHistorySync, describeHistorySync } = await import('../src/history-sync.js');
+  const timers = createFakeTimerHarness();
+  const updatedUrls = [];
+  const store = {};
+  const area = {
+    async get(k) { return k in store ? { [k]: structuredClone(store[k]) } : {}; },
+    async set(v) { Object.assign(store, structuredClone(v)); }
+  };
+  const sync = createHistorySync(
+    {
+      storage: { local: area, session: area },
+      tabs: { create: async () => ({ id: 9 }), update: async (_id, opts) => updatedUrls.push(opts.url) }
+    },
+    { mergeObservedBatch: async () => ({ ok: true, added: 1, duplicates: 0, conflicts: 0 }) },
+    timers.nowFn
+  );
+  const binding = {
+    bindingId: 'bind_1',
+    actorUserId: '1001001',
+    captureSessionId: 7,
+    collectionGeneration: 1,
+    accountGeneration: 1
+  };
+  await sync.start(binding, 'Alice');
+
+  const hiddenAnchor = makeAnchor({ href: '/Alice/with_replies', hidden: true });
+  const ariaHiddenAnchor = makeAnchor({ href: '/Alice/with_replies', ariaHidden: 'true' });
+  let env;
+  const visibleAnchor = makeAnchor({
+    href: '/Alice/with_replies',
+    onClick: () => env.setUrl('https://x.com/Alice/with_replies')
+  });
+
+  env = createMockPageEnv({
+    url: 'https://x.com/Alice',
+    bindingContext: binding,
+    anchors: [hiddenAnchor, ariaHiddenAnchor, visibleAnchor],
+    taskHandler: async (msg) => {
+      if (msg.type === 'GET_HISTORY_SYNC_TASK') {
+        return { ok: true, job: describeHistorySync(await sync.read()), debugLogsEnabled: false };
+      }
+      if (msg.type === 'ADVANCE_HISTORY_SYNC') {
+        return sync.advance(await sync.read(), msg.action);
+      }
+      if (msg.type === 'STOP_HISTORY_SYNC_TASK') {
+        return sync.stop(await sync.read(), msg.reason, msg.retryAt);
+      }
+      return { ok: true };
+    }
+  });
+  env.win.__sparklinkIsolatedBridge.requestHistoryNext = () => {};
+
+  const page = installHistorySyncPage(env.win, env.chromeObj, timers);
+  await page.ready;
+  await timers.advanceBy(12000);
+  assert.equal(hiddenAnchor.clickCount, 0);
+  assert.equal(ariaHiddenAnchor.clickCount, 0);
+  assert.equal(visibleAnchor.clickCount, 1);
+
+  // Page 1 arrives with canPage=true
+  await sync.mergePage(
+    await sync.read(),
+    { jobId: (await sync.read()).id, pageId: 'p1', events: [], historyPage: { canPage: true, ended: false } },
+    binding
+  );
+
+  // 12s later, 'next' scroll grant is issued
+  await timers.advanceBy(12000);
+  assert.equal((await sync.read()).attempts, 1);
+
+  // 45s pass with NO Page 2 response -> must transition to 'search' mode (with partial=true) instead of terminating as 'stalled'
+  await timers.advanceBy(45000);
+  const afterStall = await sync.read();
+  assert.equal(afterStall.status, 'running');
+  assert.equal(afterStall.mode, 'search');
+  assert.equal(afterStall.partial, true);
+  assert.match(updatedUrls.at(-1), /^https:\/\/x\.com\/search\?/);
+  page.destroy();
+});
+

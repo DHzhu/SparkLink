@@ -671,6 +671,9 @@
         accountGeneration: res.bindingContext.accountGeneration
       });
       state.historySyncId = res.historySyncId || null;
+      if (!state.historySyncId) {
+        state.historyScope = null;
+      }
       state.bindingContext = nextBinding;
       syncMainState();
       notifySubscribers({
@@ -1036,6 +1039,9 @@
 
       if (msg.type === 'END_HISTORY_TRANSPORT' && msg.jobId === state.historySyncId) {
         state.historyScope = null;
+        if (msg.clearSyncId === true) {
+          state.historySyncId = null;
+        }
         syncMainState();
         notifySubscribers({ type: 'HISTORY_SYNC_ENDED', jobId: msg.jobId });
         return;

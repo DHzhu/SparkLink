@@ -124,6 +124,7 @@
           if (binding && path === profile && elapsed >= repliesGateMs) {
             if (!clicked) {
               const link = Array.from(win.document.querySelectorAll('a[href]')).find(node => {
+                if (!node || node.hidden === true || node.getAttribute?.('aria-hidden') === 'true') return false;
                 let href;
                 try { href = new URL(node.getAttribute('href'), url); } catch { return false; }
                 return href.origin === url.origin && href.pathname.toLowerCase() === replies && !href.search && !href.hash;
@@ -141,8 +142,8 @@
             }
           }
           enteredReplies ||= nowPath === replies;
-          if (job.hasNext && elapsed >= 45000) return stop('stalled');
-          if (job.hasNext) action = 'next';
+          if (job.hasNext && elapsed >= 45000) action = 'search';
+          else if (job.hasNext) action = 'next';
           else if (!action && (
             (wasOnReplies && (job.pages > 0 || job.missingTimeline)) ||
             (nowPath === profile && repliesRequested && !clicked && job.missingTimeline) ||

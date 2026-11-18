@@ -329,12 +329,20 @@
       }
       win.scrollTo(0, targetHeight);
       try {
-        const cells = typeof doc.querySelectorAll === 'function' ? doc.querySelectorAll('[data-testid="cellInnerDiv"]') : null;
+        const primary = typeof doc.querySelector === 'function' ? doc.querySelector('[data-testid="primaryColumn"]') : null;
+        const cells = primary && typeof primary.querySelectorAll === 'function'
+          ? primary.querySelectorAll('[data-testid="cellInnerDiv"]')
+          : !primary && typeof doc.querySelectorAll === 'function'
+          ? doc.querySelectorAll('[data-testid="cellInnerDiv"]')
+          : null;
         const lastCell = cells && cells.length > 0 ? cells[cells.length - 1] : null;
         if (lastCell && typeof lastCell.scrollIntoView === 'function') {
           lastCell.scrollIntoView({ block: 'end' });
         }
       } catch {}
+      if ((Number(se.scrollTop) || Number(win.scrollY) || 0) < targetHeight) {
+        win.scrollTo(0, targetHeight);
+      }
       try {
         if (typeof Event === 'function' && typeof win.dispatchEvent === 'function') {
           win.dispatchEvent(new Event('scroll'));
@@ -817,6 +825,8 @@
         if (!targetId || (state.bindingContext && state.bindingContext.bindingId === targetId)) {
           state.bindingContext = null;
           state.latestGraphqlViewer = null;
+          clearHistoryTransport();
+          scope = null;
           cancelActiveReaders((t) => !targetId || t.bindingId === targetId);
           engine.revokeBinding(targetId);
         } else {

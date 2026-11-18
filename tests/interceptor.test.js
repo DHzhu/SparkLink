@@ -991,3 +991,109 @@ test('scrollScan never issues synthetic fetches on timeout and extends grace wai
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(scrollTargets.length, prevScrollCount);
 });
+
+test('Audit regressions: triggerScrollStep targets primaryColumn cells instead of sidebarColumn and REVOKE_BINDING aborts active scroll waiter', async (t) => {
+  let clock = 1_794_800_000_000;
+  t.mock.method(Date, 'now', () => clock);
+
+  let primaryLastScrolled = 0;
+  let sidebarScrolled = 0;
+  const scrollingElement = { scrollTop: 0, scrollHeight: 3600 };
+  const primaryCell = {
+    scrollIntoView() {
+      primaryLastScrolled += 1;
+    }
+  };
+  const sidebarCell = {
+    scrollIntoView() {
+      sidebarScrolled += 1;
+      // Simulate sticky sidebar pulling scrollTop back to 0 if mistakenly targeted
+      scrollingElement.scrollTop = 0;
+      win.scrollY = 0;
+    }
+  };
+
+  const listeners = new Map();
+  const outbound = [];
+  const baseUrl = new URL(timelineFixtures.ownRepliesTimelineMixed.requestUrl);
+  const pagePayload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  pagePayload.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom-pcol',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'cursor_primary_1' }
+  });
+  const win = {
+    location: { origin: 'https://x.com', href: 'https://x.com/sample_me/with_replies', pathname: '/sample_me/with_replies', search: '' },
+    scrollY: 0,
+    document: {
+      scrollingElement,
+      documentElement: scrollingElement,
+      querySelector(sel) {
+        if (sel === '[data-testid="primaryColumn"]') {
+          return {
+            querySelectorAll(innerSel) {
+              return innerSel === '[data-testid="cellInnerDiv"]' ? [primaryCell] : [];
+            }
+          };
+        }
+        return null;
+      },
+      querySelectorAll(sel) {
+        return sel === '[data-testid="cellInnerDiv"]' ? [primaryCell, sidebarCell] : [];
+      }
+    },
+    scrollTo(_x, y) {
+      scrollingElement.scrollTop = y;
+      win.scrollY = y;
+    },
+    dispatchEvent() {},
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type).add(fn);
+    },
+    postMessage(data) {
+      outbound.push(data);
+    },
+    async fetch() {
+      return new Response(
+        JSON.stringify(pagePayload),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }
+  };
+  win.top = win;
+
+  installMainInterceptor(win, adapterApi);
+  const dispatch = (type, extra) => {
+    for (const fn of listeners.get('message') || []) {
+      fn({
+        source: win,
+        origin: 'https://x.com',
+        data: { protocol: 'SPARKLINK_BRIDGE_V1', nonce: 'audit_nonce', collectionEnabled: true, captureSessionId: 10, type, ...extra }
+      });
+    }
+  };
+
+  dispatch('BRIDGE_INIT', {
+    bindingContext: BINDING_A,
+    historyScope: { id: 'job_pcol', actor: BINDING_A.actorUserId, since: clock - 86400000, deadline: clock + 300000, query: null }
+  });
+
+  await win.fetch(baseUrl.href);
+  for (let i = 0; i < 40 && !outbound.some((m) => m.historyPage); i += 1) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+
+  clock += 12000;
+  dispatch('HISTORY_NEXT', { jobId: 'job_pcol', bindingId: BINDING_A.bindingId });
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.equal(primaryLastScrolled, 1);
+  assert.equal(sidebarScrolled, 0);
+  assert.ok(scrollingElement.scrollTop >= 3600);
+
+  // Immediately revoking binding must wake and clear history transport without waiting 3.5s
+  dispatch('REVOKE_BINDING', { bindingId: BINDING_A.bindingId });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(primaryLastScrolled, 1);
+});
+

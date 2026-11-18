@@ -67,7 +67,7 @@ zip -r dist/sparklink-custom.zip manifest.json icons src
 | **网页徽章挂载与 DOM 渲染** | [`src/content.js`](src/content.js) | 徽章 SVG 构建、悬浮提示文本与页面注入位置 |
 | **弹窗浅色 / 深色主题配色** | [`src/popup/popup.css`](src/popup/popup.css) | 顶部 `:root` 与 `@media (prefers-color-scheme: dark)` 中的全部配色变量 |
 | **弹窗页面结构与交互逻辑** | [`src/popup/popup.html`](src/popup/popup.html)、[`src/popup/popup.js`](src/popup/popup.js) | 面板尺寸、标题口号、榜单布局与按钮交互 |
-| **互动档位阈值与统计周期** | [`src/metrics.js`](src/metrics.js) | 默认 `30 天` 窗口与 `1–10 / 11–50 / 51+` 分级阈值 |
+| **互动档位阈值与统计周期** | [`src/metrics.js`](src/metrics.js)、[`src/content.js`](src/content.js) | `src/metrics.js` 定义 `WINDOW_MS`（默认 `30 天`）与 `TIER_THRESHOLDS`（`11 / 51`）；需同步更新 `src/content.js` 中的 `TIER_ACTIVE_MIN` / `TIER_DEEP_MIN`（Popup 标签会自动读取 `TIER_THRESHOLDS`） |
 | **同步条数 / 翻页上限** | [`src/history-sync.js`](src/history-sync.js) | `MAX_ITEMS`、`MAX_PAGES`、冷却时间等（注意保留防风控延迟） |
 | **扩展图标与基础信息** | [`icons/`](icons/)、[`manifest.json`](manifest.json) | 替换 16/32/48/128 PNG 图标、名称或版本号 |
 
@@ -83,7 +83,7 @@ zip -r dist/sparklink-custom.zip manifest.json icons src
 
 ## 本地校验与测试
 
-本仓库测试基于 Node.js 原生 `node:test` 运行，无需安装任何第三方依赖：
+本仓库测试基于 Node.js 原生 `node:test` 运行，无需安装任何第三方依赖。因测试集同时使用 ESM 与 CommonJS 且根目录不引入 `package.json`，需要 **`Node.js >= 22.12`**：
 
 ```bash
 # 1. 语法检查
@@ -91,6 +91,9 @@ for f in src/*.js src/popup/*.js; do node --check "$f" || exit 1; done
 
 # 2. 运行全部单元测试与静态安全审计
 node --test tests/*.test.js
+
+# 3. 运行测试并输出覆盖率统计
+node --test --experimental-test-coverage tests/*.test.js
 ```
 
 测试套件包含静态安全审计（[`tests/p0-security-and-e2e.test.js`](tests/p0-security-and-e2e.test.js) 与 [`tests/acceptance-matrix.test.js`](tests/acceptance-matrix.test.js)），会自动校验源码中不存在 `document.cookie`、鉴权头读取或额外网络外发行为。
@@ -126,3 +129,9 @@ SparkLink/
 - `.gitignore` 已默认排除本地构建包（`dist/`、`*.zip`）、个人备份文件（`sparklink-backup-*.json`）、浏览器调试配置、`.env*`、代理与本地工作流目录（`.agent/`、`conductor/`、`CLAUDE.md`、`GEMINI.md`）。
 - 若基于本仓库二次开发后继续开源分享，请先运行 `git status` 检查不要把个人导出的 `sparklink-backup-*.json` 或浏览器配置目录提交进版本库。
 - 本扩展为非官方辅助工具，与 X Corp. 无任何隶属关系；请合理使用同步频率并遵守平台使用规范。
+
+---
+
+## 开源协议
+
+本项目基于 [Apache License 2.0](LICENSE) 开源发布。

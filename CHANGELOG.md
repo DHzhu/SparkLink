@@ -11,10 +11,12 @@
 - 扩展主显示图标（`icons/icon16.png`、`icons/icon32.png`、`icons/icon48.png`、`icons/icon128.png`）与 Popup 顶部品牌标志（`src/popup/popup.html`）同步更新为深空蓝底色的橙金火焰环图形，与页面互动徽章视觉保持一致。
 - 互动徽章改为同色橙焰，按 1–10、11–50、51 次及以上逐档变大。有蓝 V 时火焰围绕原标识，无蓝 V 时显示白心火焰。徽章只用火焰大小区分等级，排行榜次数单独显示。开启减少动态效果后火焰保持静止。
 - 备份导出切换为紧凑 JSON 序列化并引入 `O(1)` 用户 Handle 索引（`src/popup/popup.js`、`src/storage.js`），确保满载 20,000 条回复（约 5.92 MiB）导出的备份体积低于 9 MiB 导入上限且可快速往返恢复。
+- 将同步入口改名为“同步最近数据”，支持最多 1000 条或近 7 天回复终止条件；时间线与按日搜索阶段上限均提升至 80 页，单次总时限调整为 20 分钟（无进展空闲超时 5 分钟）（`src/history-sync.js`、`src/popup/popup.js`、`src/popup/popup.html`）。
 
 ### 新增
 
-- 新增“同步近 7 天回复”。打开并切换到专用前台标签页进入本人回复列表，仅通过受限速的原生页面滚动触发 X 自身前端加载分页并被动拦截响应；缺少分页入口时按 UTC 日期读取 X 最新搜索结果并支持日内滚动翻页。时间线阶段最多 8 页、搜索阶段最多 32 次推进；两次启动至少间隔 15 分钟。遇到限流或需要验证即停止，保留已同步记录，并在弹窗展示可重试时间。
+- 新增开源项目文档（`README.md`）与 Apache License 2.0 协议（`LICENSE`），重点说明本地安装加载、数据完全本地存储、AI 助手二次定制与自主打包指引。
+- 新增“同步最近数据”（原“同步近 7 天回复”）。打开并切换到专用前台标签页进入本人回复列表，仅通过受限速的原生页面滚动触发 X 自身前端加载分页并被动拦截响应；缺少分页入口时按 UTC 日期读取 X 最新搜索结果并支持日内滚动翻页。时间线与搜索阶段各最多 80 页（最多纳入最近 1000 条或 7 天回复）；任务启动及结束后至少间隔 15 分钟。遇到限流或需要验证即停止，保留已同步记录，并在弹窗展示可重试时间。
 - 在 Popup“数据管理”新增默认关闭的“调试日志（控制台输出同步诊断）”开关（`sparklink_debug_logs`），统一控制 Worker、Bridge、Page 与 MAIN 四个环境的 `[SparkLink Sync/*]` 诊断日志输出。
 - 完成项目标准化与 Conductor 管理结构初始化（基于 `spec.md` v1.2.0）。
 - 完成 P0 兼容性验证与适配契约层：构建脱敏网络/DOM 测试样本集（`tests/fixtures/`），实现 X GraphQL 白名单适配器与有界待解析队列（`src/x-adapter.js`）、MAIN 世界只读流式网络封装（`src/interceptor.js`）以及 ISOLATED 世界消息桥接与批次确认状态机（`src/bridge.js`）。
@@ -28,6 +30,12 @@
 
 ### 修复
 
+- **[开源全仓审核]** 修复审核发现的 7 项核心代码隐患并同步文档（`src/x-adapter.js`、`src/interceptor.js`、`src/history-sync.js`、`src/history-sync-page.js`、`src/bridge.js`、`src/content.js`、`src/metrics.js`、`src/popup/`、`README.md`、`spec.md`）：
+  - `matchWhitelistedRequest` 与拦截器支持读取 `POST` GraphQL JSON 请求体中的 `variables`，并在 `/with_replies` 路径兜底升级时排除纯原帖 `UserTweets`（仅保留显式 `includeReplies` / `withReplies`、`UserTimeline` 与 `UserPosts` 升级）；
+  - 长任务完成写入非 `running` 状态时将冷却延续至结束后至少 15 分钟（不缩短更长的服务器 `retryAt` / 1 小时限流冷却），并在 `describeHistorySync` 暴露 `idleDeadline` 与 `nextTimeoutAt` 使弹窗和页面控制器在 5 分钟空闲超时点准时刷新或停止；
+  - `bridge.js` 的 `destroy()` 补全 `pageshow`、`visibilitychange`、握手定时器与 `installedBridges` 引用清理；
+  - `content.js` 的 `MutationObserver` 增加针对 `fill`/`style`/`class`/`color`/`data-testid` 的标签与选择器快路径以降低高频动态页面的遍历开销，同时收敛并对齐 `TIER_THRESHOLDS`（`11 / 51`）至 `metrics.js`、`content.js` 与 `popup.html` / `popup.js`。
+- **[同步稳定性与静默日志]** 兼容新版 `UserReplies` / `ProfileTweetsAndReplies` / `UserTimeline` / `UserPosts` 与 `timeline_v3` 结构，内联序列化同步诊断日志并严格恢复仅在开启 `sparklink_debug_logs` 时输出至控制台（`src/x-adapter.js`、`src/interceptor.js`、`src/bridge.js`、`src/history-sync-page.js`）。
 - **[全仓审计]** 修复 5 项全仓边缘场景问题（`src/background.js`、`src/bridge.js`、`src/history-sync.js`、`src/history-sync-page.js`、`src/interceptor.js`、`src/styles.css`、`src/content.js`、`src/popup/popup.js`）：
   - 同步标签页切换账号时先停止旧任务再清空 `historySyncId`，避免新绑定账号的被动回复补录被误拦截；
   - `history.read()` 超时状态持久化并下发 `END_HISTORY_TRANSPORT`，`CLEAR_ACCOUNT` / `CLEAR_ALL` 完整清理同步传输层并重置 `sparklink_debug_logs` 调试开关；

@@ -4,14 +4,14 @@
 | --- | --- |
 | Product | SparkLink - 星火链 |
 | Slogan | 我不会错过你的每一次发声 |
-| Document version | 1.2.0 |
+| Document version | 1.3.0 |
 | Target extension version | 1.0.0 |
-| Review date | 2026-11-16（Asia/Shanghai） |
+| Review date | 2026-11-17（Asia/Shanghai） |
 | Target platform | Google Chrome / Microsoft Edge，Chromium Manifest V3 |
 | Technical baseline | Vanilla JavaScript（ES2022）、HTML、CSS、Chrome Extension APIs |
 | Status | 本地 MVP 有条件可行，登录后的 X 页面兼容性待实机验证 |
 
-本文整合原 X-Pulse v1.0.0 规格与 SparkLink 品牌方案，作为后续实现和验收依据。本次交付为规格文档，尚未实现插件，也未在登录后的 X 页面执行验证。
+本文整合原 X-Pulse v1.0.0 规格与 SparkLink 品牌方案，作为后续实现和验收依据。插件已实现，并使用离线样例在 Chromium 中验证。登录后的 X 页面兼容性仍待实机验证。
 
 ## 1. Feasibility Review
 
@@ -50,7 +50,7 @@ Chrome 官方说明了 MAIN 与页面共享环境以及页面 CSP 的适用范�
 首版包含：
 
 1. 被动捕获当前登录账号成功发送的网页端回复。
-2. 用户自行浏览自己“回复”时间线时，补充其中可识别的近 30 天历史回复。
+2. 自然浏览本人“回复”时间线时被动补录近 30 天。用户也可以在 Popup 手动启动近 7 天回复同步。
 3. 按直接回复对象计算数量，在受支持的帖子和评论作者信息旁展示星火徽章。
 4. 按账号展示概览和 Top 20 排行榜，提供浏览器级采集开关、过期清理、按账号或全部清空以及 JSON 导入导出。
 5. 对账号无法确认、接口不兼容和存储失败提供可理解的状态提示。
@@ -67,7 +67,7 @@ Popup 的概览标题和覆盖说明使用以下文案。
 
 概览、排行和徽章都按当前账号窗口内的唯一回复计数。“最近回复时间”取这些记录中最大的 `createdAt`，空集合显示“尚无已记录回复”。备份里的时间可能来自另一台设备。页面缓存、接口变更和未加载的历史都会影响覆盖程度，首版不计算本机观测时长或历史完成百分比。
 
-插件不自动滚动、不模拟点击、不自动翻页、不主动调用 X 内部或公开 API。用户主动点击主页链接所产生的正常浏览不属于插件后台采集。
+日常浏览采用被动观测。只有用户从 Popup 启动七天同步时，扩展才在非活动标签页进入本人回复列表，按游标低频分页。缺少可用分页入口时，在同一标签页按日期读取 X 的最新搜索结果。
 
 跨设备自动同步、安装前完整历史或双向互动统计，需要另行设计数据来源与授权方案。
 
@@ -186,6 +186,16 @@ Service Worker 按事件唤醒。每次启动先读取持久化状态，按第 6
 - 扫到较早时间的某条帖子，不代表这一区间的记录完整，也不代表所有分页都已读到。
 
 历史路径失败时，实时路径可继续工作，并分别显示两者状态。实时路径也无法验证时，不能将插件显示为正常统计中。
+
+#### User-initiated seven-day sync
+
+- 开启采集并确认当前账号后，用户在 Popup 的“数据管理”点击“同步近 7 天回复”。后台只允许一个任务。非活动标签页先打开本人主页，确认账号和采集会话后进入页面已有的“回复”链接。
+- 以点击时刻为截止点，按服务端创建时间纳入闭区间内最近 168 小时的本人回复。后台核对任务、标签页、文档及绑定，按回复 ID 增量合并。徽章和排行继续使用 30 天窗口。
+- The dedicated tab first opens the native Replies link. For a verified `UserTweetsAndReplies` GET, the page can request the next bottom cursor against the same observed operation and actor. The extension worker grants one advance per acknowledged page. The page keeps the request and cursor in memory, rejects redirects and repeated cursors, and drops the transport on termination. Request-specific signatures and XHR-specific header values are not reconstructed.
+- When no usable first page appears within 45 seconds, or a valid page has no usable continuation, reuse that tab for one X Latest search result page per UTC date. The exact query restricts the author, replies and dates. Independently verify author ID, direct reply fields and the inclusive 168-hour window before writing. Search coverage depends on indexing and the first batch returned for each date. A recognized empty batch counts as a read. A missing response, an incompatible payload or an unconfirmed viewer is reported separately.
+- Wait at least 12 seconds between outbound advances, limit a run to eight accepted pages and five minutes, and retain a 15-minute start cooldown. The tab can stay in the background for both paths. No scrolling or separate API key is required.
+- 两次手动启动至少相隔 15 分钟，冷却时间在浏览器重启后保留。遇到 HTTP 429、已识别的限流错误或登录验证要求时停止并冷却至少 1 小时。若服务器通过 `Retry-After` 或 `x-rate-limit-reset` 指定更晚时间，按更晚时间执行。服务不可用时也停止并尊重服务器指定的等待时间。[X 限流响应头说明](https://docs.x.com/x-api/fundamentals/rate-limits#checking-your-limits)
+- 用户可停止任务。关闭专用页、离开任务页面、暂停采集或账号变化会终止任务。已写入的记录保留，Popup 展示已读页数、新增、重复、停止原因和可再次启动的时间。冷却到期只恢复按钮，下一次同步仍由用户发起。
 
 ### 5.4 Network Semantics and Resource Bounds
 
@@ -341,17 +351,17 @@ Chrome 文档给出的 `storage.local` 默认额度为 10 MB；该存储不会�
 | Recorded reply count | Tier | Visual | Accessible label / tooltip |
 | --- | --- | --- | --- |
 | 0 | 尚无已记录回复 | 不渲染 | 无 |
-| 1–10 | 初识互动 | 浅灰星火，`opacity: 0.45` | `近30天已记录你回复TA {count} 次（含导入）` |
-| 11–50 | 活跃互动 | 橙色星火，`#ff7a00` | `近30天已记录你回复TA {count} 次（含导入）` |
-| ≥51 | 深度互动 | 红色星火及数量，`#ff2e00`、`font-weight: 700` | `近30天已记录你回复TA {count} 次（含导入）` |
+| 1–10 | 初识互动 | Small orange flames | `近30天已记录你回复TA {count} 次（含导入）` |
+| 11–50 | 活跃互动 | Medium orange flames | `近30天已记录你回复TA {count} 次（含导入）` |
+| ≥51 | 深度互动 | Large orange flames | `近30天已记录你回复TA {count} 次（含导入）` |
 
 保留原稿频次阈值，明确 50 次属于活跃、51 次才进入深度等级。“核心铁粉”改为“深度互动”，因为主动回复次数不能证明对方是自己的粉丝。
 
-徽章使用项目内定义的 SVG 火苗，不使用 emoji 作为需要精确着色的图形。Emoji 的彩色字形不保证遵循 CSS `color`。默认无持续动画，提示同时通过文本或无障碍标签表达，不能只靠颜色区分等级。
+The author row and leaderboard share the same local SVG flame outline and orange fill (`#ff7a00`). Flame size increases at each tier. The leaderboard displays the reply count in a separate text field beside the badge. A brief hover animation runs once and respects reduced motion.
 
 ### 8.2 DOM Rendering
 
-- 受支持的帖子和评论作者信息中，优先在认证标记之后放置徽章；无认证标记时放置于作者信息尾部。
+- On supported author rows, paint flames around the native blue verification icon. Preserve its size, checkmark, accessible name and click target. For authors without a blue check, render only the flame outline with a blank white center. The leaderboard uses the same standalone artwork.
 - `svg[data-testid="icon-verified"]`、`[data-testid="User-Name"]` 等仅是候选选择器。需针对当前 DOM 验证，允许不同认证标记和界面语言，不能声称其为稳定 API。
 - 作者节点必须绑定到当前观测得到的稳定用户 ID；handle 可以用于查找候选映射，但不能单凭旧存储中的 handle 确定身份。映射缺失或冲突时不显示徽章。
 - 不替换原作者、认证或链接节点，不遮挡点击区域。跨 React 更新的插入方式必须验证，不以静态截图代替运行验证。
@@ -468,6 +478,8 @@ SparkLink/
 │   ├── interceptor.js
 │   ├── x-adapter.js
 │   ├── bridge.js
+│   ├── history-sync.js
+│   ├── history-sync-page.js
 │   ├── content.js
 │   ├── background.js
 │   ├── storage.js
@@ -536,7 +548,7 @@ SparkLink/
     },
     {
       "matches": ["https://x.com/*", "https://twitter.com/*"],
-      "js": ["src/content.js"],
+      "js": ["src/content.js", "src/history-sync-page.js"],
       "css": ["src/styles.css"],
       "world": "ISOLATED",
       "run_at": "document_idle",
@@ -615,10 +627,10 @@ Popup 使用外部本地脚本，不使用内联事件处理或 eval。首版不
 
 | 机制 | x-mutual-checker v1.9.3 | SparkLink 首版规格 |
 | --- | --- | --- |
-| 数据从哪里来 | 用户启动扫描后，扩展主动分页读取关注列表，也可使用自动滚动回退。[扫描入口](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/inject.js#L303-L360) | 读取用户正常发送回复或浏览本人回复页时产生的响应。补录范围取决于用户实际加载了哪些页面。 |
+| 数据从哪里来 | 用户启动扫描后，扩展主动分页读取关注列表，也可使用自动滚动回退。[扫描入口](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/inject.js#L303-L360) | 读取 X 本身加载的回复数据。普通浏览被动记录，手动七天同步在专用页限速加载。 |
 | 保存什么 | Content Script 按当前账号写入互关、未回关和取关等状态，再与下次扫描结果比较。[存储结构](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/content.js#L104-L120) | Service Worker 串行保存每条成功回复，按回复 ID 去重。徽章和排行榜从窗口内的事件计算。 |
 | 页面如何接入 | 页面主执行环境在文档开始时注入，隔离环境的 Content Script 在页面空闲时加载。[扩展清单](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/manifest.json#L17-L40) | 主执行环境与隔离环境的消息桥都在文档开始时注入。绑定当前账号后才接收观测，徽章在页面空闲时初始化。 |
 
 二审用离线样例复核了参考项目的三个边界。有 `legacy` 对象但缺少回关字段时，旧互关者可能被列为已取关。扫描未到底且并非手动停止时，未回关名单会被本次部分结果覆盖。同页滚动缓存还可能用旧的 `true` 盖过新的 `false`。SparkLink 据此按有效实体增量合并，缺字段时跳过该条，身份资料变更时撤销旧映射。第 13 节给出了对应的验收数据。[字段与缓存](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/inject.js#L133-L173) · [部分扫描判定](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/content.js#L845-L860) · [结果合并](https://github.com/lonly2010/x-mutual-checker/blob/5c3f4e4b1116bd253998510b986f8caf50f8a919/x-mutual-checker/content.js#L885-L919)
 
-SparkLink 当前交付物为规格。第 12.1 节的 viewer 证据、成功回复、直接父帖作者和真实 DOM 仍待在已登录的 Chrome 与 Edge 上验证。
+第 12.1 节的 viewer 证据、成功回复、直接父帖作者和真实 DOM 仍待在已登录的 Chrome 与 Edge 上验证。

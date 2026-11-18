@@ -1358,3 +1358,78 @@ test('Adapter unwraps UserWithVisibilityResults, falls back to core.user_result,
   }), null);
 });
 
+test('Adapter matches versioned/renamed profile replies operations, POST requests, and timeline_v3 payloads', () => {
+  const engine = createAdapterEngine();
+
+  const v2Post = matchWhitelistedRequest(
+    'https://x.com/i/api/graphql/qId1/UserTweetsAndRepliesV2?variables=%7B%22userId%22%3A%221001001%22%7D',
+    'POST'
+  );
+  assert.deepEqual(v2Post, {
+    operationName: 'UserTweetsAndRepliesV2',
+    category: 'replies_timeline',
+    method: 'POST',
+    requestedUserId: '1001001'
+  });
+
+  const userReplies = matchWhitelistedRequest(
+    'https://x.com/graphql/qId2/UserReplies/?variables=%7B%22rest_id%22%3A%221001001%22%7D',
+    'GET'
+  );
+  assert.deepEqual(userReplies, {
+    operationName: 'UserReplies',
+    category: 'replies_timeline',
+    method: 'GET',
+    requestedUserId: '1001001'
+  });
+
+  const profileReplies = matchWhitelistedRequest(
+    'https://x.com/i/api/graphql/qId3/ProfileTweetsAndReplies?variables=%7B%22userId%22%3A%221001001%22%7D',
+    'GET'
+  );
+  assert.equal(profileReplies.category, 'replies_timeline');
+
+  const varReplies = matchWhitelistedRequest(
+    'https://x.com/i/api/graphql/qId4/UserTimeline?variables=%7B%22userId%22%3A%221001001%22%2C%22includeReplies%22%3Atrue%7D',
+    'GET'
+  );
+  assert.equal(varReplies.category, 'replies_timeline');
+
+  const plainTimeline = matchWhitelistedRequest(
+    'https://x.com/i/api/graphql/qId5/UserTimeline?variables=%7B%22userId%22%3A%221001001%22%7D',
+    'GET'
+  );
+  assert.equal(plainTimeline.category, 'author_mapping');
+
+  const v3Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  v3Payload.data.user.result.timeline_v3 = v3Payload.data.user.result.timeline_v2;
+  delete v3Payload.data.user.result.timeline_v2;
+
+  const repliesRes = engine.processTimelineResponse({
+    operationName: 'ProfileTweetsAndReplies',
+    payload: v3Payload,
+    bindingContext: SAMPLE_BINDING,
+    observedAt: NOW_MS
+  });
+  assert.equal(repliesRes.events.length, 2);
+  assert.ok(repliesRes.historyPage);
+
+  const nonRepliesRes = engine.processTimelineResponse({
+    operationName: 'UserTimeline',
+    payload: v3Payload,
+    bindingContext: SAMPLE_BINDING,
+    observedAt: NOW_MS
+  });
+  assert.equal('historyPage' in nonRepliesRes, false);
+
+  const upgradedRes = engine.processTimelineResponse({
+    operationName: 'UserTimeline',
+    repliesTimeline: true,
+    payload: v3Payload,
+    bindingContext: SAMPLE_BINDING,
+    observedAt: NOW_MS
+  });
+  assert.equal(upgradedRes.events.length, 2);
+  assert.ok(upgradedRes.historyPage);
+});
+

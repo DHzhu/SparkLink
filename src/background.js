@@ -276,8 +276,20 @@ export function createBackgroundService(chromeApi, options = {}) {
       active: Boolean(sender.tab.active),
       documentId: typeof sender.documentId === 'string' && sender.documentId ? sender.documentId : null,
       href: sender.url,
+      tabHref: typeof sender.tab.url === 'string' ? sender.tab.url : null,
       origin: senderOrigin
     };
+  }
+
+  function matchesSenderHistoryUrl(job, xSender) {
+    return (
+      matchesHistoryUrl(job, xSender.href) ||
+      Boolean(
+        xSender.tabHref &&
+          xSender.tabHref !== xSender.href &&
+          matchesHistoryUrl(job, xSender.tabHref)
+      )
+    );
   }
 
   function scopedHistoryId(job, sender, existing, actorUserId = null) {
@@ -693,7 +705,7 @@ export function createBackgroundService(chromeApi, options = {}) {
         if (!bindingEquals(entry.bindingContext, msg.bindingContext) || !history.matches(job, entry.bindingContext)) {
           return { ok: false, code: 'STALE_BINDING' };
         }
-        if (!matchesHistoryUrl(job, xSender.href)) return { ok: false, code: 'STALE_DOCUMENT' };
+        if (!matchesSenderHistoryUrl(job, xSender)) return { ok: false, code: 'STALE_DOCUMENT' };
         if (msg.type === 'ADVANCE_HISTORY_SYNC') return history.advance(job, msg.action);
         const merged = await history.mergePage(job, msg, entry.bindingContext);
         if (merged.added > 0) notifyTabs((e) => e.bindingContext?.actorUserId === job.actorUserId,
@@ -726,7 +738,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           msg.revalidateViewer !== true &&
           job?.status === 'running' &&
           job.tabId === xSender.tabId &&
-          matchesHistoryUrl(job, xSender.href) &&
+          matchesSenderHistoryUrl(job, xSender) &&
           ctrl.settings.collectionEnabled &&
           ctrl.settings.captureSessionId === job.captureSessionId &&
           ctrl.collectionGeneration === job.collectionGeneration &&
@@ -779,7 +791,9 @@ export function createBackgroundService(chromeApi, options = {}) {
           ok: true,
           debugLogsEnabled: await getDebugLogsEnabled(),
           historySyncId,
-          historyScope: job?.status === 'running' && job.tabId === xSender.tabId && matchesHistoryUrl(job, xSender.href)
+          historyJobStatus: job?.status || null,
+          historyJobReason: job?.reason || null,
+          historyScope: job?.status === 'running' && job.tabId === xSender.tabId && matchesSenderHistoryUrl(job, xSender)
             ? { id: job.id, actor: job.actorUserId, since: job.since, deadline: describeHistorySync(job).deadline, query: job.searchQuery || null }
             : null,
           collectionEnabled: ctrl.settings.collectionEnabled,
@@ -833,7 +847,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           job?.status === 'running' &&
           job.tabId === xSender.tabId &&
           job.actorUserId === msg.viewer.actorUserId &&
-          matchesHistoryUrl(job, xSender.href)
+          matchesSenderHistoryUrl(job, xSender)
             ? {
                 id: job.id,
                 actor: job.actorUserId,

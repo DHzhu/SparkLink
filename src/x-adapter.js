@@ -13,14 +13,27 @@
   const WHITELISTED_OPERATIONS = Object.freeze({
     CreateTweet: { category: 'create_tweet', methods: new Set(['POST']) },
     Viewer: { category: 'viewer', methods: new Set(['GET', 'POST']) },
-    SearchTimeline: { category: 'manual_search', methods: new Set(['GET']) },
-    UserTweetsAndReplies: { category: 'replies_timeline', methods: new Set(['GET']) },
-    TweetDetail: { category: 'author_mapping', methods: new Set(['GET']) },
+    SearchTimeline: { category: 'manual_search', methods: new Set(['GET', 'POST']) },
+    UserTweetsAndReplies: { category: 'replies_timeline', methods: new Set(['GET', 'POST']) },
+    TweetDetail: { category: 'author_mapping', methods: new Set(['GET', 'POST']) },
     HomeTimeline: { category: 'author_mapping', methods: new Set(['GET', 'POST']) },
     HomeLatestTimeline: { category: 'author_mapping', methods: new Set(['GET', 'POST']) },
-    UserTweets: { category: 'author_mapping', methods: new Set(['GET']) },
-    UserByScreenName: { category: 'author_mapping', methods: new Set(['GET']) }
+    UserTweets: { category: 'author_mapping', methods: new Set(['GET', 'POST']) },
+    UserByScreenName: { category: 'author_mapping', methods: new Set(['GET', 'POST']) }
   });
+
+  function isRepliesTimelineOperation(op) {
+    return typeof op === 'string' && /^(?:User|Profile)[A-Za-z0-9_]*Replies[A-Za-z0-9_]*$/i.test(op);
+  }
+
+  function isUserProfileTimelineOperation(op) {
+    return (
+      typeof op === 'string' &&
+      !/^UserByScreenName$/i.test(op) &&
+      (isRepliesTimelineOperation(op) ||
+        /^(?:User|Profile)[A-Za-z0-9_]*(?:Tweets|Posts|Timeline)[A-Za-z0-9_]*$/i.test(op))
+    );
+  }
 
   function isPlainObject(value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -118,23 +131,45 @@
     } catch (_err) {
       return null;
     }
-    const webRoute = ALLOWED_ORIGINS.has(parsed.origin) && /^\/i\/api\/graphql\//.test(parsed.pathname);
-    const apiRoute = ['https://api.x.com', 'https://api.twitter.com'].includes(parsed.origin) &&
-      /^\/graphql\//.test(parsed.pathname);
-    if (!webRoute && !apiRoute) return null;
-    const path = parsed.pathname.match(/^(?:\/i\/api)?\/graphql\/([^/]+)\/([^/]+)$/);
+    const validOrigin =
+      ALLOWED_ORIGINS.has(parsed.origin) ||
+      parsed.origin === 'https://api.x.com' ||
+      parsed.origin === 'https://api.twitter.com';
+    const validRoute = /^(?:\/i\/api)?\/graphql\//.test(parsed.pathname);
+    if (!validOrigin || !validRoute) return null;
+    const path = parsed.pathname.match(/^(?:\/i\/api)?\/graphql\/([^/]+)\/([^/]+)\/?$/);
     if (!path || !SAFE_QUERY_ID_RE.test(path[1])) return null;
     const operationName = path[2];
     const normalizedMethod = method.toUpperCase();
-    const spec = Object.hasOwn(WHITELISTED_OPERATIONS, operationName) && WHITELISTED_OPERATIONS[operationName];
+    const spec =
+      (Object.hasOwn(WHITELISTED_OPERATIONS, operationName) && WHITELISTED_OPERATIONS[operationName]) ||
+      (isRepliesTimelineOperation(operationName)
+        ? { category: 'replies_timeline', methods: new Set(['GET', 'POST']) }
+        : isUserProfileTimelineOperation(operationName)
+          ? { category: 'author_mapping', methods: new Set(['GET', 'POST']) }
+          : null);
     if (!spec || !spec.methods.has(normalizedMethod)) return null;
     const match = { operationName, category: spec.category, method: normalizedMethod };
-    if (operationName === 'UserTweetsAndReplies' || operationName === 'SearchTimeline') {
+    if (
+      match.category === 'replies_timeline' ||
+      isUserProfileTimelineOperation(operationName) ||
+      operationName === 'SearchTimeline'
+    ) {
       try {
         const raw = parsed.searchParams.get('variables');
-        const vars = raw && raw.length < 8192 && JSON.parse(raw);
-        const uid = typeof vars?.userId === 'number' ? String(vars.userId) : vars?.userId;
+        const vars = raw && raw.length < 32768 && JSON.parse(raw);
+        const rawUid = vars?.userId ?? vars?.rest_id ?? vars?.id ?? vars?.user_id;
+        const uid = typeof rawUid === 'number' ? String(rawUid) : rawUid;
         if (isValidDecimalId(uid)) match.requestedUserId = uid;
+        if (
+          match.category === 'author_mapping' &&
+          isUserProfileTimelineOperation(operationName) &&
+          (vars?.includeReplies === true ||
+            vars?.withReplies === true ||
+            /replies/i.test(String(vars?.timelineType || vars?.tab || '')))
+        ) {
+          match.category = 'replies_timeline';
+        }
         if (operationName === 'SearchTimeline') {
           const validCursor =
             vars?.cursor === undefined ||
@@ -1248,7 +1283,7 @@
         return { instructions: null, timelineOwnerId: null, singleUser };
       }
 
-      if (operationName === 'UserTweetsAndReplies' || operationName === 'UserTweets') {
+      if (isUserProfileTimelineOperation(operationName)) {
         const rawUserResult =
           isPlainObject(data.user) && isPlainObject(data.user.result)
             ? data.user.result
@@ -1256,7 +1291,9 @@
               ? data.user_result.result
               : isPlainObject(data.user_results) && isPlainObject(data.user_results.result)
                 ? data.user_results.result
-                : null;
+                : isPlainObject(data.viewer?.user_results?.result)
+                  ? data.viewer.user_results.result
+                  : null;
         if (!rawUserResult) {
           return { instructions: null, timelineOwnerId: null, singleUser: null };
         }
@@ -1266,14 +1303,18 @@
         }
         const ownerUser = extractUserFieldsFromGraphqlNode(userResult);
         const timelineHolder =
-          isPlainObject(userResult.timeline_v2) || isPlainObject(userResult.timeline)
+          isPlainObject(userResult.timeline_v3) ||
+          isPlainObject(userResult.timeline_v2) ||
+          isPlainObject(userResult.timeline)
             ? userResult
             : rawUserResult;
-        const timelineObj = isPlainObject(timelineHolder.timeline_v2)
-          ? timelineHolder.timeline_v2.timeline || timelineHolder.timeline_v2
-          : isPlainObject(timelineHolder.timeline)
-            ? timelineHolder.timeline.timeline || timelineHolder.timeline
-            : null;
+        const timelineObj = isPlainObject(timelineHolder.timeline_v3)
+          ? timelineHolder.timeline_v3.timeline || timelineHolder.timeline_v3
+          : isPlainObject(timelineHolder.timeline_v2)
+            ? timelineHolder.timeline_v2.timeline || timelineHolder.timeline_v2
+            : isPlainObject(timelineHolder.timeline)
+              ? timelineHolder.timeline.timeline || timelineHolder.timeline
+              : null;
         const instructions =
           isPlainObject(timelineObj) && Array.isArray(timelineObj.instructions)
             ? timelineObj.instructions
@@ -1369,7 +1410,7 @@
       const requestOwner = isValidDecimalId(params.requestedUserId) ? params.requestedUserId : null;
       const conflictingOwner = responseOwner && requestOwner && responseOwner !== requestOwner;
       const timelineOwnerId = search ? bindingContext?.actorUserId : conflictingOwner ? null : responseOwner || requestOwner;
-      const ownTimelineOperation = operationName === 'UserTweetsAndReplies' || search;
+      const ownTimelineOperation = isRepliesTimelineOperation(operationName) || params.repliesTimeline === true || search;
       if (search && (hasBusinessErrors || !hasRecognizableTimelineInstructions(instructions))) {
         return { ...empty, partialUnrecognized: true, anomalies: ['unrecognized_search_page'] };
       }

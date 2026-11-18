@@ -1320,4 +1320,63 @@ test('Pre-confirm buffering replays early UserTweetsAndReplies and SearchTimelin
   assert.equal(preInitPages[0].data.historyPage.canPage, true);
 });
 
+test('Interceptor upgrades UserTimeline/UserPosts to replies_timeline on /with_replies and serializes sync logs inline', async () => {
+  const clock = Date.now();
+  const pagePayload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  pagePayload.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom-ut',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'ut-cursor-2' }
+  });
+
+  const loggedCalls = [];
+  const env = createMockEnvironment(async () => new Response(JSON.stringify(pagePayload), { status: 200 }));
+  env.win.location.href = 'https://x.com/sample_me/with_replies';
+  env.win.document = {};
+  env.win.scrollTo = () => {};
+  env.win.console = {
+    info(...args) {
+      if (String(args[0] || '').includes('[SparkLink Sync/Main]')) {
+        loggedCalls.push(args);
+      }
+    }
+  };
+  installMainInterceptor(env.win, adapterApi);
+  env.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'BRIDGE_INIT',
+    nonce: 'nonce_ut',
+    debugLogsEnabled: true,
+    collectionEnabled: true,
+    captureSessionId: 12,
+    bindingContext: BINDING_A,
+    historyScope: { id: 'job_ut', actor: BINDING_A.actorUserId, since: clock - 86400000, deadline: clock + 300000, query: null },
+    stateConfirmed: true,
+    observedPaused: false
+  });
+
+  await env.win.fetch('https://x.com/i/api/graphql/qIdUt/UserTimeline?variables=%7B%22userId%22%3A%221001001%22%7D');
+  await new Promise((r) => setTimeout(r, 15));
+
+  const pagesOnReplies = env.outboundMessages.filter((m) => m.data.historyPage);
+  assert.equal(pagesOnReplies.length, 1);
+  assert.equal(pagesOnReplies[0].data.historyPage.canPage, true);
+  assert.ok(loggedCalls.length > 0);
+  for (const args of loggedCalls) {
+    assert.ok(args.every((arg) => arg === null || typeof arg !== 'object'));
+  }
+
+  // On profile root (not /with_replies), UserTimeline stays author_mapping and emits no historyPage
+  env.outboundMessages.length = 0;
+  env.win.location.href = 'https://x.com/sample_me';
+  await env.win.fetch('https://x.com/i/api/graphql/qIdUt/UserTimeline?variables=%7B%22userId%22%3A%221001001%22%7D');
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(env.outboundMessages.filter((m) => m.data.historyPage).length, 0);
+
+  // UserPosts on /with_replies also upgrades to replies_timeline
+  env.win.location.href = 'https://x.com/sample_me/with_replies';
+  await env.win.fetch('https://x.com/i/api/graphql/qIdUp/UserPosts?variables=%7B%22userId%22%3A%221001001%22%7D');
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(env.outboundMessages.filter((m) => m.data.historyPage).length, 1);
+});
+
 

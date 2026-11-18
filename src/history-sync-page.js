@@ -18,7 +18,17 @@
       if (key) lastLogKey = key;
       try {
         if (win.console && typeof win.console.info === 'function') {
-          win.console.info('[SparkLink Sync/Page]', ...args);
+          const formatted = args.map((arg) => {
+            if (arg && typeof arg === 'object') {
+              try {
+                return JSON.stringify(arg);
+              } catch {
+                return String(arg);
+              }
+            }
+            return arg;
+          });
+          win.console.info('[SparkLink Sync/Page]', ...formatted);
         }
       } catch {}
     }
@@ -83,6 +93,16 @@
           debugLogsEnabled = Boolean(bridge.isDebugLogsEnabled());
         }
         const job = res?.job;
+        if (!stopped && job && job.status !== 'running') {
+          logSync('ended:' + job.status + ':' + (job.reason || ''), 'history sync ended', {
+            status: job.status,
+            reason: job.reason || null,
+            mode: job.mode,
+            pages: job.pages,
+            added: job.added,
+            duplicates: job.duplicates
+          });
+        }
         if (stopped || !res?.ok || job?.status !== 'running') return destroy();
         ensureBridgeSubscription(bridge);
         const binding = bridge?.getBindingContext();

@@ -523,7 +523,17 @@
       }
       try {
         if (win.console && typeof win.console.info === 'function') {
-          win.console.info('[SparkLink Sync/Bridge]', ...args);
+          const formatted = args.map((arg) => {
+            if (arg && typeof arg === 'object') {
+              try {
+                return JSON.stringify(arg);
+              } catch {
+                return String(arg);
+              }
+            }
+            return arg;
+          });
+          win.console.info('[SparkLink Sync/Bridge]', ...formatted);
         }
       } catch {}
     }
@@ -559,9 +569,12 @@
       if (state.historyScope || state.historySyncId) {
         logSync('HELLO scope updated', {
           historySyncId: state.historySyncId,
+          hasScope: Boolean(state.historyScope),
           scopeQuery: state.historyScope?.query || null,
           hasBinding: isValidBindingContext(res.bindingContext),
-          actor: res.bindingContext?.actorUserId || state.historyScope?.actor || null
+          actor: res.bindingContext?.actorUserId || state.historyScope?.actor || null,
+          jobStatus: res.historyJobStatus || null,
+          jobReason: res.historyJobReason || null
         });
       }
 

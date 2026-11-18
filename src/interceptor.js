@@ -318,7 +318,17 @@
       }
       try {
         if (win.console && typeof win.console.info === 'function') {
-          win.console.info('[SparkLink Sync/Main]', ...args);
+          const formatted = args.map((arg) => {
+            if (arg && typeof arg === 'object') {
+              try {
+                return JSON.stringify(arg);
+              } catch {
+                return String(arg);
+              }
+            }
+            return arg;
+          });
+          win.console.info('[SparkLink Sync/Main]', ...formatted);
         }
       } catch {}
     }
@@ -808,6 +818,14 @@
       const sessionChanged = Boolean(prevSessionId !== null && prevSessionId !== nextSessionId);
       const bindingSwitched = Boolean(prevBindingId && prevBindingId !== nextBinding?.bindingId);
       if (scopeChanged || sessionChanged || bindingSwitched || (!nextScope && scope)) {
+        if (!nextScope && scope) {
+          logSync('state sync cleared active scope', {
+            prevScopeId: scope.id,
+            prevScopeQuery: scope.query || null,
+            nextEnabled,
+            path: win.location?.pathname || null
+          });
+        }
         clearHistoryTransport();
       }
       const scopeJustActivated = Boolean(nextScope && (!scope || nextScope.id !== scope.id || nextScope.query !== scope.query));
@@ -1105,6 +1123,7 @@
       if (match.category === 'replies_timeline' || match.category === 'author_mapping' || isScopedSearch(match)) {
         const res = engine.processTimelineResponse({
           operationName: match.operationName, requestedUserId: match.requestedUserId,
+          repliesTimeline: match.category === 'replies_timeline',
           manualSearch: isScopedSearch(match), payload,
           bindingContext: frozenBinding,
           observedAt
@@ -1314,16 +1333,32 @@
       if (!url || (!activeState && !allowPreConfirm)) {
         return null;
       }
-      const match = adapter.matchWhitelistedRequest(url, method);
+      let match = adapter.matchWhitelistedRequest(url, method);
+      let currentPath = '';
+      try {
+        currentPath = win.location?.href
+          ? new URL(win.location.href).pathname
+          : win.location?.pathname || '';
+      } catch {
+        currentPath = win.location?.pathname || '';
+      }
       if (!match) {
         if ((scope || !state.stateConfirmed) && /\/graphql\/[^/]+\/([^/?#]+)/i.test(url)) {
           const opMatch = url.match(/\/graphql\/[^/]+\/([^/?#]+)/i);
           const rawOp = opMatch ? opMatch[1] : '';
-          if (/Reply|Replies|Search|Timeline|Tweet/i.test(rawOp) && !/HomeTimeline|HomeLatestTimeline|TweetDetail|^UserTweets$/i.test(rawOp)) {
-            logSync('unmatched GraphQL request', { op: rawOp, method, path: win.location?.pathname || null });
+          if (rawOp && !/^(?:HomeTimeline|HomeLatestTimeline)$/i.test(rawOp)) {
+            logSync('unmatched GraphQL request', { op: rawOp, method, path: currentPath || null });
           }
         }
         return null;
+      }
+      if (
+        match.category === 'author_mapping' &&
+        /^(?:User|Profile)[A-Za-z0-9_]*(?:Tweets|Posts|Timeline)[A-Za-z0-9_]*$/i.test(match.operationName) &&
+        !/Highlight|Article|Media|Likes|SuperFollow/i.test(match.operationName) &&
+        /\/with_replies\/?$/i.test(currentPath)
+      ) {
+        match = { ...match, category: 'replies_timeline' };
       }
       if (activeState) {
         if ((match.category === 'replies_timeline' || match.category === 'manual_search') && scope) {
@@ -1352,7 +1387,7 @@
             scopeActor: scope?.actor || null,
             scopeQuery: scope?.query || null,
             hasBinding: Boolean(state.bindingContext),
-            path: win.location?.pathname || null
+            path: currentPath || null
           });
         }
         return allowed ? match : null;
@@ -1377,9 +1412,11 @@
             if (trackNativeHistory && (scope || !state.stateConfirmed)) {
               logSync('intercepted native fetch', {
                 op: match.operationName,
+                category: match.category,
                 requestedUserId: match.requestedUserId || null,
                 hasBinding: Boolean(state.bindingContext),
-                preConfirm: !state.stateConfirmed
+                preConfirm: !state.stateConfirmed,
+                path: win.location?.pathname || null
               });
             }
               if (match.category === 'create_tweet') {
@@ -1586,11 +1623,21 @@
                 if (trackNativeHistory) {
                   nativeRequestsInFlight += 1;
                   if (scope || !state.stateConfirmed) {
+                    let xhrPath = null;
+                    try {
+                      xhrPath = win.location?.href
+                        ? new URL(win.location.href).pathname
+                        : win.location?.pathname || null;
+                    } catch {
+                      xhrPath = win.location?.pathname || null;
+                    }
                     logSync('intercepted native XHR', {
                       op: match.operationName,
+                      category: match.category,
                       requestedUserId: match.requestedUserId || null,
                       hasBinding: Boolean(state.bindingContext),
-                      preConfirm: !state.stateConfirmed
+                      preConfirm: !state.stateConfirmed,
+                      path: xhrPath
                     });
                   }
                 }

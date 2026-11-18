@@ -1330,6 +1330,7 @@ test('Interceptor upgrades UserTimeline/UserPosts to replies_timeline on /with_r
 
   const loggedCalls = [];
   const env = createMockEnvironment(async () => new Response(JSON.stringify(pagePayload), { status: 200 }));
+  env.win.navigator = { userAgent: 'Mozilla/5.0 Chrome/120.0.0.0' };
   env.win.location.href = 'https://x.com/sample_me/with_replies';
   env.win.document = {};
   env.win.scrollTo = () => {};
@@ -1344,6 +1345,20 @@ test('Interceptor upgrades UserTimeline/UserPosts to replies_timeline on /with_r
   env.win.dispatchBridgeMessage({
     protocol: 'SPARKLINK_BRIDGE_V1',
     type: 'BRIDGE_INIT',
+    nonce: 'nonce_ut',
+    debugLogsEnabled: false,
+    collectionEnabled: true,
+    captureSessionId: 12,
+    bindingContext: BINDING_A,
+    historyScope: { id: 'job_ut', actor: BINDING_A.actorUserId, since: clock - 86400000, deadline: clock + 300000, query: null },
+    stateConfirmed: true,
+    observedPaused: false
+  });
+  assert.equal(loggedCalls.length, 0);
+
+  env.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'SYNC_STATE',
     nonce: 'nonce_ut',
     debugLogsEnabled: true,
     collectionEnabled: true,

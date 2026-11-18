@@ -363,6 +363,7 @@ test('Sync page logs are completely silent by default and emit [SparkLink Sync/P
     url: 'https://x.com/Alice',
     taskHandler: async () => ({ ok: true, job, debugLogsEnabled: debugFlag })
   });
+  env.win.navigator = { userAgent: 'Mozilla/5.0 Chrome/120.0.0.0' };
   env.win.console = {
     info(...args) {
       if (String(args[0] || '').includes('[SparkLink Sync/Page]')) {

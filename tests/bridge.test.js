@@ -561,6 +561,7 @@ test('Bridge keeps [SparkLink Sync/Bridge] silent by default and propagates debu
     }
     return { ok: true };
   });
+  win.navigator = { userAgent: 'Mozilla/5.0 Chrome/120.0.0.0' };
   win.console = {
     info(...args) {
       if (String(args[0] || '').includes('[SparkLink Sync/Bridge]')) {

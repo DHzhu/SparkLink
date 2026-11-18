@@ -517,8 +517,7 @@
     }
 
     function logSync(...args) {
-      const isRealBrowser = Boolean(win.navigator && typeof win.navigator.userAgent === 'string');
-      if (!state.debugLogsEnabled && !(isRealBrowser && (state.historySyncId || state.historyScope))) {
+      if (!state.debugLogsEnabled) {
         return;
       }
       try {

@@ -304,16 +304,8 @@
         fn();
       }
     }
-    const isRealBrowser = Boolean(win.navigator && typeof win.navigator.userAgent === 'string');
     function logSync(...args) {
-      let onSyncRoute = false;
-      if (isRealBrowser && !state.debugLogsEnabled) {
-        try {
-          const p = win.location?.pathname || '';
-          onSyncRoute = Boolean(scope) || !state.stateConfirmed || /\/with_replies\/?$/i.test(p) || p === '/search';
-        } catch {}
-      }
-      if (!state.debugLogsEnabled && !onSyncRoute) {
+      if (!state.debugLogsEnabled) {
         return;
       }
       try {

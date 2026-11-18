@@ -12,7 +12,8 @@
     let debugLogsEnabled = false;
     let lastLogKey = '';
     function logSync(key, ...args) {
-      if (!debugLogsEnabled) return;
+      const isRealBrowser = !customTimers && Boolean(win.navigator && typeof win.navigator.userAgent === 'string');
+      if (!debugLogsEnabled && !isRealBrowser) return;
       if (key && key === lastLogKey) return;
       if (key) lastLogKey = key;
       try {

@@ -304,8 +304,16 @@
         fn();
       }
     }
+    const isRealBrowser = Boolean(win.navigator && typeof win.navigator.userAgent === 'string');
     function logSync(...args) {
-      if (!state.debugLogsEnabled) {
+      let onSyncRoute = false;
+      if (isRealBrowser && !state.debugLogsEnabled) {
+        try {
+          const p = win.location?.pathname || '';
+          onSyncRoute = Boolean(scope) || !state.stateConfirmed || /\/with_replies\/?$/i.test(p) || p === '/search';
+        } catch {}
+      }
+      if (!state.debugLogsEnabled && !onSyncRoute) {
         return;
       }
       try {
@@ -351,14 +359,15 @@
       } catch {}
       return true;
     }
-    function triggerScrollUpNudge() {
+    function triggerScrollUpNudge(distancePx) {
       const doc = win.document;
       if (!doc) return false;
       const se = doc.scrollingElement || doc.documentElement || doc.body;
       if (!se) return false;
       const curTop = Number(se.scrollTop) || Number(win.scrollY) || 0;
+      const step = Number.isInteger(distancePx) && distancePx > 0 ? distancePx : 300;
       if (curTop <= 300) return false;
-      win.scrollTo(0, curTop - 300);
+      win.scrollTo(0, Math.max(0, curTop - step));
       try {
         if (typeof Event === 'function' && typeof win.dispatchEvent === 'function') {
           win.dispatchEvent(new Event('scroll'));
@@ -405,7 +414,12 @@
       if (scope) {
         return !scope.query && Date.now() < scope.deadline && match.requestedUserId === scope.actor;
       }
-      if (state.bindingContext) return true;
+      if (state.bindingContext) {
+        return !match.requestedUserId || match.requestedUserId === state.bindingContext.actorUserId;
+      }
+      if (adapter.isValidDecimalId(match.requestedUserId)) {
+        return true;
+      }
       try {
         return /\/with_replies\/?$/i.test(new URL(win.location.href).pathname);
       } catch {
@@ -413,7 +427,7 @@
       }
     }
     function isEligiblePreConfirmMatch(match) {
-      if (!match || !state.nonce || state.stateConfirmed || state.observedPaused || state.hasPausedOnce) {
+      if (!match || state.stateConfirmed || state.observedPaused || state.hasPausedOnce) {
         return false;
       }
       return (
@@ -466,8 +480,12 @@
           inFlight: nativeRequestsInFlight
         });
         triggerScrollStep();
-        let nudgeStage = 0;
-        const scrollDeadline = Date.now() + 3500;
+        let prevLoopMs = Date.now();
+        let realTimeExtended = false;
+        let scrollDeadline = prevLoopMs + 3500;
+        let nextNudgeAt = nowAtStart + 1200;
+        let pendingDownNudge = false;
+        let nudgeCount = 0;
         while (isContextStillActive(context) && pageRequest === abort && !abort.signal.aborted) {
           if (lastNativePageAt > pageBaseline) {
             logSync('HISTORY_NEXT -> scrollScan captured native page', {
@@ -477,16 +495,31 @@
             return;
           }
           const nowMs = Date.now();
+          const stepDelta = nowMs - prevLoopMs;
+          prevLoopMs = nowMs;
+          if (
+            !realTimeExtended &&
+            stepDelta >= 0 &&
+            stepDelta < 1000 &&
+            nowMs >= scrollDeadline - 500 &&
+            nativeRequestsInFlight === 0
+          ) {
+            scrollDeadline = nowAtStart + 10500;
+            realTimeExtended = true;
+            logSync('HISTORY_NEXT -> extending real-time scroll retries', { op, nudgeCount });
+          }
           const hardLimit = nativeRequestsInFlight > 0 ? scrollDeadline + 5000 : scrollDeadline;
           if (nowMs >= hardLimit) break;
-          if (nudgeStage === 1) {
-            nudgeStage = 2;
+          if (pendingDownNudge) {
+            pendingDownNudge = false;
             triggerScrollStep();
-          } else if (nudgeStage === 0 && nativeRequestsInFlight === 0 && nowMs >= scrollDeadline - 2000) {
-            if (triggerScrollUpNudge()) {
-              nudgeStage = 1;
+          } else if (nativeRequestsInFlight === 0 && nowMs >= nextNudgeAt && nudgeCount < 4) {
+            nudgeCount += 1;
+            nextNudgeAt = nowMs + 2200;
+            const upDist = nudgeCount === 1 ? 300 : nudgeCount === 2 ? 600 : 1000;
+            if (triggerScrollUpNudge(upDist)) {
+              pendingDownNudge = true;
             } else {
-              nudgeStage = 2;
               triggerScrollStep();
             }
           }
@@ -578,7 +611,7 @@
         if (state.stateConfirmed) {
           return Boolean(state.collectionEnabled && state.captureSessionId !== null);
         }
-        return Boolean(state.nonce);
+        return true;
       }
       if (
         !state.collectionEnabled ||
@@ -1076,7 +1109,7 @@
           bindingContext: frozenBinding,
           observedAt
         });
-        if (res.historyPage && scope && (match.category === 'replies_timeline' || isScopedSearch(match))) {
+        if (res.historyPage && (match.category === 'replies_timeline' || isScopedSearch(match))) {
           const candidate = engine.getRepliesCursor(payload);
           cursor = candidate && !usedCursors.has(candidate) ? candidate : null;
           const hasTweets = res.events.length > 0 || res.observedTweets.length > 0 || Boolean(res.historyPage.pageKey);
@@ -1276,13 +1309,20 @@
     function evaluateCaptureEligibility(url, method) {
       const activeState = state.collectionEnabled && state.captureSessionId !== null;
       const allowPreConfirm = Boolean(
-        state.nonce && !state.stateConfirmed && !state.observedPaused && !state.hasPausedOnce
+        !state.stateConfirmed && !state.observedPaused && !state.hasPausedOnce
       );
       if (!url || (!activeState && !allowPreConfirm)) {
         return null;
       }
       const match = adapter.matchWhitelistedRequest(url, method);
       if (!match) {
+        if ((scope || !state.stateConfirmed) && /\/graphql\/[^/]+\/([^/?#]+)/i.test(url)) {
+          const opMatch = url.match(/\/graphql\/[^/]+\/([^/?#]+)/i);
+          const rawOp = opMatch ? opMatch[1] : '';
+          if (/Reply|Replies|Search|Timeline|Tweet/i.test(rawOp) && !/HomeTimeline|HomeLatestTimeline|TweetDetail|^UserTweets$/i.test(rawOp)) {
+            logSync('unmatched GraphQL request', { op: rawOp, method, path: win.location?.pathname || null });
+          }
+        }
         return null;
       }
       if (activeState) {
@@ -1305,6 +1345,16 @@
             match.category === 'viewer' ||
             searchAllowed && match.category === 'manual_search' ||
             isCandidateRepliesPage(match));
+        if (!allowed && (match.category === 'replies_timeline' || match.category === 'manual_search')) {
+          logSync('skipped native candidate request', {
+            op: match.operationName,
+            requestedUserId: match.requestedUserId || null,
+            scopeActor: scope?.actor || null,
+            scopeQuery: scope?.query || null,
+            hasBinding: Boolean(state.bindingContext),
+            path: win.location?.pathname || null
+          });
+        }
         return allowed ? match : null;
       }
       return isEligiblePreConfirmMatch(match) ? match : null;

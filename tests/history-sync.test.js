@@ -251,6 +251,12 @@ test('HELLO on the active sync tab restores binding immediately across /with_rep
   assert.equal(hello.historySyncId, job.id);
   assert.equal(hello.bindingContext.actorUserId, '101');
   assert.equal(hello.historyScope.actor, '101');
+
+  const bindRes = await call('BIND_VIEWER', { captureSessionId: 1, viewer: { actorUserId: '101', handle: 'alice' } }, navSender);
+  assert.equal(bindRes.ok, true);
+  assert.equal(bindRes.historySyncId, job.id);
+  assert.equal(bindRes.historyScope?.id, job.id);
+  assert.equal(bindRes.historyScope?.actor, '101');
 });
 
 test('Audit regressions: BIND_VIEWER account switch clears historySyncId, read() persists timeout with END_HISTORY_TRANSPORT, and CLEAR_ACCOUNT / CLEAR_ALL tear down active sync and reset debugLogsEnabled', async () => {

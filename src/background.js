@@ -829,6 +829,19 @@ export function createBackgroundService(chromeApi, options = {}) {
           job = await history.read();
         }
         const historySyncId = scopedHistoryId(job, xSender, existing, msg.viewer.actorUserId);
+        const historyScope =
+          job?.status === 'running' &&
+          job.tabId === xSender.tabId &&
+          job.actorUserId === msg.viewer.actorUserId &&
+          matchesHistoryUrl(job, xSender.href)
+            ? {
+                id: job.id,
+                actor: job.actorUserId,
+                since: job.since,
+                deadline: describeHistorySync(job).deadline,
+                query: job.searchQuery || null
+              }
+            : null;
         if (
           existing &&
           existing.documentId === xSender.documentId &&
@@ -846,6 +859,7 @@ export function createBackgroundService(chromeApi, options = {}) {
             ok: true,
             bindingContext: existing.bindingContext,
             historySyncId,
+            historyScope,
             revision: accRes.revision
           };
         }
@@ -876,6 +890,7 @@ export function createBackgroundService(chromeApi, options = {}) {
           ok: true,
           bindingContext,
           historySyncId,
+          historyScope,
           revision: accRes.revision
         };
       });

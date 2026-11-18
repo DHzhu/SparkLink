@@ -517,7 +517,8 @@
     }
 
     function logSync(...args) {
-      if (!state.debugLogsEnabled) {
+      const isRealBrowser = Boolean(win.navigator && typeof win.navigator.userAgent === 'string');
+      if (!state.debugLogsEnabled && !(isRealBrowser && (state.historySyncId || state.historyScope))) {
         return;
       }
       try {
@@ -671,7 +672,9 @@
         accountGeneration: res.bindingContext.accountGeneration
       });
       state.historySyncId = res.historySyncId || null;
-      if (!state.historySyncId) {
+      if (res.historyScope !== undefined) {
+        state.historyScope = res.historyScope || null;
+      } else if (!state.historySyncId) {
         state.historyScope = null;
       }
       state.bindingContext = nextBinding;

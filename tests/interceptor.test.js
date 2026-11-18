@@ -1290,6 +1290,34 @@ test('Pre-confirm buffering replays early UserTweetsAndReplies and SearchTimelin
   const searchPages = searchEnv.outboundMessages.filter((m) => m.data.historyPage);
   assert.equal(searchPages.length, 1);
   assert.equal(searchPages[0].data.historyPage.searchQuery, query);
+
+  // 5. UserTweetsAndReplies initiated BEFORE BRIDGE_INIT (state.nonce === null) on /<handle> (before pushState updates pathname to /with_replies) replays once confirmed
+  const earlyPage = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  earlyPage.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom-preinit',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'preinit-cursor-2' }
+  });
+  const preInitEnv = createMockEnvironment(async () => new Response(JSON.stringify(earlyPage), { status: 200 }));
+  preInitEnv.win.location.href = 'https://x.com/sample_me';
+  preInitEnv.win.document = {};
+  preInitEnv.win.scrollTo = () => {};
+  installMainInterceptor(preInitEnv.win, adapterApi);
+  await preInitEnv.win.fetch(timelineFixtures.ownRepliesTimelineMixed.requestUrl);
+  await new Promise((r) => setTimeout(r, 15));
+  preInitEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'BRIDGE_INIT',
+    nonce: 'pre_nonce_ok',
+    collectionEnabled: true,
+    captureSessionId: 10,
+    bindingContext: BINDING_A,
+    historyScope: { id: 'job_pre', actor: BINDING_A.actorUserId, since: clock - 86400000, deadline: clock + 300000, query: null },
+    stateConfirmed: true,
+    observedPaused: false
+  });
+  const preInitPages = preInitEnv.outboundMessages.filter((m) => m.data.historyPage);
+  assert.equal(preInitPages.length, 1);
+  assert.equal(preInitPages[0].data.historyPage.canPage, true);
 });
 
 

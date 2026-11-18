@@ -131,7 +131,9 @@ function createFakePopupDom() {
     'latest-reply-time',
     'stat-total-replies',
     'stat-active-targets',
+    'stat-active-label',
     'stat-deep-targets',
+    'stat-deep-label',
     'top20-list',
     'top20-empty',
     'btn-cleanup',
@@ -847,5 +849,35 @@ test('Popup refresh timer honors 5-minute idleDeadline / nextTimeoutAt instead o
   snap.historySync = { ...snap.historySync, status: 'done', reason: 'end' };
   await ui.refresh();
 });
+
+test('Popup stat threshold labels render from metrics TIER_THRESHOLDS and exist in popup.html', async () => {
+  const popupHtml = fs.readFileSync(path.join(process.cwd(), 'src', 'popup', 'popup.html'), 'utf8');
+  assert.ok(popupHtml.includes('id="stat-active-label"'), 'popup.html must define #stat-active-label');
+  assert.ok(popupHtml.includes('id="stat-deep-label"'), 'popup.html must define #stat-deep-label');
+
+  const { TIER_THRESHOLDS } = await import('../src/metrics.js');
+  const { doc, byId } = createFakePopupDom();
+  const runtime = {
+    async sendMessage(msg) {
+      if (msg.type === 'GET_POPUP_SNAPSHOT') {
+        return {
+          ok: true,
+          debugLogsEnabled: false,
+          viewerStatus: 'unbound',
+          settings: { collectionEnabled: false },
+          selectedAccount: null,
+          savedAccounts: [],
+          historyNextStart: 0
+        };
+      }
+      return { ok: true };
+    }
+  };
+  const ui = createPopupController({ document: doc, runtime });
+  await ui.init();
+  assert.equal(byId.get('stat-active-label').textContent, `活跃对象 (≥${TIER_THRESHOLDS.activeMin})`);
+  assert.equal(byId.get('stat-deep-label').textContent, `深度对象 (≥${TIER_THRESHOLDS.deepMin})`);
+});
+
 
 

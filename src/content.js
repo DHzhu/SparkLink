@@ -55,6 +55,50 @@
     'Q',
     'WBR'
   ]);
+  const SVG_PAINT_TAGS = new Set([
+    'SVG',
+    'PATH',
+    'G',
+    'CIRCLE',
+    'RECT',
+    'POLYGON',
+    'POLYLINE',
+    'ELLIPSE',
+    'LINE',
+    'USE'
+  ]);
+  const NON_USERNAME_ATTR_TAGS = new Set([
+    'BODY',
+    'HTML',
+    'MAIN',
+    'ARTICLE',
+    'SECTION',
+    'HEADER',
+    'FOOTER',
+    'NAV',
+    'ASIDE',
+    'VIDEO',
+    'AUDIO',
+    'IMG',
+    'PICTURE',
+    'CANVAS',
+    'IFRAME',
+    'INPUT',
+    'TEXTAREA',
+    'SELECT',
+    'FORM',
+    'PROGRESS',
+    'SOURCE',
+    'TRACK',
+    'SCRIPT',
+    'STYLE',
+    'LINK',
+    'META'
+  ]);
+
+  // Keep in sync with TIER_THRESHOLDS in src/metrics.js
+  const TIER_ACTIVE_MIN = 11;
+  const TIER_DEEP_MIN = 51;
 
   const installedControllers = new WeakMap();
 
@@ -68,7 +112,7 @@
       };
     }
     const ariaLabel = `近30天已记录你回复TA ${count} 次（含导入）`;
-    if (count <= 10) {
+    if (count < TIER_ACTIVE_MIN) {
       return {
         key: 'acquaintance',
         className: 'sparklink-tier-acquaintance',
@@ -76,7 +120,7 @@
         ariaLabel
       };
     }
-    if (count <= 50) {
+    if (count < TIER_DEEP_MIN) {
       return {
         key: 'active',
         className: 'sparklink-tier-active',
@@ -947,11 +991,53 @@
       let hasRelevantChange = false;
       for (let i = 0; i < records.length; i += 1) {
         const rec = records[i];
-        if (!rec || isSparklinkNode(rec.target)) {
+        if (!rec) {
           continue;
         }
-        if (rec.type === 'attributes' && rec.attributeName && rec.attributeName !== 'href' &&
-            !rec.target.closest?.('[data-testid="User-Name"]')) continue;
+        const target = rec.target;
+        if (rec.type === 'attributes') {
+          const attr = rec.attributeName;
+          const tag = typeof target?.tagName === 'string' ? target.tagName.toUpperCase() : '';
+          if (attr === 'fill') {
+            if (!SVG_PAINT_TAGS.has(tag) || isSparklinkNode(target) || !target.closest?.(VERIFIED_SELECTOR)) {
+              continue;
+            }
+            const container = target.closest?.('[data-testid="User-Name"]');
+            if (container) {
+              dirtyContainers.add(container);
+              hasRelevantChange = true;
+            }
+            continue;
+          }
+          if (attr === 'style' || attr === 'class' || attr === 'color') {
+            if (NON_USERNAME_ATTR_TAGS.has(tag) || isSparklinkNode(target)) {
+              continue;
+            }
+            const container = target.closest?.('[data-testid="User-Name"]');
+            if (container) {
+              dirtyContainers.add(container);
+              hasRelevantChange = true;
+            }
+            continue;
+          }
+          if (attr === 'data-testid') {
+            if (isSparklinkNode(target)) {
+              continue;
+            }
+            const container =
+              target.getAttribute?.('data-testid') === 'User-Name'
+                ? target
+                : target.closest?.('[data-testid="User-Name"]');
+            if (container) {
+              dirtyContainers.add(container);
+              hasRelevantChange = true;
+            }
+            continue;
+          }
+        }
+        if (isSparklinkNode(target)) {
+          continue;
+        }
         if (rec.type === 'childList') {
           const onlyOurs =
             isOnlySparklinkNodes(rec.addedNodes) && isOnlySparklinkNodes(rec.removedNodes);

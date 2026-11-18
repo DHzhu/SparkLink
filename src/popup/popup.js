@@ -3,6 +3,7 @@ import {
   buildSafeProfileUrl,
   isValidDecimalId
 } from '../schema.js';
+import { TIER_THRESHOLDS } from '../metrics.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -79,7 +80,9 @@ export function createPopupController(options = {}) {
     latestReplyTime: doc.getElementById('latest-reply-time'),
     statTotalReplies: doc.getElementById('stat-total-replies'),
     statActiveTargets: doc.getElementById('stat-active-targets'),
+    statActiveLabel: doc.getElementById('stat-active-label'),
     statDeepTargets: doc.getElementById('stat-deep-targets'),
+    statDeepLabel: doc.getElementById('stat-deep-label'),
     top20List: doc.getElementById('top20-list'),
     top20Empty: doc.getElementById('top20-empty'),
     btnCleanup: doc.getElementById('btn-cleanup'),
@@ -446,6 +449,12 @@ export function createPopupController(options = {}) {
     if (els.overviewCoverage) {
       els.overviewCoverage.textContent =
         '来源包括本机网页活动和导入的备份，历史记录可能不完整。';
+    }
+    if (els.statActiveLabel) {
+      els.statActiveLabel.textContent = `活跃对象 (≥${TIER_THRESHOLDS.activeMin})`;
+    }
+    if (els.statDeepLabel) {
+      els.statDeepLabel.textContent = `深度对象 (≥${TIER_THRESHOLDS.deepMin})`;
     }
 
     renderViewerStatusBadge(snap);

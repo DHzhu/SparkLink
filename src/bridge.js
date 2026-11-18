@@ -1108,22 +1108,26 @@
       }
     }
 
-    win.addEventListener('message', onWindowMessage);
-    win.addEventListener('pageshow', (ev) => {
-      if (ev && ev.persisted) {
+    function onPageShow(ev) {
+      if (ev && ev.persisted && !state.destroyed) {
         // Both worlds advance before queued messages from the frozen document can be delivered.
         state.documentEpoch += 1;
         state.pendingViewerRevalidation = true;
         revokeLocalBinding(null, false);
         performHello();
       }
-    });
+    }
+
+    function onVisibilityChange() {
+      if (!state.destroyed && win.document && win.document.visibilityState === 'visible') {
+        performHello();
+      }
+    }
+
+    win.addEventListener('message', onWindowMessage);
+    win.addEventListener('pageshow', onPageShow);
     if (win.document && typeof win.document.addEventListener === 'function') {
-      win.document.addEventListener('visibilitychange', () => {
-        if (win.document.visibilityState === 'visible') {
-          performHello();
-        }
-      });
+      win.document.addEventListener('visibilitychange', onVisibilityChange);
     }
 
     if (
@@ -1135,15 +1139,17 @@
 
     // Bounded handshake loop with MAIN world
     let handshakeCount = 0;
+    let handshakeTimer = null;
     function stepHandshake() {
+      handshakeTimer = null;
       if (state.destroyed || state.mainReady || handshakeCount >= DEFAULT_MAX_HANDSHAKE_ATTEMPTS) {
         return;
       }
       handshakeCount += 1;
       sendBridgeInitToMain();
-      const timer = setTimeout(stepHandshake, DEFAULT_HANDSHAKE_INTERVAL_MS);
-      if (timer && typeof timer.unref === 'function') {
-        timer.unref();
+      handshakeTimer = setTimeout(stepHandshake, DEFAULT_HANDSHAKE_INTERVAL_MS);
+      if (handshakeTimer && typeof handshakeTimer.unref === 'function') {
+        handshakeTimer.unref();
       }
     }
     stepHandshake();
@@ -1238,18 +1244,27 @@
       },
       destroy() {
         state.destroyed = true;
+        if (handshakeTimer !== null) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
         subscribers.clear();
         pendingQueue.length = 0;
         tweetToAuthorMap.clear();
         userByIdMap.clear();
         handleToUserIdMap.clear();
         win.removeEventListener('message', onWindowMessage);
+        win.removeEventListener('pageshow', onPageShow);
+        if (win.document && typeof win.document.removeEventListener === 'function') {
+          win.document.removeEventListener('visibilitychange', onVisibilityChange);
+        }
         if (
           chromeApi.runtime.onMessage &&
           typeof chromeApi.runtime.onMessage.removeListener === 'function'
         ) {
           chromeApi.runtime.onMessage.removeListener(onRuntimeMessage);
         }
+        installedBridges.delete(win);
       }
     });
 

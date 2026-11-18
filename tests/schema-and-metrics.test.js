@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   WINDOW_MS,
+  TIER_THRESHOLDS,
   isReplyInWindow,
   getBadgeTier,
   computeAccountSummary,
@@ -355,3 +356,12 @@ test('Metrics enforce exact 30x24h rolling boundaries, badge tiers (0/1/10/11/50
     '99999': 0
   });
 });
+
+test('TIER_THRESHOLDS is exported and drives both getBadgeTier and computeAccountSummary consistently', () => {
+  assert.deepEqual(TIER_THRESHOLDS, { activeMin: 11, deepMin: 51 });
+  assert.equal(getBadgeTier(TIER_THRESHOLDS.activeMin - 1).tier, 'acquaintance');
+  assert.equal(getBadgeTier(TIER_THRESHOLDS.activeMin).tier, 'active');
+  assert.equal(getBadgeTier(TIER_THRESHOLDS.deepMin - 1).tier, 'active');
+  assert.equal(getBadgeTier(TIER_THRESHOLDS.deepMin).tier, 'deep');
+});
+

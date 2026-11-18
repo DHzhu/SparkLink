@@ -961,3 +961,71 @@ test('Audit regressions: flame-ring outer valleys strictly enclose inner cutout 
   assert.equal(rnwBadge.parentNode, rnwInlineRow, 'Gold-check badge inside column wrappers must mount inside the horizontal inline row');
 });
 
+test('Attribute mutation fast-path skips non-User-Name tags/non-verified SVGs without closest() traversal, preserves verified re-render, and matches metrics TIER_THRESHOLDS', async (t) => {
+  const { TIER_THRESHOLDS } = await import('../src/metrics.js');
+  assert.equal(getTierMeta(0).key, 'none');
+  assert.equal(getTierMeta(TIER_THRESHOLDS.activeMin - 1).key, 'acquaintance');
+  assert.equal(getTierMeta(TIER_THRESHOLDS.activeMin).key, 'active');
+  assert.equal(getTierMeta(TIER_THRESHOLDS.deepMin - 1).key, 'active');
+  assert.equal(getTierMeta(TIER_THRESHOLDS.deepMin).key, 'deep');
+
+  const { win, body, bridge } = createFakeDomAndBridge({ '2001': 15 });
+  const card = buildTweetCard({ handle: 'user_t1', displayName: 'Alice Verified', verified: true });
+  body.appendChild(card.article);
+
+  let nonUserNameClosestCalls = 0;
+  const videoEl = new FakeElement('video');
+  videoEl.closest = () => {
+    nonUserNameClosestCalls += 1;
+    return null;
+  };
+  body.appendChild(videoEl);
+
+  const randomDiv = new FakeElement('div');
+  randomDiv.closest = () => {
+    nonUserNameClosestCalls += 1;
+    return null;
+  };
+  body.appendChild(randomDiv);
+
+  const otherSvg = new FakeElement('svg', 'http://www.w3.org/2000/svg');
+  const otherPath = new FakeElement('path', 'http://www.w3.org/2000/svg');
+  otherSvg.appendChild(otherPath);
+  const origOtherPathClosest = otherPath.closest.bind(otherPath);
+  otherPath.closest = (sel) => {
+    if (sel === '[data-testid="User-Name"]') {
+      nonUserNameClosestCalls += 1;
+    }
+    return origOtherPathClosest(sel);
+  };
+  body.appendChild(otherSvg);
+
+  const controller = installContentBadges(win, bridge, { debounceMs: 1, frameBudgetMs: 1000 });
+  t.after(() => controller.destroy());
+  const verifiedPath = card.userNameBox.querySelector('svg[data-testid="icon-verified"]').querySelector('path');
+  await waitForBadgeState(
+    () => card.userNameBox.querySelector('.sparklink-native-fire'),
+    'Initial blue-check flame overlay should render'
+  );
+
+  // Trigger noisy attribute mutations outside [data-testid="User-Name"]
+  win.triggerMutations([
+    { type: 'attributes', attributeName: 'style', target: videoEl },
+    { type: 'attributes', attributeName: 'class', target: card.article },
+    { type: 'attributes', attributeName: 'style', target: body },
+    { type: 'attributes', attributeName: 'fill', target: randomDiv },
+    { type: 'attributes', attributeName: 'fill', target: otherPath }
+  ]);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(nonUserNameClosestCalls, 0, 'Fast-path must avoid closest([data-testid="User-Name"]) on irrelevant attribute mutations');
+
+  // Verified SVG paint mutation inside [data-testid="User-Name"] still triggers re-render cleanly
+  verifiedPath.setAttribute('fill', '#c8a400');
+  win.triggerMutations([{ type: 'attributes', attributeName: 'fill', target: verifiedPath }]);
+  await waitForBadgeState(
+    () => card.userNameBox.querySelector('.sparklink-fire-core') && !card.userNameBox.querySelector('.sparklink-native-fire'),
+    'Verified path fill change from blue to gold must re-render to standalone core badge'
+  );
+});
+
+

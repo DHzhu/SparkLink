@@ -2,6 +2,10 @@ import { isPlainObject, isValidDecimalId, isValidTimestampMs } from './schema.js
 
 export const WINDOW_MS = 30 * 24 * 60 * 60 * 1000; // 2,592,000,000 ms
 export const CLOCK_SKEW_TOLERANCE_MS = 60 * 1000; // 1 minute threshold for warning
+export const TIER_THRESHOLDS = Object.freeze({
+  activeMin: 11,
+  deepMin: 51
+});
 
 export function isReplyInWindow(createdAt, nowMs) {
   if (!isValidTimestampMs(createdAt) || !isValidTimestampMs(nowMs)) {
@@ -27,7 +31,7 @@ export function getBadgeTier(count) {
       tooltip: ''
     };
   }
-  if (safeCount <= 10) {
+  if (safeCount < TIER_THRESHOLDS.activeMin) {
     return {
       count: safeCount,
       tier: 'acquaintance',
@@ -37,7 +41,7 @@ export function getBadgeTier(count) {
       tooltip: formatBadgeTooltip(safeCount)
     };
   }
-  if (safeCount <= 50) {
+  if (safeCount < TIER_THRESHOLDS.deepMin) {
     return {
       count: safeCount,
       tier: 'active',
@@ -138,10 +142,10 @@ export function computeAccountSummary(accountObj, nowMs = Date.now()) {
   const entries = [];
 
   for (const entry of byTarget.values()) {
-    if (entry.count >= 11) {
+    if (entry.count >= TIER_THRESHOLDS.activeMin) {
       activeTargetsCount += 1;
     }
-    if (entry.count >= 51) {
+    if (entry.count >= TIER_THRESHOLDS.deepMin) {
       deepTargetsCount += 1;
     }
     entries.push({

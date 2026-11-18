@@ -583,3 +583,55 @@ test('Bridge keeps [SparkLink Sync/Bridge] silent by default and propagates debu
   assert.ok(bridgeLogs.length > 0);
   bridge.destroy();
 });
+
+test('Bridge destroy() removes pageshow and visibilitychange listeners, clears handshake timer, and allows fresh re-install', async () => {
+  const { win, chromeObj, runtimeCalls } = createBridgeMockEnv(async (msg) => {
+    if (msg.type === 'HELLO') {
+      return {
+        ok: true,
+        collectionEnabled: true,
+        captureSessionId: 1,
+        bindingContext: BINDING_A1,
+        bindRequired: false,
+        revision: 1
+      };
+    }
+    return { ok: true };
+  });
+
+  const docListeners = new Map();
+  win.document = {
+    visibilityState: 'visible',
+    addEventListener(type, fn) {
+      if (!docListeners.has(type)) docListeners.set(type, new Set());
+      docListeners.get(type).add(fn);
+    },
+    removeEventListener(type, fn) {
+      if (docListeners.has(type)) docListeners.get(type).delete(fn);
+    },
+    emitVisibilityChange() {
+      for (const fn of docListeners.get('visibilitychange') || []) fn();
+    }
+  };
+
+  const bridge1 = installIsolatedBridge(win, chromeObj, { retryDelayMs: 5 });
+  await new Promise((r) => setImmediate(r));
+  const initialCalls = runtimeCalls.length;
+  assert.ok(initialCalls >= 1);
+
+  bridge1.destroy();
+
+  // Subsequent pageshow and visibilitychange must not invoke HELLO on destroyed bridge
+  win.restoreFromCache();
+  win.document.emitVisibilityChange();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(runtimeCalls.length, initialCalls);
+
+  // Re-installing after destroy returns a distinct working bridge instance
+  const bridge2 = installIsolatedBridge(win, chromeObj, { retryDelayMs: 5 });
+  assert.notEqual(bridge2, bridge1);
+  await new Promise((r) => setImmediate(r));
+  assert.ok(runtimeCalls.length > initialCalls);
+  bridge2.destroy();
+});
+

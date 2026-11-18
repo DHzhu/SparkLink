@@ -33,10 +33,15 @@ const COOLDOWN_KEY = 'sparklink_history_next_start';
 export function describeHistorySync(job) {
   if (!job) return null;
   const { id, status, reason, actorUserId, handle, captureSessionId, since, until, pages, added, duplicates } = job;
+  const actionAt = job.actionAt || until;
+  const pageAt = job.pageAt || until;
+  const lastActiveAt = Math.max(until, pageAt, actionAt);
+  const deadline = until + MAX_RUNTIME_MS;
+  const idleDeadline = lastActiveAt + MAX_IDLE_RUNTIME_MS;
   return { id, status, reason, actorUserId, handle, captureSessionId, since, until,
     mode: job.mode || 'timeline', searchQuery: job.searchQuery || null, dayRead: Boolean(job.dayRead),
-    hasNext: Boolean(job.hasNext), missingTimeline: Boolean(job.missingTimeline), actionAt: job.actionAt || until, pageAt: job.pageAt || until,
-    deadline: until + MAX_RUNTIME_MS, pages, added, duplicates };
+    hasNext: Boolean(job.hasNext), missingTimeline: Boolean(job.missingTimeline), actionAt, pageAt,
+    deadline, idleDeadline, nextTimeoutAt: Math.min(deadline, idleDeadline), pages, added, duplicates };
 }
 
 // The background service serializes job mutations with binding and storage writes.
@@ -54,6 +59,11 @@ export function createHistorySync(chromeApi, storage, now) {
   async function save(job) {
     await area.set({ [HISTORY_SYNC_KEY]: job });
     if (job && job.status !== 'running') {
+      const minCooldown = now() + START_INTERVAL_MS;
+      const existingCooldown = await nextStart();
+      if (minCooldown > existingCooldown) {
+        await chromeApi.storage.local.set({ [COOLDOWN_KEY]: minCooldown });
+      }
       chromeApi.tabs?.sendMessage?.(job.tabId, { type: 'END_HISTORY_TRANSPORT', jobId: job.id })?.catch(() => {});
     }
     return job;

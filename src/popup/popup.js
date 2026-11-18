@@ -422,7 +422,12 @@ export function createPopupController(options = {}) {
     const detail = running ? progress : reasons[job.reason] || '已停止';
     els.historyStatus.textContent = `@${job.handle} ${state} · ${detail}。已读取 ${job.pages} 页，新增 ${job.added} 条，重复 ${job.duplicates} 条。${cooldownText}`;
     if (running) {
-      syncDeadlineTimer = setTimeout(refresh, Math.max(250, job.deadline - Date.now() + 100));
+      const wakeupAt = Number.isFinite(job.nextTimeoutAt)
+        ? job.nextTimeoutAt
+        : Number.isFinite(job.idleDeadline)
+          ? Math.min(job.deadline, job.idleDeadline)
+          : job.deadline;
+      syncDeadlineTimer = setTimeout(refresh, Math.max(250, wakeupAt - Date.now() + 100));
       syncDeadlineTimer.unref?.();
     }
   }

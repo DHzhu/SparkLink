@@ -121,7 +121,7 @@
         const replies = profile + '/with_replies';
         const time = now();
         const elapsed = time - Math.max(job.pageAt, job.actionAt);
-        if (time >= job.deadline) return stop('timeout');
+        if (time >= job.deadline || (Number.isFinite(job.idleDeadline) && time >= job.idleDeadline)) return stop('timeout');
         if (!binding && elapsed >= 45000) return stop('account_changed');
         let action;
         let nowPath = path;

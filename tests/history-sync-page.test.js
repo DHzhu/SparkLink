@@ -535,4 +535,48 @@ test('Real-timer default waits 6000ms on /<handle> before direct replies navigat
   page2.destroy();
 });
 
+test('History sync page controller triggers timeout stop when job.idleDeadline expires before job.deadline', async () => {
+  const timers = createFakeTimerHarness(1_700_000_000_000);
+  const start = timers.nowFn();
+  let bridgeSub = null;
+  const env = createMockPageEnv({
+    url: 'https://x.com/Alice/with_replies',
+    taskHandler: async () => ({
+      ok: true,
+      job: makeJob({
+        mode: 'timeline',
+        actionAt: start,
+        pageAt: start,
+        idleDeadline: start + 5 * 60000,
+        deadline: start + 20 * 60000
+      })
+    })
+  });
+  env.win.__sparklinkIsolatedBridge.subscribe = (fn) => {
+    bridgeSub = fn;
+    return () => {
+      bridgeSub = null;
+    };
+  };
+
+  const page = installHistorySyncPage(env.win, env.chromeObj, {
+    nowFn: timers.nowFn,
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn
+  });
+  await page.ready;
+
+  // Advance just past 5-minute idleDeadline (still 15 minutes before hard deadline)
+  await timers.advanceBy(5 * 60000 + 1);
+  if (bridgeSub) {
+    bridgeSub({ type: 'BINDING_READY' });
+    await timers.flushMicrotasks();
+  }
+  const stopMsgs = env.runtimeMessages.filter((m) => m.type === 'STOP_HISTORY_SYNC_TASK');
+  assert.equal(stopMsgs.length, 1);
+  assert.equal(stopMsgs[0].reason, 'timeout');
+  page.destroy();
+});
+
+
 

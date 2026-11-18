@@ -797,3 +797,55 @@ test('Audit regressions: unreadable import file handling, preserved account sele
   assert.equal(snapshotCalls.at(-1).preferredActorUserId ?? null, null, 'Successful CLEAR_ALL resets userSelectedActorId');
 });
 
+test('Popup refresh timer honors 5-minute idleDeadline / nextTimeoutAt instead of waiting 20-minute hard deadline', async (t) => {
+  const { doc } = createFakePopupDom();
+  const baseNow = Date.now();
+  const snap = {
+    ok: true,
+    debugLogsEnabled: false,
+    viewerStatus: 'bound',
+    activeTabActorUserId: '42',
+    settings: { collectionEnabled: true },
+    selectedAccount: { actorUserId: '42', handle: 'alice', summary: { top20: [] } },
+    savedAccounts: [{ actorUserId: '42', handle: 'alice', summary: { top20: [] } }],
+    historyNextStart: 0,
+    historySync: {
+      id: 'job_idle_timer',
+      handle: 'alice',
+      status: 'running',
+      mode: 'timeline',
+      pages: 1,
+      added: 1,
+      duplicates: 0,
+      deadline: baseNow + 20 * 60000,
+      idleDeadline: baseNow + 5 * 60000,
+      nextTimeoutAt: baseNow + 5 * 60000
+    }
+  };
+  const scheduledDelays = [];
+  const origSetTimeout = globalThis.setTimeout;
+  t.mock.method(globalThis, 'setTimeout', (fn, delay, ...rest) => {
+    scheduledDelays.push(delay);
+    return origSetTimeout(fn, delay, ...rest);
+  });
+
+  const runtime = {
+    async sendMessage(msg) {
+      if (msg.type === 'GET_POPUP_SNAPSHOT') return snap;
+      return { ok: true };
+    }
+  };
+
+  const ui = createPopupController({ document: doc, runtime });
+  await ui.init();
+
+  assert.equal(scheduledDelays.length > 0, true);
+  const timerDelay = scheduledDelays.at(-1);
+  assert.ok(timerDelay <= 5 * 60000 + 500, `Expected delay <= 300500ms, got ${timerDelay}`);
+  assert.ok(timerDelay >= 4 * 60000, `Expected delay around 5 minutes, got ${timerDelay}`);
+
+  snap.historySync = { ...snap.historySync, status: 'done', reason: 'end' };
+  await ui.refresh();
+});
+
+

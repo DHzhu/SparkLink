@@ -433,3 +433,61 @@ test('History sync stops cleanly with reason item_limit once MAX_ITEMS (1000) ne
   assert.equal(mergedBatches.at(-1).at(-1), '5020');
 });
 
+test('Post-completion cooldown extends 15m from completion after long (>15m) runs without shortening longer server retryAt, and describeHistorySync exposes idleDeadline', async () => {
+  const { createHistorySync, describeHistorySync } = await import('../src/history-sync.js');
+  let clock = now;
+  const api = {
+    storage: { local: area(), session: area() },
+    tabs: { create: async () => ({ id: 55 }), update: async () => {} }
+  };
+  const sync = createHistorySync(
+    api,
+    { mergeObservedBatch: async () => ({ ok: true, added: 1, duplicates: 0, conflicts: 0 }) },
+    () => clock
+  );
+  const binding = { actorUserId: '101', captureSessionId: 1, accountGeneration: 1, collectionGeneration: 1 };
+  const started = await sync.start(binding, 'alice');
+  assert.equal(started.job.deadline, now + 20 * 60000);
+  assert.equal(started.job.idleDeadline, now + 5 * 60000);
+  assert.equal(started.job.nextTimeoutAt, now + 5 * 60000);
+
+  // Actively sync for 18 minutes (6 steps x 3 minutes) without exceeding 5-minute idle limit
+  for (let i = 0; i < 6; i += 1) {
+    clock += 3 * 60000;
+    const active = await sync.read();
+    assert.equal(active.status, 'running');
+    await sync.mergePage(
+      active,
+      { jobId: active.id, pageId: 'long_' + i, events: [], historyPage: { canPage: true, ended: i === 5 } },
+      binding
+    );
+    const updated = await sync.read();
+    const described = describeHistorySync(updated);
+    assert.equal(described.deadline, now + 20 * 60000);
+    assert.equal(described.idleDeadline, clock + 5 * 60000);
+    assert.equal(described.nextTimeoutAt, Math.min(now + 20 * 60000, clock + 5 * 60000));
+  }
+  const finishedAt = clock;
+  const finished = await sync.read();
+  assert.equal(finished.status, 'done');
+  assert.equal(finished.reason, 'end');
+
+  // At minute 18, original start + 15m has elapsed, yet a new start MUST still be in cooldown until finishedAt + 15m
+  assert.equal(await sync.nextStart(), finishedAt + 15 * 60000);
+  const immediateRetry = await sync.start(binding, 'alice');
+  assert.equal(immediateRetry.code, 'COOLDOWN');
+
+  clock = finishedAt + 15 * 60000 - 1;
+  assert.equal((await sync.start(binding, 'alice')).code, 'COOLDOWN');
+
+  clock = finishedAt + 15 * 60000;
+  const second = await sync.start(binding, 'alice');
+  assert.equal(second.ok, true);
+
+  // Stopping with rate_limited (1h) + retryAt (2h) must NOT be shortened by completion cooldown
+  const retryAt = clock + 2 * 3600000;
+  await sync.stop(await sync.read(), 'rate_limited', retryAt);
+  assert.equal(await sync.nextStart(), retryAt);
+});
+
+

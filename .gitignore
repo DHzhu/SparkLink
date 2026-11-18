@@ -67,3 +67,10 @@ user-data-dir/
 raw-samples/
 captures/
 sparklink-backup-*.json
+
+# --- Local Workflow & Agent Configuration ---
+.agent/
+conductor/
+CLAUDE.md
+GEMINI.md
+.claudignore

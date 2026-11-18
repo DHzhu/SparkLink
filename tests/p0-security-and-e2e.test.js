@@ -17,16 +17,46 @@ function stripComments(source) {
     .replace(/^\s*\/\/.*$/gm, '');
 }
 
-test('Static security audit: P0 classic scripts contain zero cookie/auth-header reads, zero eval, zero toString tampering, and zero top-level ESM', () => {
-  const files = ['x-adapter.js', 'interceptor.js', 'bridge.js'];
-  for (const name of files) {
-    const srcPath = path.join(__dirname, '..', 'src', name);
+test('Static security audit: runtime scripts contain zero cookie/ct0/auth-header reads, zero join() token obfuscation, zero eval, and zero toString tampering', () => {
+  const classicScripts = ['x-adapter.js', 'interceptor.js', 'bridge.js', 'content.js', 'history-sync-page.js'];
+  const allScripts = [
+    ...classicScripts,
+    'background.js',
+    'history-sync.js',
+    'storage.js',
+    'metrics.js',
+    'schema.js',
+    path.join('popup', 'popup.js')
+  ];
+
+  const arrayJoinRe = /\[((?:\s*['"][^'"]*['"]\s*,?)+)\]\s*\.join\s*\(\s*(['"][^'"]*['"])?\s*\)/g;
+  const sensitiveJoinedRe = /cookie|ct0|csrf|bearer|authorization|x-client-transaction-id/i;
+
+  for (const relName of allScripts) {
+    const srcPath = path.join(__dirname, '..', 'src', relName);
     const code = stripComments(fs.readFileSync(srcPath, 'utf8'));
 
-    assert.equal(/\bdocument\.cookie\b/.test(code), false, `${name} must not access document.cookie`);
-    assert.equal(/x-csrf-token|bearer\s+/i.test(code), false, `${name} must not inspect auth tokens`);
-    assert.equal(/\beval\s*\(|new\s+Function\s*\(/.test(code), false, `${name} must not use eval/new Function`);
-    assert.equal(/Function\.prototype\.toString/.test(code), false, `${name} must not touch Function.prototype.toString`);
+    assert.equal(/\bdocument\.cookie\b|\[\s*['"]cookie['"]\s*\]/.test(code), false, `${relName} must not access document.cookie`);
+    assert.equal(/\bct0\b/i.test(code), false, `${relName} must not reference ct0 cookie`);
+    assert.equal(/x-csrf-token|x-client-transaction-id|bearer\s+/i.test(code), false, `${relName} must not inspect or construct auth/signature headers`);
+    assert.equal(/\beval\s*\(|new\s+Function\s*\(/.test(code), false, `${relName} must not use eval/new Function`);
+    assert.equal(/Function\.prototype\.toString/.test(code), false, `${relName} must not touch Function.prototype.toString`);
+
+    for (const m of code.matchAll(arrayJoinRe)) {
+      const parts = Array.from(m[1].matchAll(/['"]([^'"]*)['"]/g), (p) => p[1]);
+      const sep = m[2] ? m[2].slice(1, -1) : ',';
+      const joined = parts.join(sep);
+      assert.equal(
+        sensitiveJoinedRe.test(joined),
+        false,
+        `${relName} must not obfuscate sensitive token "${joined}" via array .join()`
+      );
+    }
+  }
+
+  for (const name of classicScripts) {
+    const srcPath = path.join(__dirname, '..', 'src', name);
+    const code = stripComments(fs.readFileSync(srcPath, 'utf8'));
     assert.equal(/^\s*(import|export)\s+/m.test(code), false, `${name} must be a classic script without top-level ESM`);
   }
 });

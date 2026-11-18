@@ -267,6 +267,7 @@
 
     const state = {
       nonce: null,
+      debugLogsEnabled: false,
       collectionEnabled: false,
       captureSessionId: null,
       documentEpoch: 0,
@@ -280,82 +281,38 @@
       activeClones: 0
     };
 
-    // Only the dedicated document retains a read-only continuation for its original endpoint.
-    // Neither the Request nor its cursor crosses into extension storage or messaging.
-    const nativeFetch = win.fetch;
-    const CSRF_HEADER_NAME = ['x', 'csrf', 'token'].join('-');
-    const PUBLIC_AUTH_HEADER = [
-      'Bear',
-      'er',
-      ' AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA'
-    ].join('');
-    const DEFAULT_TIMELINE_FEATURES = {
-      rweb_video_screen_enabled: false,
-      profile_label_improvements_pcf_label_in_post_enabled: true,
-      responsive_web_profile_redirect_enabled: false,
-      rweb_tipjar_consumption_enabled: true,
-      verified_phone_label_enabled: false,
-      creator_subscriptions_tweet_preview_api_enabled: true,
-      responsive_web_graphql_timeline_navigation_enabled: true,
-      responsive_web_graphql_skip_user_profile_image_extensions_enabled: false,
-      premium_content_api_read_enabled: false,
-      communities_web_enable_tweet_community_results_fetch: true,
-      c9s_tweet_anatomy_moderator_badge_enabled: true,
-      responsive_web_grok_analyze_button_fetch_trends_enabled: false,
-      responsive_web_grok_analyze_post_followups_enabled: true,
-      responsive_web_jetfuel_frame: true,
-      responsive_web_grok_share_attachment_enabled: true,
-      articles_preview_enabled: true,
-      responsive_web_edit_tweet_api_enabled: true,
-      graphql_is_translatable_rweb_tweet_is_translatable_enabled: true,
-      view_counts_everywhere_api_enabled: true,
-      longform_notetweets_consumption_enabled: true,
-      responsive_web_grok_show_grok_translated_post: false,
-      responsive_web_grok_analysis_button_from_backend: false,
-      creator_subscriptions_quote_tweet_preview_enabled: false,
-      freedom_of_speech_not_reach_fetch_enabled: true,
-      standardized_nudges_misinfo: true,
-      tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
-      longform_notetweets_rich_text_read_enabled: true,
-      longform_notetweets_inline_media_enabled: true,
-      responsive_web_grok_image_annotation_enabled: true,
-      responsive_web_grok_imagine_annotation_enabled: true,
-      responsive_web_grok_community_note_auto_translation_is_enabled: false,
-      responsive_web_enhance_cards_enabled: false
-    };
-    const knownQueryIds = Object.create(null);
-    const capturedFeatures = Object.create(null);
-    const sharedFeatures = Object.create(null);
-    const capturedFieldToggles = Object.create(null);
-    const capturedApiHeaders = Object.create(null);
+    // Only the dedicated sync document holds its latest observed cursor in memory to pace native scrolling.
+    // Neither cursors nor raw payloads cross into extension storage.
     let scope = null;
-    let template = null;
-    let pendingTemplate = null;
     let cursor = null;
     let pendingSearch = null;
     let pendingTimeline = null;
     let pageRequest = null;
-    let bootstrappedTimeline = false;
-    let bootstrapTimer = null;
     const usedCursors = new Set();
     let lastFetchAt = 0;
     let lastNativePageAt = 0;
     let nativeRequestsInFlight = 0;
+    let wakeScrollWaiter = null;
+    function notifyScrollWaiter() {
+      const fn = wakeScrollWaiter;
+      if (fn) {
+        wakeScrollWaiter = null;
+        fn();
+      }
+    }
     function logSync(...args) {
+      if (!state.debugLogsEnabled) {
+        return;
+      }
       try {
         if (win.console && typeof win.console.info === 'function') {
           win.console.info('[SparkLink Sync/Main]', ...args);
         }
       } catch {}
     }
-    function hasDomScroll() {
+    function canScrollDocument() {
       try {
-        return Boolean(
-          typeof win.scrollTo === 'function' &&
-          win.document &&
-          typeof win.document.querySelector === 'function' &&
-          win.document.querySelector('[data-testid="tweet"], [data-testid="cellInnerDiv"], main [role="region"]')
-        );
+        return Boolean(typeof win.scrollTo === 'function' && win.document);
       } catch {
         return false;
       }
@@ -386,19 +343,14 @@
       return true;
     }
     function clearHistoryTransport() {
-      if (bootstrapTimer !== null) {
-        clearTimeout(bootstrapTimer);
-        bootstrapTimer = null;
-      }
-      bootstrappedTimeline = false;
       pageRequest?.abort();
       pageRequest = null;
-      template = null;
-      pendingTemplate = null;
+      notifyScrollWaiter();
       cursor = null;
       pendingSearch = null;
       pendingTimeline = null;
       usedCursors.clear();
+      lastFetchAt = 0;
       lastNativePageAt = 0;
       nativeRequestsInFlight = 0;
     }
@@ -420,494 +372,88 @@
         return false;
       }
     }
-    function readCt0FromDocument() {
-      try {
-        const cookieKey = ['coo', 'kie'].join('');
-        const raw = win.document && typeof win.document[cookieKey] === 'string' ? win.document[cookieKey] : '';
-        const m = raw.match(/(?:^|;\s*)ct0=([^;]+)/);
-        return m ? decodeURIComponent(m[1]) : '';
-      } catch {
-        return '';
-      }
-    }
-    function recordApiHeadersFromSource(source) {
-      if (!source) return;
-      const skip = new Set(['x-client-transaction-id', 'signature', 'dpop', 'content-type', 'content-length', 'host', 'cookie']);
-      const save = (k, v) => {
-        if (typeof k !== 'string' || typeof v !== 'string') return;
-        const lower = k.toLowerCase();
-        if (skip.has(lower) || lower.length > 128 || v.length > 4096) return;
-        if (Object.keys(capturedApiHeaders).length < 32 || Object.prototype.hasOwnProperty.call(capturedApiHeaders, lower)) {
-          capturedApiHeaders[lower] = v;
-        }
-      };
-      try {
-        if (typeof Headers === 'function' && source instanceof Headers) {
-          source.forEach((v, k) => save(k, v));
-        } else if (Array.isArray(source)) {
-          for (let i = 0; i < source.length; i += 1) {
-            if (Array.isArray(source[i])) save(source[i][0], source[i][1]);
-          }
-        } else if (typeof source === 'object') {
-          const keys = Object.keys(source);
-          for (let i = 0; i < keys.length; i += 1) {
-            save(keys[i], source[keys[i]]);
-          }
-        }
-      } catch {
-        // Ignore header inspection errors
-      }
-    }
-    function captureGraphqlMetadata(urlString, headersSource) {
-      if (!urlString) return;
-      try {
-        const parsed = new URL(urlString, win.location.href);
-        const isAllowedApi =
-          (ALLOWED_ORIGINS.has(parsed.origin) && /^\/i\/api\/graphql\//.test(parsed.pathname)) ||
-          (['https://api.x.com', 'https://api.twitter.com'].includes(parsed.origin) && /^\/graphql\//.test(parsed.pathname));
-        if (!isAllowedApi) return;
-        recordApiHeadersFromSource(headersSource);
-        const pathMatch = parsed.pathname.match(/^(?:\/i\/api)?\/graphql\/([A-Za-z0-9_-]{1,64})\/([A-Za-z0-9_]{1,64})$/);
-        if (!pathMatch) return;
-        const qid = pathMatch[1];
-        const op = pathMatch[2];
-        knownQueryIds[op] = qid;
-        const rawFeatures = parsed.searchParams.get('features');
-        if (rawFeatures && rawFeatures.length < 16384) {
-          const parsedFeatures = JSON.parse(rawFeatures);
-          if (adapter.isPlainObject(parsedFeatures)) {
-            const opFeats = capturedFeatures[op] || (capturedFeatures[op] = Object.create(null));
-            for (const [fk, fv] of Object.entries(parsedFeatures)) {
-              if (typeof fv === 'boolean') {
-                sharedFeatures[fk] = fv;
-                opFeats[fk] = fv;
-              }
-            }
-          }
-        }
-        const rawToggles = parsed.searchParams.get('fieldToggles');
-        if (rawToggles && rawToggles.length < 4096) {
-          const parsedToggles = JSON.parse(rawToggles);
-          if (adapter.isPlainObject(parsedToggles)) {
-            capturedFieldToggles[op] = { ...(capturedFieldToggles[op] || {}), ...parsedToggles };
-          }
-        }
-      } catch {
-        // Ignore metadata capture errors
-      }
-    }
-    function buildApiHeaders(baseHeaders) {
-      const hdrs = typeof Headers === 'function' ? new Headers() : null;
-      if (!hdrs) return undefined;
-      const trySet = (k, v) => {
-        if (typeof k !== 'string' || typeof v !== 'string' || !v) return;
-        try {
-          hdrs.set(k, v);
-        } catch {
-          // Ignore forbidden headers
-        }
-      };
-      if (baseHeaders) {
-        try {
-          if (typeof baseHeaders.forEach === 'function') {
-            baseHeaders.forEach((v, k) => trySet(k, v));
-          } else if (Array.isArray(baseHeaders)) {
-            for (let i = 0; i < baseHeaders.length; i += 1) {
-              if (Array.isArray(baseHeaders[i])) trySet(baseHeaders[i][0], baseHeaders[i][1]);
-            }
-          }
-        } catch {
-          // Ignore invalid base headers
-        }
-      }
-      for (const [k, v] of Object.entries(capturedApiHeaders)) {
-        if (!hdrs.has(k)) trySet(k, v);
-      }
-      hdrs.delete('x-client-transaction-id');
-      hdrs.delete('signature');
-      hdrs.delete('dpop');
-      hdrs.delete('content-length');
-      hdrs.delete('content-type');
-      if (!hdrs.has('authorization')) trySet('authorization', PUBLIC_AUTH_HEADER);
-      if (!hdrs.has(CSRF_HEADER_NAME)) {
-        const ct0 = readCt0FromDocument();
-        if (ct0) trySet(CSRF_HEADER_NAME, ct0);
-      }
-      if (!hdrs.has('x-twitter-auth-type')) trySet('x-twitter-auth-type', 'OAuth2Session');
-      if (!hdrs.has('x-twitter-active-user')) trySet('x-twitter-active-user', 'yes');
-      if (!hdrs.has('x-twitter-client-language')) {
-        trySet('x-twitter-client-language', win.document?.documentElement?.lang || 'en');
-      }
-      return hdrs;
-    }
-    async function discoverOperationSpec(op, forceFresh) {
-      if (!forceFresh && knownQueryIds[op]) {
-        return {
-          qid: knownQueryIds[op],
-          features: { ...DEFAULT_TIMELINE_FEATURES, ...sharedFeatures, ...(capturedFeatures[op] || {}) },
-          fieldToggles: { ...(capturedFieldToggles[op] || {}) }
-        };
-      }
-      const doc = win.document;
-      const scripts = doc && doc.scripts ? Array.from(doc.scripts) : [];
-      const srcs = scripts
-        .map((s) => s && s.src)
-        .filter((s) => typeof s === 'string' && (/client-web/.test(s) || /twimg\.com/.test(s)));
-      const opPattern = new RegExp(
-        'queryId:"([^"]+)",operationName:"' + op + '"(?:,operationType:"[^"]+")?(?:,metadata:\\{featureSwitches:\\[([^\\]]*)\\](?:,fieldToggles:\\[([^\\]]*)\\])?\\})?'
-      );
-      for (let i = 0; i < srcs.length; i += 1) {
-        try {
-          const resp = await nativeFetch.call(win, srcs[i], { credentials: 'omit' });
-          if (!resp || !resp.ok) continue;
-          const text = await resp.text();
-          const m = text.match(opPattern);
-          if (m) {
-            knownQueryIds[op] = m[1];
-            const opFeats = capturedFeatures[op] || (capturedFeatures[op] = Object.create(null));
-            if (m[2]) {
-              const fMatches = m[2].match(/"([^"]+)"/g) || [];
-              for (let j = 0; j < fMatches.length; j += 1) {
-                const fname = fMatches[j].slice(1, -1);
-                if (fname && !(fname in opFeats)) {
-                  opFeats[fname] = fname in sharedFeatures ? sharedFeatures[fname] : true;
-                }
-              }
-            }
-            if (m[3]) {
-              const tMatches = m[3].match(/"([^"]+)"/g) || [];
-              const opToggles = capturedFieldToggles[op] || (capturedFieldToggles[op] = Object.create(null));
-              for (let j = 0; j < tMatches.length; j += 1) {
-                const tname = tMatches[j].slice(1, -1);
-                if (tname && !(tname in opToggles)) opToggles[tname] = false;
-              }
-            }
-            return {
-              qid: m[1],
-              features: { ...DEFAULT_TIMELINE_FEATURES, ...sharedFeatures, ...opFeats },
-              fieldToggles: { ...(capturedFieldToggles[op] || {}) }
-            };
-          }
-        } catch {
-          // Ignore unreachable script bundle
-        }
-      }
-      return null;
-    }
-    function buildTemplateRequest(input, init, targetHref) {
-      const useHref =
-        typeof input === 'string' ||
-        (input && typeof input === 'object' && !('headers' in input) && typeof input.href === 'string');
-      return new Request(useHref ? targetHref : input, init);
-    }
-    function rememberTemplate(input, init, url, match, context) {
-      if (!match || (match.category !== 'replies_timeline' && match.category !== 'manual_search')) return;
-      const target = new URL(url, win.location.href);
-      const activeBinding = context?.binding || state.bindingContext;
-      const at = Date.now();
-      const matchesCurrentScope = Boolean(
-        scope &&
-        at < scope.deadline &&
-        activeBinding &&
-        activeBinding.actorUserId === scope.actor &&
-        (scope.query
-          ? isScopedSearch(match)
-          : match.category === 'replies_timeline' && match.requestedUserId === scope.actor)
-      );
-      if (matchesCurrentScope) {
-        template = null;
-        cursor = null;
-      }
-      if ((target.origin !== win.location.origin && !['https://api.x.com', 'https://api.twitter.com'].includes(target.origin)) ||
-          target.username || target.password || target.hash) return;
-      const req = buildTemplateRequest(input, init, target.href);
-      // A one-time signature belongs only to the original request.
-      if (['signature', 'dpop'].some(name => req.headers.has(name))) return;
-      const cleanHeaders = typeof Headers === 'function' ? new Headers(req.headers) : undefined;
-      cleanHeaders?.delete('x-client-transaction-id');
-      const candidate = new Request(req, { headers: cleanHeaders, redirect: 'error' });
-      if (matchesCurrentScope) {
-        template = candidate;
-        pendingTemplate = null;
-        lastFetchAt = at;
-      } else if (
-        (!scope || !activeBinding) &&
-        ((match.category === 'replies_timeline' && isCandidateRepliesPage(match)) ||
-          (match.category === 'manual_search' && isScopedSearch(match)))
+    async function scrollNextPage(data) {
+      const binding = state.bindingContext;
+      const nowAtStart = Date.now();
+      if (
+        !cursor ||
+        pageRequest ||
+        !scope ||
+        nowAtStart >= scope.deadline ||
+        scope.id !== data.jobId ||
+        !binding ||
+        binding.bindingId !== data.bindingId ||
+        binding.actorUserId !== scope.actor ||
+        usedCursors.has(cursor) ||
+        usedCursors.size >= 32 ||
+        nowAtStart - lastFetchAt < 12000 ||
+        !canScrollDocument()
       ) {
-        pendingTemplate = { req: candidate, match, at };
-      }
-    }
-    async function fetchGraphqlTimelinePage({ op, url, vars, baseHeaders, credentials, context, abort, suppressErrorStop = false }) {
-      let rediscovered = false;
-      let features = null;
-      const rawFeatures = url.searchParams.get('features');
-      if (rawFeatures) {
-        try {
-          features = JSON.parse(rawFeatures);
-        } catch {
-          features = null;
-        }
-      }
-      url.searchParams.set('variables', JSON.stringify(vars));
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const headers = buildApiHeaders(baseHeaders);
-        const reqOpts = { method: 'GET', credentials: credentials || 'include', redirect: 'error' };
-        if (headers) reqOpts.headers = headers;
-        const request = new Request(url.href, reqOpts);
-        const response = await nativeFetch.call(win, request, { redirect: 'error', signal: abort.signal });
-        if (!isContextStillActive(context) || pageRequest !== abort) return null;
-        const header = (name) => response.headers.get(name);
-        if (response.status === 429) {
-          logSync('synthetic GraphQL 429 rate limited', { op, suppressErrorStop });
-          checkHistoryHttpStatus(429, context, header);
-          return null;
-        }
-        const body = await readBoundedBodyStream(response.body, maxResponseBytes, context);
-        if (!isContextStillActive(context) || pageRequest !== abort) return null;
-        let parsed = null;
-        if (body.ok && body.text.trim()) {
-          try {
-            parsed = JSON.parse(body.text);
-          } catch {
-            parsed = null;
-          }
-        }
-        const hasTimelineData = Boolean(
-          parsed &&
-          parsed.data &&
-          (parsed.data.user || parsed.data.user_result || parsed.data.user_results || parsed.data.search_by_raw_query)
-        );
-        if (response.ok && hasTimelineData) {
-          logSync('synthetic GraphQL success', { op, status: response.status, hasCursorVar: Boolean(vars.cursor) });
-          return { parsed, header, urlHref: url.href, request };
-        }
-        logSync('synthetic GraphQL non-success', {
-          op,
-          attempt,
-          status: response.status,
-          bodyOk: body.ok,
-          hasTimelineData,
-          errors: Array.isArray(parsed?.errors) ? parsed.errors.map((e) => ({ code: e?.code, msg: String(e?.message || '').slice(0, 120) })) : null
-        });
-        if ((response.status === 400 || response.status === 404) && !rediscovered) {
-          rediscovered = true;
-          const spec = await discoverOperationSpec(op, true);
-          if (spec && spec.qid) {
-            url.pathname = url.pathname.replace(/\/graphql\/[^/]+\//, '/graphql/' + spec.qid + '/');
-            features = { ...spec.features, ...(features || {}) };
-            url.searchParams.set('features', JSON.stringify(features));
-            continue;
-          }
-        }
-        const errMsg = Array.isArray(parsed?.errors) && parsed.errors[0] && parsed.errors[0].message ? String(parsed.errors[0].message) : '';
-        const miss = errMsg.match(/cannot be null:\s*(.+)$/i);
-        if (miss && attempt < 2) {
-          features = features || { ...DEFAULT_TIMELINE_FEATURES, ...sharedFeatures, ...(capturedFeatures[op] || {}) };
-          miss[1].split(',').forEach((k) => {
-            const key = k.trim();
-            if (key) features[key] = true;
-          });
-          url.searchParams.set('features', JSON.stringify(features));
-          continue;
-        }
-        if (parsed && Array.isArray(parsed.errors) && parsed.errors.length > 0) {
-          if (suppressErrorStop && !parsed.errors.some((e) => e?.code === 88)) {
-            return null;
-          }
-          const codeMatch = adapter.matchWhitelistedRequest(url.href, 'GET');
-          handleParsedPayload(codeMatch, parsed, null, context, header);
-          return null;
-        }
-        if (!response.ok || !body.ok) {
-          if (!suppressErrorStop) {
-            signalHistoryStop(scope?.query ? 'unavailable' : 'unrecognized', context, header);
-          }
-          return null;
-        }
-        throw new Error('Incomplete history response');
-      }
-      if (!suppressErrorStop) {
-        signalHistoryStop(scope?.query ? 'unavailable' : 'unrecognized', context, () => null);
-      }
-      return null;
-    }
-    async function bootstrapDirectTimeline() {
-      if (bootstrappedTimeline || template || pageRequest || !scope || scope.query || Date.now() >= scope.deadline) return;
-      const binding = state.bindingContext;
-      if (!binding || binding.actorUserId !== scope.actor) return;
-      if (!win.document?.scripts?.length) return;
-      bootstrappedTimeline = true;
-      const context = captureContext();
-      const abort = new AbortController();
-      pageRequest = abort;
-      const timeout = setTimeout(() => abort.abort(), 15000);
-      try {
-        const spec = await discoverOperationSpec('UserTweetsAndReplies', false);
-        if (!spec || !spec.qid || !isContextStillActive(context) || pageRequest !== abort || template) {
-          logSync('bootstrapDirectTimeline skipped', { foundSpec: Boolean(spec && spec.qid), hasTemplate: Boolean(template), path: win.location?.pathname });
-          return;
-        }
-        logSync('bootstrapDirectTimeline querying UserTweetsAndReplies', { qid: spec.qid, path: win.location?.pathname });
-        const url = new URL(win.location.origin + '/i/api/graphql/' + spec.qid + '/UserTweetsAndReplies');
-        const vars = {
-          userId: binding.actorUserId,
-          count: 40,
-          includePromotedContent: true,
-          withCommunity: true,
-          withVoice: true,
-          withV2Timeline: true
-        };
-        url.searchParams.set('variables', JSON.stringify(vars));
-        url.searchParams.set('features', JSON.stringify(spec.features));
-        if (spec.fieldToggles && Object.keys(spec.fieldToggles).length > 0) {
-          url.searchParams.set('fieldToggles', JSON.stringify(spec.fieldToggles));
-        }
-        lastFetchAt = Date.now();
-        const res = await fetchGraphqlTimelinePage({
-          op: 'UserTweetsAndReplies',
-          url,
-          vars,
-          baseHeaders: null,
-          credentials: 'include',
-          context,
-          abort,
-          suppressErrorStop: true
-        });
-        if (!res || pageRequest !== abort || !isContextStillActive(context)) return;
-        if (!template) {
-          template = new Request(res.urlHref, {
-            method: 'GET',
-            headers: buildApiHeaders(),
-            credentials: 'include',
-            redirect: 'error'
-          });
-        }
-        handleParsedPayload(adapter.matchWhitelistedRequest(res.urlHref, 'GET'), res.parsed, null, context, res.header);
-      } catch (err) {
-        logSync('bootstrapDirectTimeline failed softly (will rely on /with_replies navigation)', { error: String(err?.message || err) });
-      } finally {
-        clearTimeout(timeout);
-        if (pageRequest === abort) pageRequest = null;
-      }
-    }
-    function scheduleDirectTimelineBootstrap() {
-      if (bootstrappedTimeline || template || pageRequest || !scope || scope.query || Date.now() >= scope.deadline) return;
-      if (!state.bindingContext || state.bindingContext.actorUserId !== scope.actor) return;
-      if (!win.document?.scripts?.length || bootstrapTimer !== null) return;
-      bootstrapTimer = setTimeout(() => {
-        bootstrapTimer = null;
-        bootstrapDirectTimeline();
-      }, 350);
-      if (bootstrapTimer && typeof bootstrapTimer.unref === 'function') {
-        bootstrapTimer.unref();
-      }
-    }
-    async function fetchNextPage(data) {
-      const binding = state.bindingContext;
-      if (!cursor || pageRequest || !scope || Date.now() >= scope.deadline || scope.id !== data.jobId ||
-          !binding || binding.bindingId !== data.bindingId || binding.actorUserId !== scope.actor ||
-          usedCursors.has(cursor) || usedCursors.size >= 32 || Date.now() - lastFetchAt < 12000) {
         logSync('HISTORY_NEXT ignored', {
           hasCursor: Boolean(cursor),
           hasPageRequest: Boolean(pageRequest),
           hasScope: Boolean(scope),
           scopeMatchesJob: Boolean(scope && scope.id === data?.jobId),
           usedCursor: cursor ? usedCursors.has(cursor) : false,
-          sinceLastFetchMs: lastFetchAt ? Date.now() - lastFetchAt : null
+          sinceLastFetchMs: lastFetchAt ? nowAtStart - lastFetchAt : null
         });
         return;
       }
       const op = scope.query ? 'SearchTimeline' : 'UserTweetsAndReplies';
-      const useDomScroll = hasDomScroll();
-      if (!useDomScroll && !template && (scope.query || !knownQueryIds[op])) {
-        logSync('HISTORY_NEXT aborted: missing template and DOM scroll', { op });
-        return;
-      }
+      const expectedCursor = cursor;
+      usedCursors.add(expectedCursor);
+      cursor = null;
+      lastFetchAt = nowAtStart;
+
       const context = captureContext();
       const abort = new AbortController();
       pageRequest = abort;
-      const timeout = setTimeout(() => abort.abort(), 18000);
+      const pageBaseline = lastNativePageAt;
       try {
-        const expectedCursor = cursor;
-        if (useDomScroll) {
-          const pageBaseline = lastNativePageAt;
-          logSync('HISTORY_NEXT -> scrollScan start', { op, cursorLen: expectedCursor.length, inFlight: nativeRequestsInFlight });
-          triggerScrollStep();
-          let nudged = false;
-          const scrollDeadline = Date.now() + 3500;
-          while (isContextStillActive(context) && pageRequest === abort) {
-            if (lastNativePageAt > pageBaseline) {
-              usedCursors.add(expectedCursor);
-              logSync('HISTORY_NEXT -> scrollScan captured native page', { op, hasNextCursor: Boolean(cursor) });
-              return;
-            }
-            const nowMs = Date.now();
-            const hardLimit = nativeRequestsInFlight > 0 ? scrollDeadline + 5000 : scrollDeadline;
-            if (nowMs >= hardLimit) break;
-            if (!nudged && nativeRequestsInFlight === 0 && nowMs >= scrollDeadline - 2000) {
-              nudged = true;
-              triggerScrollStep();
-            }
-            await new Promise((r) => setTimeout(r, 200));
-          }
-          if (!isContextStillActive(context) || pageRequest !== abort) return;
-          logSync('HISTORY_NEXT -> scrollScan timeout without native page, falling back to GraphQL fastScan', { op });
-        }
-        if (!template && (scope.query || !knownQueryIds[op])) {
-          logSync('HISTORY_NEXT fastScan skipped: no template/queryId', { op });
-          return;
-        }
-        let url;
-        let vars;
-        if (template) {
-          url = new URL(template.url);
-          vars = JSON.parse(url.searchParams.get('variables'));
-          if (scope.query) {
-            if (vars.rawQuery !== scope.query || vars.product !== 'Latest') return;
-          } else {
-            const reqUid = typeof vars.userId === 'number' ? String(vars.userId) : vars.userId;
-            if (reqUid !== binding.actorUserId) return;
-          }
-        } else {
-          const spec = await discoverOperationSpec(op, false);
-          if (!spec || !spec.qid) return;
-          url = new URL(win.location.origin + '/i/api/graphql/' + spec.qid + '/' + op);
-          vars = {
-            userId: binding.actorUserId,
-            count: 40,
-            includePromotedContent: true,
-            withCommunity: true,
-            withVoice: true,
-            withV2Timeline: true
-          };
-          url.searchParams.set('features', JSON.stringify(spec.features));
-        }
-        const nextCursor = cursor || expectedCursor;
-        if (!nextCursor || usedCursors.has(nextCursor)) return;
-        vars.cursor = nextCursor;
-        usedCursors.add(nextCursor);
-        cursor = null;
-        lastFetchAt = Date.now();
-        const res = await fetchGraphqlTimelinePage({
+        logSync('HISTORY_NEXT -> scrollScan start', {
           op,
-          url,
-          vars,
-          baseHeaders: template ? template.headers : null,
-          credentials: template ? template.credentials : 'include',
-          context,
-          abort,
-          suppressErrorStop: useDomScroll
+          cursorLen: expectedCursor.length,
+          inFlight: nativeRequestsInFlight
         });
-        if (!res || pageRequest !== abort || !isContextStillActive(context)) return;
-        handleParsedPayload(adapter.matchWhitelistedRequest(res.urlHref, 'GET'), res.parsed, null, context, res.header);
-      } catch (err) {
-        logSync('fetchNextPage error', { op, error: String(err?.message || err) });
-        if (!useDomScroll && isContextStillActive(context) && pageRequest === abort) {
-          signalHistoryStop(scope?.query ? 'unavailable' : 'unrecognized', context, () => null);
+        triggerScrollStep();
+        let nudged = false;
+        const scrollDeadline = Date.now() + 3500;
+        while (isContextStillActive(context) && pageRequest === abort && !abort.signal.aborted) {
+          if (lastNativePageAt > pageBaseline) {
+            logSync('HISTORY_NEXT -> scrollScan captured native page', {
+              op,
+              hasNextCursor: Boolean(cursor)
+            });
+            return;
+          }
+          const nowMs = Date.now();
+          const hardLimit = nativeRequestsInFlight > 0 ? scrollDeadline + 5000 : scrollDeadline;
+          if (nowMs >= hardLimit) break;
+          if (!nudged && nativeRequestsInFlight === 0 && nowMs >= scrollDeadline - 2000) {
+            nudged = true;
+            triggerScrollStep();
+          }
+          await new Promise((r) => {
+            let timer = null;
+            wakeScrollWaiter = () => {
+              if (timer !== null) clearTimeout(timer);
+              r();
+            };
+            timer = setTimeout(() => {
+              if (wakeScrollWaiter) wakeScrollWaiter = null;
+              r();
+            }, 200);
+          });
         }
+        if (isContextStillActive(context) && pageRequest === abort) {
+          logSync('HISTORY_NEXT -> scrollScan timeout without native page', {
+            op,
+            inFlight: nativeRequestsInFlight
+          });
+        }
+      } catch (err) {
+        logSync('scrollNextPage error', { op, error: String(err?.message || err) });
       } finally {
-        clearTimeout(timeout);
         if (pageRequest === abort) pageRequest = null;
       }
     }
@@ -1125,6 +671,9 @@
     }
 
     function applyStateSync(data) {
+      if (typeof data.debugLogsEnabled === 'boolean') {
+        state.debugLogsEnabled = data.debugLogsEnabled;
+      }
       const nextEnabled = Boolean(data.collectionEnabled);
       const nextSessionId =
         nextEnabled && Number.isInteger(data.captureSessionId) && data.captureSessionId > 0
@@ -1190,19 +739,6 @@
         engine.revokeBinding(prevBindingId);
       }
 
-      if (pendingTemplate && nextBinding && scope && Date.now() < scope.deadline && nextBinding.actorUserId === scope.actor) {
-        const pt = pendingTemplate;
-        pendingTemplate = null;
-        const ptMatches = scope.query
-          ? isScopedSearch(pt.match)
-          : pt.match.category === 'replies_timeline' && pt.match.requestedUserId === scope.actor;
-        if (ptMatches) {
-          template = pt.req;
-          lastFetchAt = pt.at;
-        }
-      } else if (nextBinding && !scope) {
-        pendingTemplate = null;
-      }
       if (pendingSearch && nextBinding) {
         const held = pendingSearch;
         pendingSearch = null;
@@ -1221,9 +757,6 @@
       }
       if (state.collectionEnabled && state.bindingContext) {
         state.needsPostPauseVerification = false;
-        if (scope && !scope.query && state.bindingContext.actorUserId === scope.actor) {
-          scheduleDirectTimelineBootstrap();
-        }
         if (
           !prevEnabled ||
           prevSessionId !== state.captureSessionId ||
@@ -1276,7 +809,7 @@
       }
 
       if (data.type === 'HISTORY_NEXT') {
-        fetchNextPage(data);
+        scrollNextPage(data);
       } else if (data.type === 'SYNC_STATE') {
         applyStateSync(data);
       } else if (data.type === 'REVOKE_BINDING') {
@@ -1342,17 +875,6 @@
         context = captureContext();
       }
       const frozenBinding = context.binding;
-      if (!template && pendingTemplate && scope && Date.now() < scope.deadline &&
-          frozenBinding?.actorUserId === scope.actor) {
-        const ptMatches = scope.query
-          ? isScopedSearch(pendingTemplate.match)
-          : pendingTemplate.match.category === 'replies_timeline' && pendingTemplate.match.requestedUserId === scope.actor;
-        if (ptMatches) {
-          template = pendingTemplate.req;
-          lastFetchAt = pendingTemplate.at;
-        }
-        pendingTemplate = null;
-      }
 
       // Always inspect Viewer operations to establish or verify viewer identity
       if (match.category === 'viewer') {
@@ -1439,15 +961,21 @@
           const candidate = engine.getRepliesCursor(payload);
           cursor = candidate && !usedCursors.has(candidate) ? candidate : null;
           const hasTweets = res.events.length > 0 || res.observedTweets.length > 0 || Boolean(res.historyPage.pageKey);
-          const hasTransport = Boolean(template || knownQueryIds[match.operationName] || hasDomScroll());
+          const hasTransport = canScrollDocument();
           if (match.category === 'replies_timeline' && hasTransport) {
             if ((usedCursors.size > 0 && !hasTweets && !res.partialUnrecognized) || (hasTweets && !cursor)) {
               res.historyPage.ended = true;
             }
           }
+          if (res.historyPage.ended) {
+            cursor = null;
+          }
           const searchHasRows = !isScopedSearch(match) || res.events.length > 0 || res.observedTweets.length > 0;
           res.historyPage.canPage = Boolean(hasTransport && cursor && !res.historyPage.ended && searchHasRows);
-          lastNativePageAt = Date.now();
+          const pageNow = Date.now();
+          lastNativePageAt = pageNow;
+          lastFetchAt = pageNow;
+          notifyScrollWaiter();
           logSync('parsed history page', {
             op: match.operationName,
             events: res.events.length,
@@ -1634,9 +1162,6 @@
         if (state.collectionEnabled && state.captureSessionId !== null) {
           try {
             const { url, method } = extractFetchUrlAndMethod(input, init);
-            if (url) {
-              captureGraphqlMetadata(url, (init && init.headers) || (input && typeof input === 'object' ? input.headers : null));
-            }
             const match = url ? adapter.matchWhitelistedRequest(url, method) : null;
             if (match && (match.category === 'replies_timeline' || match.category === 'manual_search') && scope) {
               const scopedOk = match.category !== 'manual_search' || isScopedSearch(match);
@@ -1647,7 +1172,6 @@
             if (match && (match.category !== 'manual_search' || isScopedSearch(match)) &&
                 (state.bindingContext || match.category === 'viewer' || isScopedSearch(match) || isCandidateRepliesPage(match))) {
               const context = captureContext();
-              try { rememberTemplate(input, init, url, match, context); } catch { template = null; }
               let requestMeta = null;
               let requestMetaPromise = null;
               let skipObservation = false;
@@ -1816,7 +1340,6 @@
     if (typeof win.XMLHttpRequest === 'function' && win.XMLHttpRequest.prototype) {
       const xhrProto = win.XMLHttpRequest.prototype;
       const originalOpen = xhrProto.open;
-      const originalSetHeader = xhrProto.setRequestHeader;
       const originalSend = xhrProto.send;
       const xhrMetaMap = new WeakMap();
       const xhrBoundListeners = new WeakSet();
@@ -1828,7 +1351,6 @@
           xhrMetaMap.set(this, {
             method: typeof method === 'string' ? method : 'GET',
             url: typeof url === 'string' ? url : url && typeof url.href === 'string' ? url.href : null,
-            headers: [],
             activeCapture: null
           });
         } catch (_err) {
@@ -1837,61 +1359,15 @@
         return result;
       };
 
-      if (typeof originalSetHeader === 'function') {
-        xhrProto.setRequestHeader = function sparklinkXhrHeader(name, value) {
-          const result = originalSetHeader.apply(this, arguments);
-          const meta = xhrMetaMap.get(this);
-          if (
-            meta &&
-            Array.isArray(meta.headers) &&
-            meta.headers.length < 64 &&
-            typeof name === 'string' &&
-            typeof value === 'string' &&
-            name.length > 0 &&
-            name.length <= 128 &&
-            value.length <= 4096
-          ) {
-            meta.headers.push([name, value]);
-          }
-          return result;
-        };
-      }
-
       xhrProto.send = function sparklinkXhrSend(body) {
         try {
           const meta = xhrMetaMap.get(this);
           if (meta) {
             meta.activeCapture = null;
             if (state.collectionEnabled && state.captureSessionId !== null && meta.url) {
-              captureGraphqlMetadata(meta.url, meta.headers);
               const match = adapter.matchWhitelistedRequest(meta.url, meta.method);
               if (match && (match.category !== 'manual_search' || isScopedSearch(match)) &&
                 (state.bindingContext || match.category === 'viewer' || isScopedSearch(match) || isCandidateRepliesPage(match))) {
-                if ((match.category === 'replies_timeline' || isScopedSearch(match)) &&
-                    typeof nativeFetch === 'function') {
-                  const hdrs = typeof Headers === 'function' ? new Headers() : null;
-                  if (hdrs && Array.isArray(meta.headers)) {
-                    for (let hi = 0; hi < meta.headers.length; hi += 1) {
-                      try {
-                        hdrs.append(meta.headers[hi][0], meta.headers[hi][1]);
-                      } catch (_hdrErr) {
-                        // Ignore invalid header pairs
-                      }
-                    }
-                  }
-                  const initObj = {
-                    method: meta.method || 'GET',
-                    credentials: this.withCredentials ? 'include' : 'same-origin'
-                  };
-                  if (hdrs) {
-                    initObj.headers = hdrs;
-                  }
-                  try {
-                    rememberTemplate(meta.url, initObj, meta.url, match, captureContext());
-                  } catch {
-                    template = null;
-                  }
-                }
                 let requestMeta = null;
                 let skip = false;
                 if (match.category === 'create_tweet' && body !== undefined && body !== null) {

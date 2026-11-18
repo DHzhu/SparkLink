@@ -612,50 +612,88 @@ test('Manual stop signals preserve native responses for HTTP limits, authenticat
   assert.ok(signals.every(m => m.captureSessionId === 10));
 });
 
-test('An authorized cursor grant reuses only the observed own replies GET and drops duplicate grants and redirects', async (t) => {
+test('Authorized HISTORY_NEXT paginates exclusively via native scrollScan, marks cursor used before scrolling, and drops duplicate or unpaced grants', async (t) => {
   let clock = Date.now();
   t.mock.method(Date, 'now', () => clock);
   const requests = [];
-  const payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
-  const entries = payload.data.user.result.timeline_v2.timeline.instructions.find(i => Array.isArray(i.entries)).entries;
-  for (const entry of entries) if (entry.content?.cursorType === 'Bottom') entry.content.value = 'page-two';
-  if (!entries.some(e => e.content?.cursorType === 'Bottom')) {
-    entries.push({ entryId: 'cursor-bottom', content: { cursorType: 'Bottom', value: 'page-two' } });
+  const page1Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  const entries1 = page1Payload.data.user.result.timeline_v2.timeline.instructions.find(i => Array.isArray(i.entries)).entries;
+  for (const entry of entries1) if (entry.content?.cursorType === 'Bottom') entry.content.value = 'scroll-p2';
+  if (!entries1.some(e => e.content?.cursorType === 'Bottom')) {
+    entries1.push({ entryId: 'cursor-bottom', content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'scroll-p2' } });
   }
+  const page2Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  const entries2 = page2Payload.data.user.result.timeline_v2.timeline.instructions.find(i => Array.isArray(i.entries)).entries;
+  for (const entry of entries2) if (entry.content?.cursorType === 'Bottom') entry.content.value = 'scroll-p2';
+  if (!entries2.some(e => e.content?.cursorType === 'Bottom')) {
+    entries2.push({ entryId: 'cursor-bottom', content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'scroll-p2' } });
+  }
+
   const { win, outboundMessages } = createMockEnvironment(async (input, init) => {
-    requests.push({ input, init });
-    return new Response(JSON.stringify(payload));
+    const reqUrl = typeof input === 'string' ? input : input.url;
+    requests.push({ url: reqUrl, init });
+    const vars = JSON.parse(new URL(reqUrl).searchParams.get('variables'));
+    return new Response(JSON.stringify(vars.cursor ? page2Payload : page1Payload));
   });
+
+  const se = { scrollTop: 0, scrollHeight: 2800 };
+  win.location.href = 'https://x.com/sample_me/with_replies';
+  win.document = {
+    documentElement: se,
+    scrollingElement: se,
+    querySelector: () => ({ scrollIntoView() {} }),
+    querySelectorAll: () => [{ scrollIntoView() {} }]
+  };
+  let scrollStepCount = 0;
+  const baseUrl = new URL(timelineFixtures.ownRepliesTimelineMixed.requestUrl);
+  const baseVars = JSON.parse(baseUrl.searchParams.get('variables'));
+  win.scrollTo = (_x, y) => {
+    se.scrollTop = y;
+    scrollStepCount += 1;
+    if (scrollStepCount === 1) {
+      const nextUrl = new URL(baseUrl.href);
+      nextUrl.searchParams.set('variables', JSON.stringify({ ...baseVars, cursor: 'scroll-p2' }));
+      queueMicrotask(() => {
+        win.fetch(nextUrl.href);
+      });
+    }
+  };
+
   const msg = (type, extra) => win.dispatchBridgeMessage({ type, protocol: 'SPARKLINK_BRIDGE_V1', nonce: 'history_cursor', ...extra });
   const state = { collectionEnabled: true, captureSessionId: BINDING_A.captureSessionId, bindingContext: BINDING_A,
     historyScope: { id: 'job', actor: BINDING_A.actorUserId, deadline: clock + 300000, query: null } };
   installMainInterceptor(win, adapterApi);
   msg('BRIDGE_INIT', state);
   const grant = { jobId: 'job', bindingId: BINDING_A.bindingId };
-  const url = timelineFixtures.ownRepliesTimelineMixed.requestUrl;
   const pages = () => outboundMessages.filter(m => m.data.historyPage);
   const waitPage = async (num) => {
-    for (let i = 0; i < 100 && pages().length < num; ++i) await new Promise(r => setTimeout(r, 2));
+    for (let i = 0; i < 100 && pages().length < num; ++i) await new Promise(r => setTimeout(r, 5));
     assert.equal(pages().length, num);
   };
-  await win.fetch(url);
+
+  await win.fetch(baseUrl.href);
   await waitPage(1);
   assert.equal(pages()[0].data.historyPage.canPage, true);
+
+  // Unpaced grant (< 12s since page 1) must be ignored
   msg('HISTORY_NEXT', grant);
+  assert.equal(scrollStepCount, 0);
   assert.equal(requests.length, 1);
+
   clock += 12000;
   msg('HISTORY_NEXT', { ...grant, jobId: 'stale' });
   msg('HISTORY_NEXT', grant);
   msg('HISTORY_NEXT', grant);
   await waitPage(2);
+
   assert.equal(requests.length, 2);
-  const request = requests[1].input;
-  const next = new URL(request.url);
-  assert.equal(next.origin + next.pathname, url.split('?')[0]);
-  assert.deepEqual(JSON.parse(next.searchParams.get('variables')), { ...JSON.parse(new URL(url).searchParams.get('variables')), cursor: 'page-two' });
-  assert.equal(request.redirect, 'error');
+  const secondVars = JSON.parse(new URL(requests[1].url).searchParams.get('variables'));
+  assert.equal(secondVars.cursor, 'scroll-p2');
+  // Page 2 echoed the same 'scroll-p2' cursor, which was marked used before scrolling -> ended & canPage: false
   assert.equal(pages()[1].data.historyPage.canPage, false);
-  assert.ok(pages().every(m => !JSON.stringify(m).includes('page-two')));
+  assert.equal(pages()[1].data.historyPage.ended, true);
+  assert.ok(pages().every(m => !JSON.stringify(m).includes('scroll-p2')));
+
   msg('SYNC_STATE', { ...state, historyScope: null });
   clock += 12000;
   msg('HISTORY_NEXT', grant);
@@ -687,12 +725,40 @@ test('Daily search received before document binding waits for that viewer; ordin
   assert.equal(pages()[0].data.historyPage.searchQuery, query);
 });
 
-test('XHR with custom headers (including x-client-transaction-id) supports timeline and search cursor pagination, and buffers pre-binding timeline', async (t) => {
+test('Pre-binding XHR buffers cleanly and both timeline and search XHR paginate via scrollScan with accurate empty-page ended detection', async (t) => {
   let clock = Date.now();
   t.mock.method(Date, 'now', () => clock);
-  const fetchRequests = [];
+  const syntheticFetchCalls = [];
   const query = 'from:sample_me filter:replies since:2026-11-16 until:2026-11-17';
-  const searchPayload = {
+
+  const replyPage1 = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  replyPage1.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'xhr-cursor-2' }
+  });
+  // Empty page 2 with only a new cursor: because 'xhr-cursor-2' was marked used BEFORE scrolling, usedCursors.size > 0 && !hasTweets must set ended = true!
+  const emptyReplyPage2 = {
+    data: {
+      user: {
+        result: {
+          timeline_v2: {
+            timeline: {
+              instructions: [
+                {
+                  type: 'TimelineAddEntries',
+                  entries: [
+                    { entryId: 'cursor-bottom-2', content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'xhr-cursor-3' } }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const searchPage1 = {
     data: {
       search_by_raw_query: {
         search_timeline: {
@@ -711,24 +777,47 @@ test('XHR with custom headers (including x-client-transaction-id) supports timel
       }
     }
   };
-  const replyPayload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
-  const replyEntries = replyPayload.data.user.result.timeline_v2.timeline.instructions[0].entries;
-  for (const e of replyEntries) if (e.content?.cursorType === 'Bottom') e.content.value = 'xhr-cursor-2';
-  if (!replyEntries.some(e => e.content?.cursorType === 'Bottom')) {
-    replyEntries.push({ entryId: 'cursor-bottom', content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'xhr-cursor-2' } });
-  }
+  const searchPage2 = {
+    data: {
+      search_by_raw_query: {
+        search_timeline: {
+          timeline: {
+            instructions: [
+              {
+                type: 'TimelineAddEntries',
+                entries: []
+              }
+            ]
+          }
+        }
+      }
+    }
+  };
 
   const { win, FakeXHR, outboundMessages } = createMockEnvironment(async (input) => {
-    fetchRequests.push(input);
-    return new Response(JSON.stringify(
-      String(input.url).includes('SearchTimeline') ? searchPayload : replyPayload
-    ));
+    syntheticFetchCalls.push(input);
+    return new Response('{}', { status: 404 });
   });
-  FakeXHR.prototype.setRequestHeader = function (name, value) {
-    this._headers = this._headers || [];
-    this._headers.push([name, value]);
+  const se = { scrollTop: 0, scrollHeight: 2400 };
+  win.document = {
+    documentElement: se,
+    scrollingElement: se,
+    querySelector: () => null,
+    querySelectorAll: () => []
   };
   win.location.href = 'https://x.com/sample_me/with_replies';
+
+  const xhrUrlsSeen = [];
+  let scrollAction = null;
+  win.scrollTo = (_x, y) => {
+    se.scrollTop = y;
+    if (typeof scrollAction === 'function') {
+      const fn = scrollAction;
+      scrollAction = null;
+      queueMicrotask(fn);
+    }
+  };
+
   installMainInterceptor(win, adapterApi);
   const sync = (type, extra) => win.dispatchBridgeMessage({
     protocol: 'SPARKLINK_BRIDGE_V1', nonce: 'xhr_cursor', collectionEnabled: true, captureSessionId: 10, type, ...extra
@@ -736,115 +825,69 @@ test('XHR with custom headers (including x-client-transaction-id) supports timel
   const replyScope = { id: 'job1', actor: BINDING_A.actorUserId, deadline: clock + 300000, query: null };
   sync('BRIDGE_INIT', { bindingContext: null, historyScope: null });
 
-  // Pre-binding XHR with custom headers & x-client-transaction-id
+  // Pre-binding XHR arrives before bindingContext/historyScope; note DOM tweet cells are not rendered yet
   const xhr = new FakeXHR();
-  xhr.withCredentials = true;
   xhr.open('GET', timelineFixtures.ownRepliesTimelineMixed.requestUrl);
-  xhr.setRequestHeader('x-client-transaction-id', 'tx_abc_123');
-  xhr.setRequestHeader('x-twitter-active-user', 'yes');
   xhr.send();
-  xhr.dispatchLoad(200, replyPayload, 'json');
+  xhr.dispatchLoad(200, replyPage1, 'json');
 
-  // Binding + scope arrive afterward -> pendingTimeline and pendingTemplate promote cleanly
   sync('SYNC_STATE', { bindingContext: BINDING_A, historyScope: replyScope });
   const pages = () => outboundMessages.filter(m => m.data.historyPage);
   assert.equal(pages().length, 1);
   assert.equal(pages()[0].data.historyPage.canPage, true);
 
+  // Scroll triggers X's native XHR for page 2 carrying cursor 'xhr-cursor-2'
+  scrollAction = () => {
+    const u = new URL(timelineFixtures.ownRepliesTimelineMixed.requestUrl);
+    const v = JSON.parse(u.searchParams.get('variables'));
+    u.searchParams.set('variables', JSON.stringify({ ...v, cursor: 'xhr-cursor-2' }));
+    xhrUrlsSeen.push(u.href);
+    const xhr2 = new win.XMLHttpRequest();
+    xhr2.open('GET', u.href);
+    xhr2.send();
+    xhr2.dispatchLoad(200, emptyReplyPage2, 'json');
+  };
   clock += 12000;
   sync('HISTORY_NEXT', { jobId: 'job1', bindingId: BINDING_A.bindingId });
-  for (let i = 0; i < 100 && pages().length < 2; ++i) await new Promise(r => setTimeout(r, 2));
+  for (let i = 0; i < 100 && pages().length < 2; ++i) await new Promise(r => setTimeout(r, 5));
   assert.equal(pages().length, 2);
-  assert.equal(fetchRequests[0].headers.get('x-twitter-active-user'), 'yes');
-  assert.equal(fetchRequests[0].headers.get('x-client-transaction-id'), null);
+  assert.equal(JSON.parse(new URL(xhrUrlsSeen[0]).searchParams.get('variables')).cursor, 'xhr-cursor-2');
+  assert.equal(pages()[1].data.historyPage.ended, true);
+  assert.equal(pages()[1].data.historyPage.canPage, false);
 
-  // Search mode XHR pagination
+  // Search mode XHR pagination via scrollScan
   win.location.href = 'https://x.com/search?' + new URLSearchParams({ q: query, f: 'live' });
   const searchScope = { id: 'job1', actor: BINDING_A.actorUserId, deadline: clock + 300000, query };
   sync('SYNC_STATE', { bindingContext: BINDING_A, historyScope: searchScope });
   const searchUrl = 'https://x.com/i/api/graphql/Fix/SearchTimeline?variables=' +
     encodeURIComponent(JSON.stringify({ rawQuery: query, product: 'Latest' }));
-  xhr.open('GET', searchUrl);
-  xhr.setRequestHeader('x-client-transaction-id', 'tx_search_1');
-  xhr.send();
-  xhr.dispatchLoad(200, searchPayload, 'json');
+  const searchXhr1 = new win.XMLHttpRequest();
+  searchXhr1.open('GET', searchUrl);
+  searchXhr1.send();
+  searchXhr1.dispatchLoad(200, searchPage1, 'json');
   assert.equal(pages().length, 3);
   assert.equal(pages()[2].data.historyPage.canPage, true);
 
+  scrollAction = () => {
+    const nextSearchUrl = 'https://x.com/i/api/graphql/Fix/SearchTimeline?variables=' +
+      encodeURIComponent(JSON.stringify({ rawQuery: query, product: 'Latest', cursor: 'search-p2' }));
+    xhrUrlsSeen.push(nextSearchUrl);
+    const searchXhr2 = new win.XMLHttpRequest();
+    searchXhr2.open('GET', nextSearchUrl);
+    searchXhr2.send();
+    searchXhr2.dispatchLoad(200, searchPage2, 'json');
+  };
   clock += 12000;
   sync('HISTORY_NEXT', { jobId: 'job1', bindingId: BINDING_A.bindingId });
-  for (let i = 0; i < 100 && pages().length < 4; ++i) await new Promise(r => setTimeout(r, 2));
+  for (let i = 0; i < 100 && pages().length < 4; ++i) await new Promise(r => setTimeout(r, 5));
   assert.equal(pages().length, 4);
-  const nextSearchUrl = new URL(fetchRequests[1].url);
-  assert.equal(JSON.parse(nextSearchUrl.searchParams.get('variables')).cursor, 'search-p2');
+  assert.equal(JSON.parse(new URL(xhrUrlsSeen[1]).searchParams.get('variables')).cursor, 'search-p2');
+  assert.equal(pages()[3].data.historyPage.canPage, false);
+  // Zero extension-originated synthetic fetch calls ever occurred
+  assert.equal(syntheticFetchCalls.length, 0);
 });
 
-test('Direct timeline bootstrap discovers queryId from client-web scripts, self-heals missing features, and ends timeline cleanly without false search fallback', async (t) => {
-  let clock = Date.now();
-  t.mock.method(Date, 'now', () => clock);
-  const fetchCalls = [];
-  const page1Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
-  page1Payload.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
-    entryId: 'cursor-bottom-1',
-    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'direct-p2' }
-  });
-  const page2Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
-
-  let qidVersion = 'staleQid1';
-  const { win, outboundMessages } = createMockEnvironment(async (input) => {
-    const reqUrl = typeof input === 'string' ? input : input.url;
-    fetchCalls.push({ url: reqUrl, headers: input.headers || null });
-    if (reqUrl.includes('client-web/main.')) {
-      return new Response(
-        `blah;queryId:"${qidVersion}",operationName:"UserTweetsAndReplies",operationType:"query",metadata:{featureSwitches:["view_counts_everywhere_api_enabled"],fieldToggles:["withArticlePlainText"]};blah`,
-        { status: 200 }
-      );
-    }
-    if (reqUrl.includes('staleQid1/UserTweetsAndReplies')) {
-      qidVersion = 'freshQid2';
-      return new Response('{}', { status: 404 });
-    }
-    if (reqUrl.includes('freshQid2/UserTweetsAndReplies')) {
-      const vars = JSON.parse(new URL(reqUrl).searchParams.get('variables'));
-      const feats = JSON.parse(new URL(reqUrl).searchParams.get('features') || '{}');
-      if (!feats.rweb_extra_required_flag) {
-        return new Response(
-          JSON.stringify({ errors: [{ message: 'The following features cannot be null: rweb_extra_required_flag' }] }),
-          { status: 400 }
-        );
-      }
-      return new Response(JSON.stringify(vars.cursor ? page2Payload : page1Payload), { status: 200 });
-    }
-    return new Response('{}', { status: 404 });
-  });
-  win.location.href = 'https://x.com/sample_me';
-  win.document = {
-    documentElement: { lang: 'zh-cn' },
-    scripts: [{ src: 'https://abs.twimg.com/responsive-web/client-web/main.123.js' }],
-    querySelectorAll: () => []
-  };
-  installMainInterceptor(win, adapterApi);
-  const sync = (type, extra) => win.dispatchBridgeMessage({
-    protocol: 'SPARKLINK_BRIDGE_V1', nonce: 'direct_boot', collectionEnabled: true, captureSessionId: 10, type, ...extra
-  });
-  const scope = { id: 'job_direct', actor: BINDING_A.actorUserId, since: clock - 7 * 86400000, deadline: clock + 300000, query: null };
-  sync('BRIDGE_INIT', { bindingContext: BINDING_A, historyScope: scope });
-
-  const pages = () => outboundMessages.filter(m => m.data.historyPage);
-  for (let i = 0; i < 150 && pages().length < 1; ++i) await new Promise(r => setTimeout(r, 10));
-  assert.equal(pages().length, 1);
-  assert.equal(pages()[0].data.historyPage.canPage, true);
-  assert.equal(pages()[0].data.historyPage.ended, false);
-
-  clock += 12000;
-  sync('HISTORY_NEXT', { jobId: 'job_direct', bindingId: BINDING_A.bindingId });
-  for (let i = 0; i < 100 && pages().length < 2; ++i) await new Promise(r => setTimeout(r, 5));
-  assert.equal(pages().length, 2);
-  assert.equal(pages()[1].data.historyPage.canPage, false);
-  assert.equal(pages()[1].data.historyPage.ended, true);
-});
-
-test('Failed direct bootstrap (HTTP 403/404) never emits unrecognized stop, and HISTORY_NEXT uses scrollScan to capture native pagination first', async (t) => {
+test('scrollScan never issues synthetic fetches on timeout and extends grace wait when a native request is in flight', async (t) => {
   let clock = Date.now();
   t.mock.method(Date, 'now', () => clock);
   const page1Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
@@ -853,45 +896,48 @@ test('Failed direct bootstrap (HTTP 403/404) never emits unrecognized stop, and 
     content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'scroll-p2' }
   });
   const page2Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
-
-  let nativeFetches = 0;
-  const scrollTargets = [];
-  const { win, outboundMessages } = createMockEnvironment(async (input) => {
-    const reqUrl = typeof input === 'string' ? input : input.url;
-    if (reqUrl.includes('client-web/main.')) {
-      return new Response('queryId:"bootQid",operationName:"UserTweetsAndReplies"', { status: 200 });
-    }
-    if (reqUrl.includes('bootQid/UserTweetsAndReplies')) {
-      return new Response('{}', { status: 403 });
-    }
-    nativeFetches += 1;
-    return new Response(JSON.stringify(page2Payload), { status: 200 });
+  page2Payload.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom-2',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'scroll-p3' }
   });
 
-  win.location.href = 'https://x.com/sample_me';
+  const networkCalls = [];
+  let resolveSlowNative = null;
+  const { win, outboundMessages } = createMockEnvironment((input) => {
+    const reqUrl = typeof input === 'string' ? input : input.url;
+    networkCalls.push(reqUrl);
+    if (reqUrl.includes('scroll-p2')) {
+      return new Promise((resolve) => {
+        resolveSlowNative = () => resolve(new Response(JSON.stringify(page2Payload), { status: 200 }));
+      });
+    }
+    return Promise.resolve(new Response(JSON.stringify(page1Payload), { status: 200 }));
+  });
+
   const se = { scrollTop: 0, scrollHeight: 3000 };
+  win.location.href = 'https://x.com/sample_me/with_replies';
   win.document = {
     documentElement: se,
     scrollingElement: se,
     scripts: [{ src: 'https://abs.twimg.com/responsive-web/client-web/main.abc.js' }],
-    querySelector(sel) {
-      return sel.includes('cellInnerDiv') ? { scrollIntoView() {} } : null;
-    },
-    querySelectorAll() {
-      return [{ scrollIntoView() {} }];
-    }
+    querySelector: () => ({ scrollIntoView() {} }),
+    querySelectorAll: () => [{ scrollIntoView() {} }]
   };
-  let scrolledTrigger = false;
+
+  const scrollTargets = [];
+  const baseUrl = new URL(timelineFixtures.ownRepliesTimelineMixed.requestUrl);
+  const baseVars = JSON.parse(baseUrl.searchParams.get('variables'));
+  let triggerSlowNativeOnScroll = true;
   win.scrollTo = (_x, y) => {
     scrollTargets.push(y);
     se.scrollTop = y;
-    if (!scrolledTrigger && nativeFetches === 0 && outboundMessages.some((m) => m.data.historyPage)) {
-      scrolledTrigger = true;
-      const p2Url = timelineFixtures.ownRepliesTimelineMixed.requestUrl.replace(
-        encodeURIComponent('{}'),
-        encodeURIComponent(JSON.stringify({ userId: BINDING_A.actorUserId, cursor: 'scroll-p2' }))
-      );
-      queueMicrotask(() => { win.fetch(p2Url); });
+    if (triggerSlowNativeOnScroll) {
+      triggerSlowNativeOnScroll = false;
+      const slowUrl = new URL(baseUrl.href);
+      slowUrl.searchParams.set('variables', JSON.stringify({ ...baseVars, cursor: 'scroll-p2' }));
+      queueMicrotask(() => {
+        win.fetch(slowUrl.href);
+      });
     }
   };
 
@@ -902,29 +948,46 @@ test('Failed direct bootstrap (HTTP 403/404) never emits unrecognized stop, and 
   const scope = { id: 'job_scroll', actor: BINDING_A.actorUserId, since: clock - 7 * 86400000, deadline: clock + 300000, query: null };
   sync('BRIDGE_INIT', { bindingContext: BINDING_A, historyScope: scope });
 
-  // Wait past bootstrap timer (350ms): 403 on synthetic bootstrap must NOT trigger HISTORY_STOP
-  await new Promise((r) => setTimeout(r, 420));
-  assert.equal(outboundMessages.filter((m) => m.data.type === 'HISTORY_STOP').length, 0);
+  // Ensure zero script-bundle or bootstrap fetches happen on BRIDGE_INIT
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(networkCalls.length, 0);
 
-  // Navigate to /with_replies -> X loads Page 1 natively
-  win.location.href = 'https://x.com/sample_me/with_replies';
-  const origFetch = win.fetch;
-  // Simulate X firing Page 1 via XHR or fetch with real page1Payload
-  const xhr = new win.XMLHttpRequest();
-  xhr.open('GET', timelineFixtures.ownRepliesTimelineMixed.requestUrl);
-  xhr.send();
-  xhr.dispatchLoad(200, page1Payload, 'json');
-
+  // Page 1 arrives natively
+  await win.fetch(baseUrl.href);
   const pages = () => outboundMessages.filter((m) => m.data.historyPage);
+  for (let i = 0; i < 50 && pages().length < 1; ++i) await new Promise((r) => setTimeout(r, 5));
   assert.equal(pages().length, 1);
   assert.equal(pages()[0].data.historyPage.canPage, true);
 
-  // Advance 12s and send HISTORY_NEXT -> must scroll and capture X's native page 2 fetch
+  // Start scrollScan -> triggers slow native request with cursor 'scroll-p2'
   clock += 12000;
   sync('HISTORY_NEXT', { jobId: 'job_scroll', bindingId: BINDING_A.bindingId });
-  for (let i = 0; i < 100 && pages().length < 2; ++i) await new Promise((r) => setTimeout(r, 10));
-  assert.ok(scrollTargets.length >= 1);
+  for (let i = 0; i < 50 && !resolveSlowNative; ++i) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(typeof resolveSlowNative, 'function');
+  assert.equal(JSON.parse(new URL(networkCalls[1]).searchParams.get('variables')).cursor, 'scroll-p2');
+
+  // Advance clock past initial 3500ms scrollDeadline while nativeRequestsInFlight > 0 -> must keep waiting without firing any synthetic fallback
+  clock += 4000;
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(networkCalls.length, 2);
+  resolveSlowNative();
+  for (let i = 0; i < 100 && pages().length < 2; ++i) await new Promise((r) => setTimeout(r, 5));
   assert.equal(pages().length, 2);
-  assert.equal(pages()[1].data.historyPage.ended, true);
-  assert.equal(typeof origFetch, 'function');
+  assert.equal(pages()[1].data.historyPage.canPage, true);
+
+  // Next scrollScan when X produces NO network request -> times out cleanly with 0 synthetic requests and 0 HISTORY_STOP
+  clock += 12000;
+  sync('HISTORY_NEXT', { jobId: 'job_scroll', bindingId: BINDING_A.bindingId });
+  await new Promise((r) => setTimeout(r, 30));
+  clock += 4000;
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(networkCalls.length, 2);
+  assert.equal(outboundMessages.filter((m) => m.data.type === 'HISTORY_STOP').length, 0);
+
+  // Even after another 12s, 'scroll-p3' was already consumed before scrolling, so duplicate HISTORY_NEXT will not re-scroll the same cursor
+  const prevScrollCount = scrollTargets.length;
+  clock += 12000;
+  sync('HISTORY_NEXT', { jobId: 'job_scroll', bindingId: BINDING_A.bindingId });
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(scrollTargets.length, prevScrollCount);
 });

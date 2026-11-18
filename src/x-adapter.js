@@ -13,6 +13,7 @@
   const WHITELISTED_OPERATIONS = Object.freeze({
     CreateTweet: { category: 'create_tweet', methods: new Set(['POST']) },
     Viewer: { category: 'viewer', methods: new Set(['GET', 'POST']) },
+    SearchTimeline: { category: 'manual_search', methods: new Set(['GET']) },
     UserTweetsAndReplies: { category: 'replies_timeline', methods: new Set(['GET']) },
     TweetDetail: { category: 'author_mapping', methods: new Set(['GET']) },
     HomeTimeline: { category: 'author_mapping', methods: new Set(['GET', 'POST']) },
@@ -31,7 +32,7 @@
 
   function hasDangerousOwnKeys(value, depth) {
     const currentDepth = typeof depth === 'number' ? depth : 0;
-    if (currentDepth > 32) {
+    if (currentDepth > 128) {
       return true;
     }
     if (value === null || typeof value !== 'object') {
@@ -60,6 +61,16 @@
 
   function isValidDecimalId(value) {
     return typeof value === 'string' && DECIMAL_ID_RE.test(value);
+  }
+
+  function compareDecimalIds(a, b) {
+    if (a === b) {
+      return 0;
+    }
+    if (a.length !== b.length) {
+      return a.length < b.length ? -1 : 1;
+    }
+    return a < b ? -1 : 1;
   }
 
   function sanitizeHandle(value) {
@@ -107,37 +118,40 @@
     } catch (_err) {
       return null;
     }
-    if (!ALLOWED_ORIGINS.has(parsed.origin)) {
-      return null;
-    }
+    const webRoute = ALLOWED_ORIGINS.has(parsed.origin) && /^\/i\/api\/graphql\//.test(parsed.pathname);
+    const apiRoute = ['https://api.x.com', 'https://api.twitter.com'].includes(parsed.origin) &&
+      /^\/graphql\//.test(parsed.pathname);
+    if (!webRoute && !apiRoute) return null;
+    const path = parsed.pathname.match(/^(?:\/i\/api)?\/graphql\/([^/]+)\/([^/]+)$/);
+    if (!path || !SAFE_QUERY_ID_RE.test(path[1])) return null;
+    const operationName = path[2];
     const normalizedMethod = method.toUpperCase();
-    const parts = parsed.pathname.split('/').filter(Boolean);
-    // Expected: ['i', 'api', 'graphql', '<queryId>', '<operationName>']
-    if (
-      parts.length === 5 &&
-      parts[0] === 'i' &&
-      parts[1] === 'api' &&
-      parts[2] === 'graphql'
-    ) {
-      const queryId = parts[3];
-      const operationName = parts[4];
-      if (!SAFE_QUERY_ID_RE.test(queryId)) {
-        return null;
-      }
-      if (!Object.prototype.hasOwnProperty.call(WHITELISTED_OPERATIONS, operationName)) {
-        return null;
-      }
-      const spec = WHITELISTED_OPERATIONS[operationName];
-      if (!spec.methods.has(normalizedMethod)) {
-        return null;
-      }
-      return {
-        operationName,
-        category: spec.category,
-        method: normalizedMethod
-      };
+    const spec = Object.hasOwn(WHITELISTED_OPERATIONS, operationName) && WHITELISTED_OPERATIONS[operationName];
+    if (!spec || !spec.methods.has(normalizedMethod)) return null;
+    const match = { operationName, category: spec.category, method: normalizedMethod };
+    if (operationName === 'UserTweetsAndReplies' || operationName === 'SearchTimeline') {
+      try {
+        const raw = parsed.searchParams.get('variables');
+        const vars = raw && raw.length < 8192 && JSON.parse(raw);
+        const uid = typeof vars?.userId === 'number' ? String(vars.userId) : vars?.userId;
+        if (isValidDecimalId(uid)) match.requestedUserId = uid;
+        if (operationName === 'SearchTimeline') {
+          const validCursor =
+            vars?.cursor === undefined ||
+            (typeof vars.cursor === 'string' && vars.cursor.length > 0 && vars.cursor.length <= 4096);
+          if (
+            vars?.product !== 'Latest' ||
+            !validCursor ||
+            typeof vars.rawQuery !== 'string' ||
+            !/^from:[A-Za-z0-9_]{1,64} filter:replies since:\d{4}-\d{2}-\d{2}(?: until:\d{4}-\d{2}-\d{2})?$/.test(vars.rawQuery)
+          ) {
+            return null;
+          }
+          match.searchQuery = vars.rawQuery;
+        }
+      } catch { if (operationName === 'SearchTimeline') return null; }
     }
-    return null;
+    return match;
   }
 
   function extractUserFieldsFromGraphqlNode(userNode) {
@@ -345,12 +359,41 @@
       legacy && isValidDecimalId(legacy.in_reply_to_status_id_str)
         ? legacy.in_reply_to_status_id_str
         : null;
-    const directTargetUserId =
+    let directTargetUserId =
       legacy && isValidDecimalId(legacy.in_reply_to_user_id_str)
         ? legacy.in_reply_to_user_id_str
         : null;
-    const directTargetHandle =
+    let directTargetHandle =
       legacy ? sanitizeHandle(legacy.in_reply_to_screen_name) : null;
+    let directTargetDisplayName = null;
+    const mentions =
+      legacy && isPlainObject(legacy.entities) && Array.isArray(legacy.entities.user_mentions)
+        ? legacy.entities.user_mentions
+        : null;
+    if (mentions && (directTargetUserId || directTargetHandle)) {
+      for (let i = 0; i < mentions.length; i += 1) {
+        const m = mentions[i];
+        if (!isPlainObject(m)) {
+          continue;
+        }
+        const mId = isValidDecimalId(m.id_str) ? m.id_str : null;
+        const mHandle = sanitizeHandle(m.screen_name);
+        const matchesId = Boolean(directTargetUserId && mId === directTargetUserId);
+        const matchesHandle = Boolean(
+          directTargetHandle && mHandle && mHandle.toLowerCase() === directTargetHandle.toLowerCase()
+        );
+        if (matchesId || matchesHandle) {
+          if (!directTargetUserId && mId) {
+            directTargetUserId = mId;
+          }
+          if (!directTargetHandle && mHandle) {
+            directTargetHandle = mHandle;
+          }
+          directTargetDisplayName = sanitizeDisplayName(m.name);
+          break;
+        }
+      }
+    }
     const isRetweet = Boolean(
       legacy && isPlainObject(legacy.retweeted_status_result)
     );
@@ -369,6 +412,7 @@
       parentTweetId,
       directTargetUserId,
       directTargetHandle,
+      directTargetDisplayName,
       isRetweet,
       retweetNode,
       quotedNode,
@@ -792,12 +836,134 @@
       };
     }
 
-    function collectTimelineTweetItems(instructions) {
+    function isRecognizableTimelineInstruction(inst) {
+      if (!isPlainObject(inst)) {
+        return { recognizable: false, broken: false };
+      }
+      if (typeof inst.type === 'string') {
+        switch (inst.type) {
+          case 'TimelineAddEntries':
+            return Array.isArray(inst.entries)
+              ? { recognizable: true, broken: false }
+              : { recognizable: false, broken: true };
+          case 'TimelineAddToModule':
+            return Array.isArray(inst.moduleItems)
+              ? { recognizable: true, broken: false }
+              : { recognizable: false, broken: true };
+          case 'TimelinePinEntry':
+          case 'TimelineReplaceEntry':
+            return { recognizable: isPlainObject(inst.entry), broken: false };
+          case 'TimelineTerminateTimeline':
+            return {
+              recognizable: typeof inst.direction === 'string' && inst.direction.length > 0,
+              broken: false
+            };
+          case 'TimelineClearCache':
+          case 'TimelineShowAlert':
+          case 'TimelineRemoveEntries':
+          case 'TimelineClearEntriesUnreadState':
+          case 'TimelineMarkEntriesUnreadGreaterThanSortIndex':
+            return { recognizable: true, broken: false };
+          default:
+            return { recognizable: false, broken: false };
+        }
+      }
+      const hasLegacyShape =
+        Array.isArray(inst.entries) ||
+        isPlainObject(inst.entry) ||
+        Array.isArray(inst.moduleItems);
+      return { recognizable: hasLegacyShape, broken: false };
+    }
+
+    function hasRecognizableTimelineInstructions(instructions) {
+      if (!Array.isArray(instructions) || instructions.length === 0) {
+        return false;
+      }
+      let recognizableCount = 0;
+      for (let i = 0; i < instructions.length; i += 1) {
+        const check = isRecognizableTimelineInstruction(instructions[i]);
+        if (check.broken) {
+          return false;
+        }
+        if (check.recognizable) {
+          recognizableCount += 1;
+        }
+      }
+      return recognizableCount > 0;
+    }
+
+    function isCursorObject(obj) {
+      return (
+        isPlainObject(obj) &&
+        (obj.entryType === 'TimelineTimelineCursor' ||
+          obj.itemType === 'TimelineTimelineCursor' ||
+          obj.__typename === 'TimelineTimelineCursor' ||
+          typeof obj.cursorType === 'string')
+      );
+    }
+
+    function getCursorDirection(entryId, contentObj, itemContentObj) {
+      if (isCursorObject(contentObj)) {
+        return typeof contentObj.cursorType === 'string'
+          ? contentObj.cursorType.toLowerCase()
+          : 'unknown';
+      }
+      if (isCursorObject(itemContentObj)) {
+        return typeof itemContentObj.cursorType === 'string'
+          ? itemContentObj.cursorType.toLowerCase()
+          : 'unknown';
+      }
+      if (typeof entryId === 'string') {
+        if (/^cursor-bottom(?:-|$)/i.test(entryId)) {
+          return 'bottom';
+        }
+        if (/^cursor-top(?:-|$)/i.test(entryId)) {
+          return 'top';
+        }
+      }
+      return null;
+    }
+
+    function isExplicitTweetItemContent(itemContent, entryId) {
+      if (
+        isPlainObject(itemContent) &&
+        (itemContent.itemType === 'TimelineTweet' ||
+          itemContent.__typename === 'TimelineTweet' ||
+          isPlainObject(itemContent.tweet_results))
+      ) {
+        return true;
+      }
+      return typeof entryId === 'string' && /(?:^|-)tweet-\d+$/.test(entryId);
+    }
+
+    function collectTimelineTweetItems(instructions, actorUserId) {
       const primaryTweets = [];
       const auxiliaryTweets = [];
       let unrecognizedTweetCount = 0;
+      const historyMeta = {
+        eligiblePrimaryItems: [],
+        hasUnknownPrimaryTweet: false,
+        hasMissingCreatedAt: false,
+        hasBottomCursor: false,
+        hasTerminateBottom: false,
+        hasTerminateTop: false,
+        hasEmptyAddEntries: false,
+        hasNonEmptyAddEntries: false,
+        hasAddToModuleItems: false
+      };
       if (!Array.isArray(instructions)) {
-        return { primaryTweets, auxiliaryTweets, unrecognizedTweetCount };
+        return { primaryTweets, auxiliaryTweets, unrecognizedTweetCount, historyMeta };
+      }
+
+      // An unrecognized slot can conceal a recent primary tweet. Known tombstones
+      // and foreign or retweeted posts carry no boundary evidence.
+      function recordBoundaryItem(parsed) {
+        if (parsed === undefined || (parsed && !parsed.authorUserId)) {
+          historyMeta.hasUnknownPrimaryTweet = true;
+        } else if (parsed && !parsed.isRetweet && parsed.authorUserId === actorUserId) {
+          historyMeta.eligiblePrimaryItems.push(parsed);
+          if (!parsed.createdAt) historyMeta.hasMissingCreatedAt = true;
+        }
       }
 
       function inspectItemContent(itemContent) {
@@ -817,14 +983,23 @@
           }
           return;
         }
-        const rawRes = isPlainObject(itemContent.tweet_results.result)
+        if (Object.keys(itemContent.tweet_results).length === 0) {
+          return null;
+        }
+        let rawRes = isPlainObject(itemContent.tweet_results.result)
           ? itemContent.tweet_results.result
           : itemContent.tweet_results;
+        if (isPlainObject(rawRes) && rawRes.__typename === 'TweetWithVisibilityResults' && isPlainObject(rawRes.tweet)) {
+          rawRes = rawRes.tweet;
+        }
         if (
-          isPlainObject(rawRes) &&
-          (rawRes.__typename === 'TweetTombstone' || rawRes.__typename === 'TweetUnavailable')
+          !isPlainObject(rawRes) ||
+          Object.keys(rawRes).length === 0 ||
+          rawRes.__typename === 'TweetTombstone' ||
+          rawRes.__typename === 'TweetUnavailable' ||
+          rawRes.__typename === 'TweetPreviewDisplay'
         ) {
-          return;
+          return null;
         }
         const parsed = extractTweetCoreFields(itemContent.tweet_results);
         if (!parsed) {
@@ -844,34 +1019,89 @@
             auxiliaryTweets.push(qtParsed);
           }
         }
+        return parsed;
       }
 
-      function inspectEntry(entry) {
+      function inspectModuleItems(items, isPinnedEntry) {
+        let hasLeaf = false;
+        let leaf;
+        for (let i = 0; i < items.length; i += 1) {
+          const modItem = items[i];
+          if (!isPlainObject(modItem) || !isPlainObject(modItem.item)) {
+            continue;
+          }
+          const itemContent = modItem.item.itemContent;
+          let parsed;
+          if (isPlainObject(itemContent)) {
+            parsed = inspectItemContent(itemContent);
+          } else if (
+            typeof modItem.entryId === 'string' &&
+            /(?:^|-)tweet-\d+$/.test(modItem.entryId)
+          ) {
+            unrecognizedTweetCount += 1;
+          }
+
+          if (!actorUserId || isPinnedEntry) continue;
+          const cursorDir = getCursorDirection(modItem.entryId, modItem.item, itemContent);
+          if (cursorDir) {
+            continue;
+          }
+          const isModPromoted =
+            (typeof modItem.entryId === 'string' && /^promoted(?:-|$)/i.test(modItem.entryId)) ||
+            isPlainObject(modItem.item.promotedMetadata) ||
+            (isPlainObject(itemContent) && isPlainObject(itemContent.promotedMetadata));
+          if (isModPromoted) {
+            continue;
+          }
+          if (isExplicitTweetItemContent(itemContent, modItem.entryId)) {
+            hasLeaf = true;
+            leaf = parsed;
+          }
+        }
+        // Only the leaf tweet slot in a conversation module reflects the thread's timeline position,
+        // preventing an old conversation parent from masquerading as a recent thread position.
+        if (hasLeaf) recordBoundaryItem(leaf);
+      }
+
+      function inspectEntry(entry, isPinnedInstruction) {
         if (!isPlainObject(entry) || !isPlainObject(entry.content)) {
           return;
         }
         const content = entry.content;
-        if (isPlainObject(content.itemContent)) {
-          inspectItemContent(content.itemContent);
-        } else if (Array.isArray(content.items)) {
-          for (let i = 0; i < content.items.length; i += 1) {
-            const modItem = content.items[i];
-            if (isPlainObject(modItem) && isPlainObject(modItem.item)) {
-              if (isPlainObject(modItem.item.itemContent)) {
-                inspectItemContent(modItem.item.itemContent);
-              } else if (
-                typeof modItem.entryId === 'string' &&
-                /(?:^|-)tweet-\d+$/.test(modItem.entryId)
-              ) {
-                unrecognizedTweetCount += 1;
-              }
-            }
+        const entryPinned =
+          isPinnedInstruction ||
+          (typeof entry.entryId === 'string' && /^pinned(?:-|$)/i.test(entry.entryId));
+        const cursorDir = getCursorDirection(entry.entryId, content, content.itemContent);
+        if (cursorDir) {
+          if (cursorDir === 'bottom') {
+            historyMeta.hasBottomCursor = true;
           }
+          return;
+        }
+        const entryPromoted =
+          (typeof entry.entryId === 'string' && /^promoted(?:-|$)/i.test(entry.entryId)) ||
+          isPlainObject(content.promotedMetadata) ||
+          (isPlainObject(content.itemContent) && isPlainObject(content.itemContent.promotedMetadata));
+
+        if (isPlainObject(content.itemContent)) {
+          const parsed = inspectItemContent(content.itemContent);
+          if (
+            actorUserId && !entryPinned &&
+            !entryPromoted &&
+            isExplicitTweetItemContent(content.itemContent, entry.entryId)
+          ) {
+            recordBoundaryItem(parsed);
+          }
+        } else if (Array.isArray(content.items)) {
+          inspectModuleItems(content.items, entryPinned || entryPromoted);
         } else if (
           typeof entry.entryId === 'string' &&
           /^tweet-\d+$/.test(entry.entryId)
         ) {
           unrecognizedTweetCount += 1;
+          if (!entryPinned && !entryPromoted) {
+            historyMeta.hasUnknownPrimaryTweet = true;
+          }
         }
       }
 
@@ -880,25 +1110,114 @@
         if (!isPlainObject(inst)) {
           continue;
         }
+        const isPinnedInstruction = inst.type === 'TimelinePinEntry';
+        if (inst.type === 'TimelineTerminateTimeline' && typeof inst.direction === 'string') {
+          const dir = inst.direction.toLowerCase();
+          if (dir === 'bottom' || dir === 'topandbottom') {
+            historyMeta.hasTerminateBottom = true;
+          } else if (dir === 'top') {
+            historyMeta.hasTerminateTop = true;
+          }
+        }
         if (Array.isArray(inst.entries)) {
+          if (inst.type === 'TimelineAddEntries') {
+            if (inst.entries.length === 0) {
+              historyMeta.hasEmptyAddEntries = true;
+            } else {
+              historyMeta.hasNonEmptyAddEntries = true;
+            }
+          }
           for (let j = 0; j < inst.entries.length; j += 1) {
-            inspectEntry(inst.entries[j]);
+            inspectEntry(inst.entries[j], isPinnedInstruction);
           }
         }
         if (isPlainObject(inst.entry)) {
-          inspectEntry(inst.entry);
+          inspectEntry(inst.entry, isPinnedInstruction);
         }
         if (Array.isArray(inst.moduleItems)) {
-          for (let j = 0; j < inst.moduleItems.length; j += 1) {
-            const modItem = inst.moduleItems[j];
-            if (isPlainObject(modItem) && isPlainObject(modItem.item)) {
-              inspectItemContent(modItem.item.itemContent);
-            }
+          if (inst.moduleItems.length > 0) {
+            historyMeta.hasAddToModuleItems = true;
           }
+          inspectModuleItems(inst.moduleItems, isPinnedInstruction);
         }
       }
 
-      return { primaryTweets, auxiliaryTweets, unrecognizedTweetCount };
+      return { primaryTweets, auxiliaryTweets, unrecognizedTweetCount, historyMeta };
+    }
+
+    function buildHistoryPage(historyMeta) {
+      const ended = Boolean(
+        historyMeta.hasTerminateBottom ||
+          (historyMeta.hasEmptyAddEntries &&
+            !historyMeta.hasNonEmptyAddEntries &&
+            !historyMeta.hasAddToModuleItems &&
+            !historyMeta.hasBottomCursor &&
+            !historyMeta.hasTerminateTop)
+      );
+
+      if (
+        historyMeta.hasUnknownPrimaryTweet ||
+        historyMeta.hasMissingCreatedAt ||
+        historyMeta.eligiblePrimaryItems.length === 0
+      ) {
+        let fallbackPageKey = null;
+        if (!historyMeta.hasUnknownPrimaryTweet && historyMeta.eligiblePrimaryItems.length > 0) {
+          let newest = historyMeta.eligiblePrimaryItems[0];
+          for (let i = 1; i < historyMeta.eligiblePrimaryItems.length; i += 1) {
+            const cand = historyMeta.eligiblePrimaryItems[i];
+            if (compareDecimalIds(cand.tweetId, newest.tweetId) > 0) {
+              newest = cand;
+            }
+          }
+          fallbackPageKey = newest.tweetId;
+        }
+        return {
+          newestAt: null,
+          ended,
+          pageKey: fallbackPageKey
+        };
+      }
+
+      let newest = historyMeta.eligiblePrimaryItems[0];
+      for (let i = 1; i < historyMeta.eligiblePrimaryItems.length; i += 1) {
+        const cand = historyMeta.eligiblePrimaryItems[i];
+        if (
+          cand.createdAt > newest.createdAt ||
+          (cand.createdAt === newest.createdAt &&
+            compareDecimalIds(cand.tweetId, newest.tweetId) > 0)
+        ) {
+          newest = cand;
+        }
+      }
+
+      return {
+        newestAt: newest.createdAt,
+        ended,
+        pageKey: newest.tweetId
+      };
+    }
+
+    function findInstructionsDeep(node, depth) {
+      const d = typeof depth === 'number' ? depth : 0;
+      if (d > 12 || !node || typeof node !== 'object') {
+        return null;
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i += 1) {
+          const found = findInstructionsDeep(node[i], d + 1);
+          if (found) return found;
+        }
+        return null;
+      }
+      if (Array.isArray(node.instructions)) {
+        return node.instructions;
+      }
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i += 1) {
+        const found = findInstructionsDeep(node[keys[i]], d + 1);
+        if (found) return found;
+      }
+      return null;
     }
 
     function extractInstructionsAndOwner(operationName, payload) {
@@ -918,20 +1237,24 @@
         const userResult =
           isPlainObject(data.user) && isPlainObject(data.user.result)
             ? data.user.result
-            : null;
+            : isPlainObject(data.user_result) && isPlainObject(data.user_result.result)
+              ? data.user_result.result
+              : isPlainObject(data.user_results) && isPlainObject(data.user_results.result)
+                ? data.user_results.result
+                : null;
         if (!userResult) {
           return { instructions: null, timelineOwnerId: null, singleUser: null };
         }
         const ownerUser = extractUserFieldsFromGraphqlNode(userResult);
         const timelineObj = isPlainObject(userResult.timeline_v2)
-          ? userResult.timeline_v2.timeline
+          ? userResult.timeline_v2.timeline || userResult.timeline_v2
           : isPlainObject(userResult.timeline)
             ? userResult.timeline.timeline || userResult.timeline
             : null;
         const instructions =
           isPlainObject(timelineObj) && Array.isArray(timelineObj.instructions)
             ? timelineObj.instructions
-            : null;
+            : findInstructionsDeep(userResult, 0);
         return {
           instructions,
           timelineOwnerId: ownerUser ? ownerUser.userId : null,
@@ -939,6 +1262,15 @@
         };
       }
 
+      if (operationName === 'SearchTimeline') {
+        const timeline =
+          data.search_by_raw_query?.search_timeline?.timeline ||
+          data.search_by_raw_query?.search_timeline;
+        const instructions = Array.isArray(timeline?.instructions)
+          ? timeline.instructions
+          : findInstructionsDeep(data.search_by_raw_query, 0);
+        return { instructions, timelineOwnerId: null, singleUser: null };
+      }
       if (operationName === 'TweetDetail') {
         const tc = data.threaded_conversation_with_injections_v2;
         const instructions =
@@ -992,11 +1324,19 @@
 
       const observedUsers = [];
       const observedTweets = [];
-      const { instructions, timelineOwnerId, singleUser } = extractInstructionsAndOwner(
+      const { instructions, timelineOwnerId: responseOwner, singleUser } = extractInstructionsAndOwner(
         operationName,
         payload
       );
 
+      const search = operationName === 'SearchTimeline' && params.manualSearch === true;
+      const requestOwner = isValidDecimalId(params.requestedUserId) ? params.requestedUserId : null;
+      const conflictingOwner = responseOwner && requestOwner && responseOwner !== requestOwner;
+      const timelineOwnerId = search ? bindingContext?.actorUserId : conflictingOwner ? null : responseOwner || requestOwner;
+      const ownTimelineOperation = operationName === 'UserTweetsAndReplies' || search;
+      if (search && (hasBusinessErrors || !hasRecognizableTimelineInstructions(instructions))) {
+        return { ...empty, partialUnrecognized: true, anomalies: ['unrecognized_search_page'] };
+      }
       if (singleUser) {
         recordUserProfile(singleUser, observedUsers);
       }
@@ -1006,7 +1346,7 @@
           ? resolvePendingReplies(bindingContext.bindingId, observedAt)
           : { resolved: [] };
         const isDriftedOwnRepliesTimeline =
-          operationName === 'UserTweetsAndReplies' &&
+          ownTimelineOperation &&
           isValidBindingContext(bindingContext) &&
           !hasBusinessErrors &&
           !isUnavailableUser &&
@@ -1021,8 +1361,16 @@
         };
       }
 
-      const { primaryTweets, auxiliaryTweets, unrecognizedTweetCount } =
-        collectTimelineTweetItems(instructions);
+      const verifiedActorId =
+        ownTimelineOperation &&
+        isValidBindingContext(bindingContext) &&
+        timelineOwnerId &&
+        timelineOwnerId === bindingContext.actorUserId
+          ? bindingContext.actorUserId
+          : null;
+
+      const { primaryTweets, auxiliaryTweets, unrecognizedTweetCount, historyMeta } =
+        collectTimelineTweetItems(instructions, verifiedActorId);
 
       // Pass 1: Register all known tweet authors & user profiles in bounded memory
       for (let i = 0; i < auxiliaryTweets.length; i += 1) {
@@ -1039,7 +1387,8 @@
 
       // Passive history backfill applies ONLY to bound viewer's own UserTweetsAndReplies
       if (
-        operationName !== 'UserTweetsAndReplies' ||
+        !ownTimelineOperation ||
+        isUnavailableUser ||
         !isValidBindingContext(bindingContext)
       ) {
         return {
@@ -1105,16 +1454,32 @@
         let targetHandle = item.directTargetHandle;
         let targetDisplayName = null;
 
+        if (!targetUserId && targetHandle) {
+          const mappedId = handleToIdMap.get(targetHandle.toLowerCase());
+          if (isValidDecimalId(mappedId)) {
+            targetUserId = mappedId;
+          }
+        }
+
         if (targetUserId) {
           const knownTarget = userByIdMap.get(targetUserId);
           if (knownTarget) {
             targetHandle = targetHandle || knownTarget.handle;
-            targetDisplayName = knownTarget.displayName;
-          } else if (targetHandle) {
-            recordUserProfile(
-              { userId: targetUserId, handle: targetHandle, displayName: null },
-              observedUsers
-            );
+            targetDisplayName = knownTarget.displayName || item.directTargetDisplayName || null;
+            if (!knownTarget.displayName && targetDisplayName) {
+              recordUserProfile(
+                { userId: targetUserId, handle: targetHandle, displayName: targetDisplayName },
+                observedUsers
+              );
+            }
+          } else {
+            targetDisplayName = item.directTargetDisplayName || null;
+            if (targetHandle || targetDisplayName) {
+              recordUserProfile(
+                { userId: targetUserId, handle: targetHandle, displayName: targetDisplayName },
+                observedUsers
+              );
+            }
           }
         } else {
           const mappedParent = tweetAuthorMap.get(item.parentTweetId);
@@ -1151,7 +1516,7 @@
         });
       }
 
-      return {
+      const result = {
         events,
         resolvedPendingEvents: pendingResolution.resolved,
         observedUsers,
@@ -1159,6 +1524,92 @@
         partialUnrecognized,
         anomalies
       };
+      if (
+        verifiedActorId &&
+        !hasBusinessErrors &&
+        !isUnavailableUser &&
+        hasRecognizableTimelineInstructions(instructions)
+      ) {
+        result.historyPage = buildHistoryPage(historyMeta);
+      }
+      return result;
+    }
+
+    function findBottomCursorDeep(node, depth) {
+      const d = typeof depth === 'number' ? depth : 0;
+      if (d > 24 || !node || typeof node !== 'object') {
+        return null;
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i += 1) {
+          const found = findBottomCursorDeep(node[i], d + 1);
+          if (found) return found;
+        }
+        return null;
+      }
+      if (
+        String(node.cursorType || '').toLowerCase() === 'bottom' &&
+        typeof node.value === 'string' &&
+        node.value.length > 0 &&
+        node.value.length <= 4096
+      ) {
+        return node.value;
+      }
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i += 1) {
+        const found = findBottomCursorDeep(node[keys[i]], d + 1);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    function getRepliesCursor(payload) {
+      const instructions =
+        extractInstructionsAndOwner('UserTweetsAndReplies', payload).instructions ||
+        extractInstructionsAndOwner('SearchTimeline', payload).instructions ||
+        findInstructionsDeep(payload?.data, 0);
+      let cursor = null;
+      let cursorFromReplace = false;
+      let sawConflict = false;
+      for (const inst of instructions || []) {
+        const isReplace = inst?.type === 'TimelineReplaceEntry';
+        const entries = Array.isArray(inst?.entries)
+          ? inst.entries
+          : isPlainObject(inst?.entry)
+            ? [inst.entry]
+            : [];
+        for (const entry of entries) {
+          const content = entry?.content;
+          const cursorNode = content?.cursorType
+            ? content
+            : content?.itemContent?.cursorType
+              ? content.itemContent
+              : null;
+          if (
+            String(cursorNode?.cursorType || '').toLowerCase() !== 'bottom' ||
+            typeof cursorNode.value !== 'string' ||
+            !cursorNode.value ||
+            cursorNode.value.length > 4096
+          ) {
+            continue;
+          }
+          if (cursor && cursor !== cursorNode.value) {
+            if (isReplace || cursorFromReplace) {
+              cursor = cursorNode.value;
+              cursorFromReplace = isReplace;
+              continue;
+            }
+            sawConflict = true;
+            return null;
+          }
+          cursor = cursorNode.value;
+          cursorFromReplace = isReplace;
+        }
+      }
+      if (cursor || sawConflict) {
+        return cursor;
+      }
+      return findBottomCursorDeep(payload?.data || payload, 0);
     }
 
     function resolveUserIdByHandle(handle) {
@@ -1202,6 +1653,7 @@
     return Object.freeze({
       processCreateTweetResponse,
       processTimelineResponse,
+      getRepliesCursor,
       prunePendingReplies,
       resolveUserIdByHandle,
       resolveAuthorByTweetId,
@@ -1244,8 +1696,41 @@
           }
           if (idx !== -1) {
             const slice = text.slice(idx + offset).trim();
-            const endIdx = slice.indexOf('};');
-            const jsonCandidate = endIdx !== -1 ? slice.slice(0, endIdx + 1) : slice;
+            let jsonCandidate = null;
+            if (slice.startsWith('{')) {
+              let depth = 0;
+              let inStr = false;
+              let escaped = false;
+              for (let pos = 0; pos < slice.length; pos += 1) {
+                const ch = slice[pos];
+                if (escaped) {
+                  escaped = false;
+                  continue;
+                }
+                if (ch === '\\' && inStr) {
+                  escaped = true;
+                  continue;
+                }
+                if (ch === '"') {
+                  inStr = !inStr;
+                  continue;
+                }
+                if (!inStr) {
+                  if (ch === '{') depth += 1;
+                  else if (ch === '}') {
+                    depth -= 1;
+                    if (depth === 0) {
+                      jsonCandidate = slice.slice(0, pos + 1);
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+            if (!jsonCandidate) {
+              const endIdx = slice.indexOf('};');
+              jsonCandidate = endIdx !== -1 ? slice.slice(0, endIdx + 1) : slice;
+            }
             try {
               const parsed = JSON.parse(jsonCandidate);
               const extracted = extractViewerFromInitialState(parsed);

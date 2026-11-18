@@ -1216,3 +1216,145 @@ test('Adapter tolerates empty tweet_results, extracts search/replace cursors, an
     }
   }), 'deep-cursor-99');
 });
+
+test('Adapter unwraps UserWithVisibilityResults, falls back to core.user_result, tolerates path-scoped GraphQL errors, and extracts cursor-bottom-* entryIds without cursorType', () => {
+  const engine = createAdapterEngine();
+  const visPayload = {
+    errors: [
+      {
+        message: 'Tweet unavailable',
+        path: ['user', 'result', 'user', 'timeline_v2', 'timeline', 'instructions', 0, 'entries', 1]
+      }
+    ],
+    data: {
+      user: {
+        result: {
+          __typename: 'UserWithVisibilityResults',
+          user: {
+            __typename: 'User',
+            rest_id: '1001001',
+            core: { screen_name: 'sample_me', name: 'Sample Me' },
+            timeline_v2: {
+              timeline: {
+                instructions: [
+                  {
+                    type: 'TimelineAddEntries',
+                    entries: [
+                      {
+                        entryId: 'tweet-2122147641553849200',
+                        content: {
+                          entryType: 'TimelineTimelineItem',
+                          itemContent: {
+                            itemType: 'TimelineTweet',
+                            tweet_results: {
+                              result: {
+                                __typename: 'Tweet',
+                                rest_id: '2122147641553849200',
+                                core: {
+                                  user_result: {
+                                    result: {
+                                      __typename: 'UserWithVisibilityResults',
+                                      user: {
+                                        __typename: 'User',
+                                        rest_id: '1001001',
+                                        core: { screen_name: 'sample_me', name: 'Sample Me' }
+                                      }
+                                    }
+                                  }
+                                },
+                                legacy: {
+                                  user_id_str: '1001001',
+                                  created_at: 'Mon Nov 16 06:00:00 +0000 2026',
+                                  in_reply_to_status_id_str: '2121785253688249100',
+                                  in_reply_to_user_id_str: '2002055',
+                                  in_reply_to_screen_name: 'vis_target'
+                                }
+                              }
+                            }
+                          }
+                        }
+                      },
+                      {
+                        entryId: 'cursor-bottom-fallback-1',
+                        content: {
+                          value: 'entry-id-cursor-1'
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+
+  const res = engine.processTimelineResponse({
+    operationName: 'UserTweetsAndReplies',
+    payload: visPayload,
+    bindingContext: SAMPLE_BINDING,
+    observedAt: NOW_MS
+  });
+  assert.equal(res.events.length, 1);
+  assert.equal(res.events[0].targetUserId, '2002055');
+  assert.ok(res.historyPage);
+  assert.equal(engine.getRepliesCursor(visPayload), 'entry-id-cursor-1');
+
+  // Top-level GraphQL error without path still suppresses historyPage
+  const fatalSearch = engine.processTimelineResponse({
+    operationName: 'SearchTimeline',
+    manualSearch: true,
+    payload: {
+      errors: [{ message: 'Service unavailable' }],
+      data: {
+        search_by_raw_query: {
+          search_timeline: {
+            timeline: { instructions: visPayload.data.user.result.user.timeline_v2.timeline.instructions }
+          }
+        }
+      }
+    },
+    bindingContext: SAMPLE_BINDING,
+    observedAt: NOW_MS
+  });
+  assert.equal('historyPage' in fatalSearch, false);
+
+  // Path-scoped error on search with valid instructions succeeds
+  const partialSearch = engine.processTimelineResponse({
+    operationName: 'SearchTimeline',
+    manualSearch: true,
+    payload: {
+      errors: [{ message: 'Entry skipped', path: ['search_by_raw_query', 'search_timeline', 'timeline', 'instructions', 0, 'entries', 1] }],
+      data: {
+        search_by_raw_query: {
+          search_timeline: {
+            timeline: { instructions: visPayload.data.user.result.user.timeline_v2.timeline.instructions }
+          }
+        }
+      }
+    },
+    bindingContext: SAMPLE_BINDING,
+    observedAt: NOW_MS
+  });
+  assert.ok(partialSearch.historyPage);
+
+  // entryId cursor-top-* without cursorType must never match bottom cursor
+  assert.equal(engine.getRepliesCursor({
+    data: {
+      user: {
+        result: {
+          timeline_v2: {
+            timeline: {
+              instructions: [
+                { type: 'TimelineAddEntries', entries: [{ entryId: 'cursor-top-1', content: { value: 'top-only' } }] }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }), null);
+});
+

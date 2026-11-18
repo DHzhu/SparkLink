@@ -268,6 +268,8 @@
     const state = {
       nonce: null,
       debugLogsEnabled: false,
+      stateConfirmed: false,
+      observedPaused: false,
       collectionEnabled: false,
       captureSessionId: null,
       documentEpoch: 0,
@@ -287,6 +289,8 @@
     let cursor = null;
     let pendingSearch = null;
     let pendingTimeline = null;
+    const pendingPreConfirmPayloads = [];
+    const MAX_PRE_CONFIRM_PAYLOADS = 16;
     let pageRequest = null;
     const usedCursors = new Set();
     let lastFetchAt = 0;
@@ -324,9 +328,6 @@
       if (!se) return false;
       const curTop = Number(se.scrollTop) || Number(win.scrollY) || 0;
       const targetHeight = Math.max(Number(se.scrollHeight) || 0, curTop + 1200);
-      if (curTop > 300) {
-        win.scrollTo(0, curTop - 300);
-      }
       win.scrollTo(0, targetHeight);
       try {
         const primary = typeof doc.querySelector === 'function' ? doc.querySelector('[data-testid="primaryColumn"]') : null;
@@ -350,6 +351,21 @@
       } catch {}
       return true;
     }
+    function triggerScrollUpNudge() {
+      const doc = win.document;
+      if (!doc) return false;
+      const se = doc.scrollingElement || doc.documentElement || doc.body;
+      if (!se) return false;
+      const curTop = Number(se.scrollTop) || Number(win.scrollY) || 0;
+      if (curTop <= 300) return false;
+      win.scrollTo(0, curTop - 300);
+      try {
+        if (typeof Event === 'function' && typeof win.dispatchEvent === 'function') {
+          win.dispatchEvent(new Event('scroll'));
+        }
+      } catch {}
+      return true;
+    }
     function clearHistoryTransport() {
       pageRequest?.abort();
       pageRequest = null;
@@ -357,6 +373,7 @@
       cursor = null;
       pendingSearch = null;
       pendingTimeline = null;
+      pendingPreConfirmPayloads.length = 0;
       usedCursors.clear();
       lastFetchAt = 0;
       lastNativePageAt = 0;
@@ -367,6 +384,21 @@
       const location = new URL(win.location.href);
       return location.pathname === '/search' && location.searchParams.get('q') === scope.query &&
         location.searchParams.get('f') === 'live';
+    }
+    function isCandidateSearchPage(match) {
+      if (match?.category !== 'manual_search') return false;
+      if (scope) return isScopedSearch(match);
+      try {
+        const location = new URL(win.location.href);
+        return (
+          location.pathname === '/search' &&
+          location.searchParams.get('f') === 'live' &&
+          typeof match.searchQuery === 'string' &&
+          match.searchQuery === location.searchParams.get('q')
+        );
+      } catch {
+        return false;
+      }
     }
     function isCandidateRepliesPage(match) {
       if (match?.category !== 'replies_timeline') return false;
@@ -379,6 +411,16 @@
       } catch {
         return false;
       }
+    }
+    function isEligiblePreConfirmMatch(match) {
+      if (!match || !state.nonce || state.stateConfirmed || state.observedPaused || state.hasPausedOnce) {
+        return false;
+      }
+      return (
+        match.category === 'viewer' ||
+        isCandidateRepliesPage(match) ||
+        isCandidateSearchPage(match)
+      );
     }
     async function scrollNextPage(data) {
       const binding = state.bindingContext;
@@ -424,7 +466,7 @@
           inFlight: nativeRequestsInFlight
         });
         triggerScrollStep();
-        let nudged = false;
+        let nudgeStage = 0;
         const scrollDeadline = Date.now() + 3500;
         while (isContextStillActive(context) && pageRequest === abort && !abort.signal.aborted) {
           if (lastNativePageAt > pageBaseline) {
@@ -437,9 +479,16 @@
           const nowMs = Date.now();
           const hardLimit = nativeRequestsInFlight > 0 ? scrollDeadline + 5000 : scrollDeadline;
           if (nowMs >= hardLimit) break;
-          if (!nudged && nativeRequestsInFlight === 0 && nowMs >= scrollDeadline - 2000) {
-            nudged = true;
+          if (nudgeStage === 1) {
+            nudgeStage = 2;
             triggerScrollStep();
+          } else if (nudgeStage === 0 && nativeRequestsInFlight === 0 && nowMs >= scrollDeadline - 2000) {
+            if (triggerScrollUpNudge()) {
+              nudgeStage = 1;
+            } else {
+              nudgeStage = 2;
+              triggerScrollStep();
+            }
           }
           await new Promise((r) => {
             let timer = null;
@@ -451,6 +500,9 @@
               if (wakeScrollWaiter) wakeScrollWaiter = null;
               r();
             }, 200);
+            if (timer && typeof timer.unref === 'function') {
+              timer.unref();
+            }
           });
         }
         if (isContextStillActive(context) && pageRequest === abort) {
@@ -510,15 +562,27 @@
       return {
         sessionId: state.captureSessionId,
         binding: state.bindingContext,
-        documentEpoch: state.documentEpoch
+        documentEpoch: state.documentEpoch,
+        preConfirm: !state.stateConfirmed
       };
     }
 
     function isContextStillActive(context) {
+      if (state.documentEpoch !== context.documentEpoch) {
+        return false;
+      }
+      if (context.preConfirm) {
+        if (state.observedPaused || state.hasPausedOnce) {
+          return false;
+        }
+        if (state.stateConfirmed) {
+          return Boolean(state.collectionEnabled && state.captureSessionId !== null);
+        }
+        return Boolean(state.nonce);
+      }
       if (
         !state.collectionEnabled ||
-        state.captureSessionId !== context.sessionId ||
-        state.documentEpoch !== context.documentEpoch
+        state.captureSessionId !== context.sessionId
       ) {
         return false;
       }
@@ -715,6 +779,15 @@
       }
       const scopeJustActivated = Boolean(nextScope && (!scope || nextScope.id !== scope.id || nextScope.query !== scope.query));
       scope = nextScope;
+      const confirmed = data.stateConfirmed !== false;
+      if (confirmed) {
+        state.stateConfirmed = true;
+      }
+      if (typeof data.observedPaused === 'boolean') {
+        state.observedPaused = data.observedPaused;
+      } else if (confirmed && nextEnabled) {
+        state.observedPaused = false;
+      }
       state.collectionEnabled = nextEnabled && nextSessionId !== null;
       state.captureSessionId = state.collectionEnabled ? nextSessionId : null;
       state.bindingContext = state.collectionEnabled ? nextBinding : null;
@@ -728,11 +801,14 @@
         });
       }
 
-      if (data.observedPaused === true || (!state.collectionEnabled && data.stateConfirmed !== false)) {
+      if (data.observedPaused === true || (!state.collectionEnabled && confirmed)) {
         markWindowSnapshotStale();
+        pendingPreConfirmPayloads.length = 0;
+        pendingSearch = null;
+        pendingTimeline = null;
       }
 
-      if (!state.collectionEnabled || prevSessionId !== state.captureSessionId) {
+      if (!state.collectionEnabled || (prevSessionId !== null && prevSessionId !== state.captureSessionId)) {
         if (prevEnabled || prevSessionId !== null) {
           markWindowSnapshotStale();
         }
@@ -747,21 +823,30 @@
         engine.revokeBinding(prevBindingId);
       }
 
-      if (pendingSearch && nextBinding) {
+      if (state.collectionEnabled && state.captureSessionId !== null && pendingPreConfirmPayloads.length > 0) {
+        const queuedPreConfirm = pendingPreConfirmPayloads.splice(0);
+        for (let i = 0; i < queuedPreConfirm.length; i += 1) {
+          const entry = queuedPreConfirm[i];
+          if (entry.documentEpoch !== state.documentEpoch) {
+            continue;
+          }
+          handleParsedPayload(entry.match, entry.payload, entry.requestMeta, captureContext(), () => null);
+        }
+      }
+
+      if (pendingSearch && nextBinding && scope) {
         const held = pendingSearch;
         pendingSearch = null;
-        if (nextBinding.actorUserId === scope?.actor && isScopedSearch(held.match)) {
+        if (nextBinding.actorUserId === scope.actor && isScopedSearch(held.match)) {
           handleParsedPayload(held.match, held.payload, null, captureContext(), () => null);
         }
       }
-      if (pendingTimeline && nextBinding) {
+      if (pendingTimeline && nextBinding && scope) {
         const held = pendingTimeline;
         pendingTimeline = null;
-        if (scope && !scope.query && nextBinding.actorUserId === scope.actor && held.match.requestedUserId === scope.actor) {
+        if (!scope.query && nextBinding.actorUserId === scope.actor && held.match.requestedUserId === scope.actor) {
           handleParsedPayload(held.match, held.payload, null, captureContext(), () => null);
         }
-      } else if (nextBinding && !scope) {
-        pendingTimeline = null;
       }
       if (state.collectionEnabled && state.bindingContext) {
         state.needsPostPauseVerification = false;
@@ -870,7 +955,26 @@
       if (!isContextStillActive(context)) {
         return;
       }
+      if (!state.collectionEnabled || state.captureSessionId === null) {
+        if (context.preConfirm && isEligiblePreConfirmMatch(match)) {
+          if (pendingPreConfirmPayloads.length < MAX_PRE_CONFIRM_PAYLOADS) {
+            pendingPreConfirmPayloads.push({
+              match,
+              payload,
+              requestMeta,
+              documentEpoch: context.documentEpoch
+            });
+            logSync('buffered pre-confirm payload', {
+              op: match.operationName,
+              category: match.category,
+              buffered: pendingPreConfirmPayloads.length
+            });
+          }
+        }
+        return;
+      }
       const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+      const hasFatalErrors = errors.some((error) => !Array.isArray(error?.path) || error.path.length === 0);
       if (errors.some(error => error?.code === 88)) {
         signalHistoryStop('rate_limited', context, readHeader);
         return;
@@ -879,9 +983,10 @@
         signalHistoryStop('verification', context, readHeader);
         return;
       }
-      if (!context.binding && state.bindingContext &&
-          state.captureSessionId === context.sessionId &&
-          state.documentEpoch === context.documentEpoch) {
+      if (
+        state.documentEpoch === context.documentEpoch &&
+        (context.preConfirm || (!context.binding && state.bindingContext && state.captureSessionId === context.sessionId))
+      ) {
         context = captureContext();
       }
       const frozenBinding = context.binding;
@@ -910,13 +1015,17 @@
         return;
       }
 
-      if (match.category === 'manual_search' && !isScopedSearch(match)) return;
+      if (match.category === 'manual_search' && !(isScopedSearch(match) || (!frozenBinding && isCandidateSearchPage(match)))) {
+        return;
+      }
       if (!frozenBinding) {
-        if (isScopedSearch(match) && !errors.length) {
-          if (state.bindingContext?.actorUserId === scope.actor) {
+        if (isCandidateSearchPage(match) && !hasFatalErrors) {
+          if (scope && isScopedSearch(match) && state.bindingContext?.actorUserId === scope.actor) {
             handleParsedPayload(match, payload, null, captureContext(), readHeader);
-          } else if (!state.bindingContext && !pendingSearch) pendingSearch = { match, payload };
-        } else if (match.category === 'replies_timeline' && !errors.length && isCandidateRepliesPage(match)) {
+          } else if (!state.bindingContext && !pendingSearch) {
+            pendingSearch = { match, payload };
+          }
+        } else if (match.category === 'replies_timeline' && !hasFatalErrors && isCandidateRepliesPage(match)) {
           if (state.bindingContext) {
             handleParsedPayload(match, payload, null, captureContext(), readHeader);
           } else if (!pendingTimeline) {
@@ -1164,31 +1273,65 @@
       }
     }
 
+    function evaluateCaptureEligibility(url, method) {
+      const activeState = state.collectionEnabled && state.captureSessionId !== null;
+      const allowPreConfirm = Boolean(
+        state.nonce && !state.stateConfirmed && !state.observedPaused && !state.hasPausedOnce
+      );
+      if (!url || (!activeState && !allowPreConfirm)) {
+        return null;
+      }
+      const match = adapter.matchWhitelistedRequest(url, method);
+      if (!match) {
+        return null;
+      }
+      if (activeState) {
+        if ((match.category === 'replies_timeline' || match.category === 'manual_search') && scope) {
+          if (match.category === 'manual_search' && !isScopedSearch(match)) {
+            logSync('ignored SearchTimeline (scope mismatch)', {
+              reqQuery: match.searchQuery || null,
+              scopeQuery: scope.query || null,
+              href: (win.location?.pathname || '') + (win.location?.search || '')
+            });
+          }
+        }
+        const searchAllowed =
+          match.category !== 'manual_search' ||
+          isScopedSearch(match) ||
+          (!state.bindingContext && isCandidateSearchPage(match));
+        const allowed =
+          searchAllowed &&
+          (state.bindingContext ||
+            match.category === 'viewer' ||
+            searchAllowed && match.category === 'manual_search' ||
+            isCandidateRepliesPage(match));
+        return allowed ? match : null;
+      }
+      return isEligiblePreConfirmMatch(match) ? match : null;
+    }
+
     // 1. Wrap window.fetch once without altering Function.prototype.toString
     if (typeof win.fetch === 'function') {
       const originalFetch = win.fetch;
       win.fetch = function sparklinkFetchWrapper(input, init) {
         let captured = null;
-        if (state.collectionEnabled && state.captureSessionId !== null) {
-          try {
-            const { url, method } = extractFetchUrlAndMethod(input, init);
-            const match = url ? adapter.matchWhitelistedRequest(url, method) : null;
-            if (match && (match.category === 'replies_timeline' || match.category === 'manual_search') && scope) {
-              const scopedOk = match.category !== 'manual_search' || isScopedSearch(match);
-              if (!scopedOk) {
-                logSync('ignored SearchTimeline fetch (scope mismatch)', { reqQuery: match.searchQuery || null, scopeQuery: scope.query || null, href: win.location?.pathname + win.location?.search });
-              }
+        try {
+          const { url, method } = extractFetchUrlAndMethod(input, init);
+          const match = evaluateCaptureEligibility(url, method);
+          if (match) {
+            const context = captureContext();
+            let requestMeta = null;
+            let requestMetaPromise = null;
+            let skipObservation = false;
+            const trackNativeHistory = match.category === 'replies_timeline' || match.category === 'manual_search';
+            if (trackNativeHistory && (scope || !state.stateConfirmed)) {
+              logSync('intercepted native fetch', {
+                op: match.operationName,
+                requestedUserId: match.requestedUserId || null,
+                hasBinding: Boolean(state.bindingContext),
+                preConfirm: !state.stateConfirmed
+              });
             }
-            if (match && (match.category !== 'manual_search' || isScopedSearch(match)) &&
-                (state.bindingContext || match.category === 'viewer' || isScopedSearch(match) || isCandidateRepliesPage(match))) {
-              const context = captureContext();
-              let requestMeta = null;
-              let requestMetaPromise = null;
-              let skipObservation = false;
-              const trackNativeHistory = match.category === 'replies_timeline' || isScopedSearch(match);
-              if (trackNativeHistory && scope) {
-                logSync('intercepted native fetch', { op: match.operationName, requestedUserId: match.requestedUserId || null, hasBinding: Boolean(state.bindingContext) });
-              }
               if (match.category === 'create_tweet') {
                 const hasNonNullInitBody = Boolean(
                   init && typeof init === 'object' && init.body !== undefined && init.body !== null
@@ -1259,9 +1402,8 @@
                 };
               }
             }
-          } catch (_prepErr) {
-            captured = null;
-          }
+        } catch (_prepErr) {
+          captured = null;
         }
 
         // Preserve exact synchronous throw and Promise return semantics
@@ -1374,31 +1516,34 @@
           const meta = xhrMetaMap.get(this);
           if (meta) {
             meta.activeCapture = null;
-            if (state.collectionEnabled && state.captureSessionId !== null && meta.url) {
-              const match = adapter.matchWhitelistedRequest(meta.url, meta.method);
-              if (match && (match.category !== 'manual_search' || isScopedSearch(match)) &&
-                (state.bindingContext || match.category === 'viewer' || isScopedSearch(match) || isCandidateRepliesPage(match))) {
-                let requestMeta = null;
-                let skip = false;
-                if (match.category === 'create_tweet' && body !== undefined && body !== null) {
-                  if (typeof body === 'string') {
-                    if (utf8ByteLength(body) <= maxRequestBytes) {
-                      requestMeta = adapter.parseCreateTweetRequest(body);
-                    } else {
-                      skip = true;
-                    }
+            const match = evaluateCaptureEligibility(meta.url, meta.method);
+            if (match) {
+              let requestMeta = null;
+              let skip = false;
+              if (match.category === 'create_tweet' && body !== undefined && body !== null) {
+                if (typeof body === 'string') {
+                  if (utf8ByteLength(body) <= maxRequestBytes) {
+                    requestMeta = adapter.parseCreateTweetRequest(body);
                   } else {
                     skip = true;
                   }
+                } else {
+                  skip = true;
                 }
-                if (!skip) {
-                  const trackNativeHistory = match.category === 'replies_timeline' || isScopedSearch(match);
-                  if (trackNativeHistory) {
-                    nativeRequestsInFlight += 1;
-                    if (scope) {
-                      logSync('intercepted native XHR', { op: match.operationName, requestedUserId: match.requestedUserId || null, hasBinding: Boolean(state.bindingContext) });
-                    }
+              }
+              if (!skip) {
+                const trackNativeHistory = match.category === 'replies_timeline' || match.category === 'manual_search';
+                if (trackNativeHistory) {
+                  nativeRequestsInFlight += 1;
+                  if (scope || !state.stateConfirmed) {
+                    logSync('intercepted native XHR', {
+                      op: match.operationName,
+                      requestedUserId: match.requestedUserId || null,
+                      hasBinding: Boolean(state.bindingContext),
+                      preConfirm: !state.stateConfirmed
+                    });
                   }
+                }
                   meta.activeCapture = {
                     match,
                     requestMeta,
@@ -1468,7 +1613,6 @@
                       }
                     });
                   }
-                }
               }
             }
           }

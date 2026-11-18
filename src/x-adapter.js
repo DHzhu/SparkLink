@@ -154,17 +154,28 @@
     return match;
   }
 
-  function extractUserFieldsFromGraphqlNode(userNode) {
-    if (!isPlainObject(userNode)) {
-      return null;
+  function unwrapGraphqlUserNode(userNode) {
+    let cur = userNode;
+    for (let depth = 0; depth < 4 && isPlainObject(cur); depth += 1) {
+      if (cur.__typename === 'UserUnavailable') {
+        return null;
+      }
+      if (cur.__typename === 'UserWithVisibilityResults' && isPlainObject(cur.user)) {
+        cur = cur.user;
+        continue;
+      }
+      if (isPlainObject(cur.result)) {
+        cur = cur.result;
+        continue;
+      }
+      break;
     }
-    const unwrapped =
-      userNode.__typename === 'UserUnavailable'
-        ? null
-        : isPlainObject(userNode.result)
-          ? userNode.result
-          : userNode;
-    if (!isPlainObject(unwrapped)) {
+    return isPlainObject(cur) && cur.__typename !== 'UserUnavailable' ? cur : null;
+  }
+
+  function extractUserFieldsFromGraphqlNode(userNode) {
+    const unwrapped = unwrapGraphqlUserNode(userNode);
+    if (!unwrapped) {
       return null;
     }
     const userId = isValidDecimalId(unwrapped.rest_id)
@@ -343,10 +354,14 @@
     if (!tweetId) {
       return null;
     }
-    const coreUser =
-      isPlainObject(node.core) && isPlainObject(node.core.user_results)
-        ? extractUserFieldsFromGraphqlNode(node.core.user_results)
-        : null;
+    const coreUserNode = isPlainObject(node.core)
+      ? isPlainObject(node.core.user_results)
+        ? node.core.user_results
+        : isPlainObject(node.core.user_result)
+          ? node.core.user_result
+          : null
+      : null;
+    const coreUser = coreUserNode ? extractUserFieldsFromGraphqlNode(coreUserNode) : null;
     const authorUserId = coreUser
       ? coreUser.userId
       : legacy && isValidDecimalId(legacy.user_id_str)
@@ -1234,7 +1249,7 @@
       }
 
       if (operationName === 'UserTweetsAndReplies' || operationName === 'UserTweets') {
-        const userResult =
+        const rawUserResult =
           isPlainObject(data.user) && isPlainObject(data.user.result)
             ? data.user.result
             : isPlainObject(data.user_result) && isPlainObject(data.user_result.result)
@@ -1242,19 +1257,28 @@
               : isPlainObject(data.user_results) && isPlainObject(data.user_results.result)
                 ? data.user_results.result
                 : null;
+        if (!rawUserResult) {
+          return { instructions: null, timelineOwnerId: null, singleUser: null };
+        }
+        const userResult = unwrapGraphqlUserNode(rawUserResult);
         if (!userResult) {
           return { instructions: null, timelineOwnerId: null, singleUser: null };
         }
         const ownerUser = extractUserFieldsFromGraphqlNode(userResult);
-        const timelineObj = isPlainObject(userResult.timeline_v2)
-          ? userResult.timeline_v2.timeline || userResult.timeline_v2
-          : isPlainObject(userResult.timeline)
-            ? userResult.timeline.timeline || userResult.timeline
+        const timelineHolder =
+          isPlainObject(userResult.timeline_v2) || isPlainObject(userResult.timeline)
+            ? userResult
+            : rawUserResult;
+        const timelineObj = isPlainObject(timelineHolder.timeline_v2)
+          ? timelineHolder.timeline_v2.timeline || timelineHolder.timeline_v2
+          : isPlainObject(timelineHolder.timeline)
+            ? timelineHolder.timeline.timeline || timelineHolder.timeline
             : null;
         const instructions =
           isPlainObject(timelineObj) && Array.isArray(timelineObj.instructions)
             ? timelineObj.instructions
-            : findInstructionsDeep(userResult, 0);
+            : findInstructionsDeep(userResult, 0) ||
+              (timelineHolder !== userResult ? findInstructionsDeep(timelineHolder, 0) : null);
         return {
           instructions,
           timelineOwnerId: ownerUser ? ownerUser.userId : null,
@@ -1315,12 +1339,24 @@
         return empty;
       }
 
-      const hasBusinessErrors = Array.isArray(payload.errors) && payload.errors.length > 0;
-      const isUnavailableUser =
+      const hasAnyErrors = Array.isArray(payload.errors) && payload.errors.length > 0;
+      const hasBusinessErrors =
+        hasAnyErrors &&
+        payload.errors.some(
+          (err) => !isPlainObject(err) || !Array.isArray(err.path) || err.path.length === 0
+        );
+      const rawDataUserResult =
         isPlainObject(payload.data) &&
         isPlainObject(payload.data.user) &&
-        isPlainObject(payload.data.user.result) &&
-        payload.data.user.result.__typename === 'UserUnavailable';
+        isPlainObject(payload.data.user.result)
+          ? payload.data.user.result
+          : null;
+      const isUnavailableUser =
+        Boolean(rawDataUserResult) &&
+        (rawDataUserResult.__typename === 'UserUnavailable' ||
+          (rawDataUserResult.__typename === 'UserWithVisibilityResults' &&
+            isPlainObject(rawDataUserResult.user) &&
+            rawDataUserResult.user.__typename === 'UserUnavailable'));
 
       const observedUsers = [];
       const observedTweets = [];
@@ -1348,7 +1384,7 @@
         const isDriftedOwnRepliesTimeline =
           ownTimelineOperation &&
           isValidBindingContext(bindingContext) &&
-          !hasBusinessErrors &&
+          !hasAnyErrors &&
           !isUnavailableUser &&
           (!timelineOwnerId || timelineOwnerId === bindingContext.actorUserId);
         return {
@@ -1555,6 +1591,23 @@
       ) {
         return node.value;
       }
+      const nodeEntryId = typeof node.entryId === 'string' ? node.entryId : '';
+      if (/^cursor-bottom(?:-|$)/i.test(nodeEntryId) && isPlainObject(node.content)) {
+        const fallbackNode = isPlainObject(node.content.itemContent) && !node.content.value
+          ? node.content.itemContent
+          : node.content;
+        const explicitDir = typeof fallbackNode.cursorType === 'string'
+          ? fallbackNode.cursorType.toLowerCase()
+          : '';
+        if (
+          (!explicitDir || explicitDir === 'bottom') &&
+          typeof fallbackNode.value === 'string' &&
+          fallbackNode.value.length > 0 &&
+          fallbackNode.value.length <= 4096
+        ) {
+          return fallbackNode.value;
+        }
+      }
       const keys = Object.keys(node);
       for (let i = 0; i < keys.length; i += 1) {
         const found = findBottomCursorDeep(node[keys[i]], d + 1);
@@ -1580,13 +1633,25 @@
             : [];
         for (const entry of entries) {
           const content = entry?.content;
+          const entryId = typeof entry?.entryId === 'string' ? entry.entryId : '';
           const cursorNode = content?.cursorType
             ? content
             : content?.itemContent?.cursorType
               ? content.itemContent
-              : null;
+              : /^cursor-bottom(?:-|$)/i.test(entryId)
+                ? (typeof content?.value === 'string'
+                    ? content
+                    : typeof content?.itemContent?.value === 'string'
+                      ? content.itemContent
+                      : null)
+                : null;
+          const isBottomCursor =
+            Boolean(cursorNode) &&
+            (typeof cursorNode.cursorType === 'string'
+              ? cursorNode.cursorType.toLowerCase() === 'bottom'
+              : /^cursor-bottom(?:-|$)/i.test(entryId));
           if (
-            String(cursorNode?.cursorType || '').toLowerCase() !== 'bottom' ||
+            !isBottomCursor ||
             typeof cursorNode.value !== 'string' ||
             !cursorNode.value ||
             cursorNode.value.length > 4096

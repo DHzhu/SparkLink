@@ -137,7 +137,8 @@
               }
             }
             nowPath = new URL(win.location.href).pathname.replace(/\/$/, '').toLowerCase();
-            if (nowPath === profile && !repliesRequested && (!clicked || time - clickedAt >= 3000)) {
+            const directRepliesWaitMs = customTimers ? 0 : 6000;
+            if (nowPath === profile && !repliesRequested && (clicked ? time - clickedAt >= 3000 : elapsed >= directRepliesWaitMs)) {
               action = 'replies';
             }
           }

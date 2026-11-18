@@ -462,3 +462,76 @@ test('Sync page skips hidden / aria-hidden Replies anchors and falls back to UTC
   page.destroy();
 });
 
+test('Real-timer default waits 6000ms on /<handle> before direct replies navigation so late Replies links still SPA-click cleanly', async () => {
+  let clock = 1_700_000_000_000;
+  const start = clock;
+  let bridgeSub = null;
+  const job = makeJob({
+    mode: 'timeline',
+    actionAt: start,
+    pageAt: start,
+    deadline: start + 300000
+  });
+  const env = createMockPageEnv({
+    url: 'https://x.com/Alice',
+    anchors: [],
+    taskHandler: async () => ({ ok: true, job })
+  });
+  env.win.__sparklinkIsolatedBridge.subscribe = (fn) => {
+    bridgeSub = fn;
+    return () => {
+      bridgeSub = null;
+    };
+  };
+
+  // Omit setTimeoutFn so customTimers === false (production 6000ms gate), control elapsed via nowFn
+  const page = installHistorySyncPage(env.win, env.chromeObj, { nowFn: () => clock });
+  await page.ready;
+  const repliesActions = () => env.runtimeMessages.filter((m) => m.type === 'ADVANCE_HISTORY_SYNC' && m.action === 'replies');
+  assert.equal(repliesActions().length, 0);
+
+  // At 2500ms with no link yet -> still waits instead of jumping early
+  clock = start + 2500;
+  bridgeSub({ type: 'BINDING_READY' });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(repliesActions().length, 0);
+
+  // Late link renders at 3500ms -> clicks SPA link rather than issuing chrome.tabs.update
+  const lateAnchor = makeAnchor({
+    href: '/Alice/with_replies',
+    onClick: () => env.setUrl('https://x.com/Alice/with_replies')
+  });
+  env.setAnchors([lateAnchor]);
+  clock = start + 3500;
+  bridgeSub({ type: 'BINDING_READY' });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(lateAnchor.clickCount, 1);
+  assert.equal(repliesActions().length, 0);
+  page.destroy();
+
+  // Separate instance reaching >= 6000ms without an anchor falls back to action: 'replies'
+  let clock2 = 1_700_000_100_000;
+  const start2 = clock2;
+  let bridgeSub2 = null;
+  const job2 = makeJob({ id: 'job_7d_2', mode: 'timeline', actionAt: start2, pageAt: start2, deadline: start2 + 300000 });
+  const env2 = createMockPageEnv({
+    url: 'https://x.com/Alice',
+    anchors: [],
+    taskHandler: async () => ({ ok: true, job: job2 })
+  });
+  env2.win.__sparklinkIsolatedBridge.subscribe = (fn) => {
+    bridgeSub2 = fn;
+    return () => {
+      bridgeSub2 = null;
+    };
+  };
+  const page2 = installHistorySyncPage(env2.win, env2.chromeObj, { nowFn: () => clock2 });
+  await page2.ready;
+  clock2 = start2 + 6500;
+  bridgeSub2({ type: 'BINDING_READY' });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(env2.runtimeMessages.filter((m) => m.type === 'ADVANCE_HISTORY_SYNC' && m.action === 'replies').length, 1);
+  page2.destroy();
+});
+
+

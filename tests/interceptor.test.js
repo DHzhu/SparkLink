@@ -1097,3 +1097,199 @@ test('Audit regressions: triggerScrollStep targets primaryColumn cells instead o
   assert.equal(primaryLastScrolled, 1);
 });
 
+test('Pre-confirm buffering replays early UserTweetsAndReplies and SearchTimeline across split SYNC_STATE messages, rejects when confirmed paused, and separates up/down scroll nudge across frames', async (t) => {
+  let clock = 1_795_000_000_000;
+  t.mock.method(Date, 'now', () => clock);
+
+  // 1. Tab loads before HELLO, fires pre-confirm timeline/search/create_tweet, then backend confirms PAUSED -> zero events & create_tweet never cloned
+  const pausedCreateTracker = createStreamingResponse(JSON.stringify(createTweetFixtures.standardReply.response));
+  const pausedEnv = createMockEnvironment(async (url) => {
+    const u = String(url);
+    if (u.includes('CreateTweet')) return pausedCreateTracker.res;
+    if (u.includes('UserTweetsAndReplies')) {
+      return new Response(JSON.stringify(timelineFixtures.ownRepliesTimelineMixed.response), { status: 200 });
+    }
+    return new Response('{}', { status: 200 });
+  });
+  pausedEnv.win.location.href = 'https://x.com/sample_me/with_replies';
+  installMainInterceptor(pausedEnv.win, adapterApi);
+  pausedEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'BRIDGE_INIT',
+    nonce: 'pconf_pause',
+    collectionEnabled: false,
+    captureSessionId: null,
+    bindingContext: null,
+    historyScope: null,
+    stateConfirmed: false,
+    observedPaused: false
+  });
+  await pausedEnv.win.fetch(timelineFixtures.ownRepliesTimelineMixed.requestUrl);
+  await pausedEnv.win.fetch(createTweetFixtures.standardReply.requestUrl, {
+    method: 'POST',
+    body: JSON.stringify(createTweetFixtures.standardReply.requestBody)
+  });
+  assert.equal(pausedCreateTracker.getCloneCalled(), 0);
+  pausedEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'SYNC_STATE',
+    nonce: 'pconf_pause',
+    collectionEnabled: false,
+    captureSessionId: null,
+    bindingContext: null,
+    historyScope: null,
+    stateConfirmed: true,
+    observedPaused: true
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(pausedEnv.outboundMessages.filter((m) => m.data.type === 'OBSERVED_EVENTS').length, 0);
+
+  // 2. Pre-confirm UserTweetsAndReplies survives split SYNC_STATE (collectionEnabled -> bindingContext -> historyScope) and replays page 1
+  const page1Payload = structuredClone(timelineFixtures.ownRepliesTimelineMixed.response);
+  page1Payload.data.user.result.timeline_v2.timeline.instructions[0].entries.push({
+    entryId: 'cursor-bottom-pconf',
+    content: { entryType: 'TimelineTimelineCursor', cursorType: 'Bottom', value: 'pconf-cursor-2' }
+  });
+  const scrollYs = [];
+  const se = { scrollTop: 1000, scrollHeight: 3000 };
+  const timelineEnv = createMockEnvironment(async () => new Response(JSON.stringify(page1Payload), { status: 200 }));
+  timelineEnv.win.location.href = 'https://x.com/sample_me/with_replies';
+  timelineEnv.win.scrollY = 1000;
+  timelineEnv.win.document = {
+    scrollingElement: se,
+    documentElement: se,
+    querySelector: () => null,
+    querySelectorAll: () => []
+  };
+  timelineEnv.win.scrollTo = (_x, y) => {
+    scrollYs.push(y);
+    se.scrollTop = y;
+    timelineEnv.win.scrollY = y;
+  };
+  installMainInterceptor(timelineEnv.win, adapterApi);
+  timelineEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'BRIDGE_INIT',
+    nonce: 'pconf_tl',
+    collectionEnabled: false,
+    captureSessionId: null,
+    bindingContext: null,
+    historyScope: null,
+    stateConfirmed: false,
+    observedPaused: false
+  });
+  await timelineEnv.win.fetch(timelineFixtures.ownRepliesTimelineMixed.requestUrl);
+  await new Promise((r) => setTimeout(r, 15));
+  const replyScope = { id: 'job_pconf', actor: BINDING_A.actorUserId, since: clock - 86400000, deadline: clock + 300000, query: null };
+  // Step A: HELLO enables collection before binding or scope arrives
+  timelineEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'SYNC_STATE',
+    nonce: 'pconf_tl',
+    collectionEnabled: true,
+    captureSessionId: 10,
+    bindingContext: null,
+    historyScope: null,
+    stateConfirmed: true,
+    observedPaused: false
+  });
+  // Step B: BIND_VIEWER sets bindingContext while historyScope is still null (must NOT drop pendingTimeline)
+  timelineEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'SYNC_STATE',
+    nonce: 'pconf_tl',
+    collectionEnabled: true,
+    captureSessionId: 10,
+    bindingContext: BINDING_A,
+    historyScope: null,
+    stateConfirmed: true,
+    observedPaused: false
+  });
+  // Step C: historyScope arrives -> pendingTimeline replays with cursor preserved
+  timelineEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'SYNC_STATE',
+    nonce: 'pconf_tl',
+    collectionEnabled: true,
+    captureSessionId: 10,
+    bindingContext: BINDING_A,
+    historyScope: replyScope,
+    stateConfirmed: true,
+    observedPaused: false
+  });
+  const tlPages = timelineEnv.outboundMessages.filter((m) => m.data.historyPage);
+  assert.equal(tlPages.length, 1);
+  assert.equal(tlPages[0].data.historyPage.canPage, true);
+
+  // 3. Two-frame async up-then-down nudge inside scrollNextPage
+  clock += 12000;
+  timelineEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'HISTORY_NEXT',
+    nonce: 'pconf_tl',
+    jobId: 'job_pconf',
+    bindingId: BINDING_A.bindingId
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(scrollYs, [3000]);
+  clock += 1600;
+  await new Promise((r) => setTimeout(r, 230));
+  assert.equal(scrollYs[1], 2700);
+  await new Promise((r) => setTimeout(r, 230));
+  assert.ok(scrollYs.length >= 3);
+  assert.ok(scrollYs[2] >= 3000);
+  clock += 3000;
+  timelineEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'REVOKE_BINDING',
+    nonce: 'pconf_tl',
+    bindingId: BINDING_A.bindingId
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // 4. Pre-confirm SearchTimeline on /search?q=...&f=live replays once SYNC_STATE sets bindingContext + historyScope
+  const query = 'from:sample_me filter:replies since:2026-11-16 until:2026-11-17';
+  const searchUrl = 'https://x.com/i/api/graphql/Fix/SearchTimeline?variables=' +
+    encodeURIComponent(JSON.stringify({ rawQuery: query, product: 'Latest' }));
+  const searchPayload = {
+    data: {
+      search_by_raw_query: {
+        search_timeline: {
+          timeline: timelineFixtures.ownRepliesTimelineMixed.response.data.user.result.timeline_v2.timeline
+        }
+      }
+    }
+  };
+  const searchEnv = createMockEnvironment(async () => new Response(JSON.stringify(searchPayload), { status: 200 }));
+  searchEnv.win.location.href = 'https://x.com/search?' + new URLSearchParams({ q: query, f: 'live' });
+  installMainInterceptor(searchEnv.win, adapterApi);
+  searchEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'BRIDGE_INIT',
+    nonce: 'pconf_search',
+    collectionEnabled: false,
+    captureSessionId: null,
+    bindingContext: null,
+    historyScope: null,
+    stateConfirmed: false,
+    observedPaused: false
+  });
+  await searchEnv.win.fetch(searchUrl);
+  await new Promise((r) => setTimeout(r, 15));
+  searchEnv.win.dispatchBridgeMessage({
+    protocol: 'SPARKLINK_BRIDGE_V1',
+    type: 'SYNC_STATE',
+    nonce: 'pconf_search',
+    collectionEnabled: true,
+    captureSessionId: 10,
+    bindingContext: BINDING_A,
+    historyScope: { id: 'job_s', actor: BINDING_A.actorUserId, since: clock - 86400000, deadline: clock + 300000, query },
+    stateConfirmed: true,
+    observedPaused: false
+  });
+  const searchPages = searchEnv.outboundMessages.filter((m) => m.data.historyPage);
+  assert.equal(searchPages.length, 1);
+  assert.equal(searchPages[0].data.historyPage.searchQuery, query);
+});
+
+
